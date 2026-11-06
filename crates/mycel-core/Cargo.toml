@@ -3,3 +3,15 @@ name = "mycel-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+mycel-proto.workspace = true
+mycel-crypto.workspace = true
+mycel-store.workspace = true
+mycel-net.workspace = true
+postcard.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

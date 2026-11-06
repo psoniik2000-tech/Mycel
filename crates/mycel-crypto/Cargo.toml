@@ -3,3 +3,9 @@ name = "mycel-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+mycel-proto.workspace = true
+iroh-base.workspace = true
+postcard.workspace = true
+blake3 = "1"
