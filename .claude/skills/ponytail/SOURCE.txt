@@ -1,0 +1,1 @@
+Source: https://github.com/dietrichgebert/ponytail (commit 09c434a, 2026-10-18, v5.3.2), skills/ only, without hooks.
