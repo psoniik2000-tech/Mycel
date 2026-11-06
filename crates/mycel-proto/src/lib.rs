@@ -19,6 +19,34 @@ pub struct Envelope {
     pub ciphertext: Vec<u8>,
 }
 
+/// Messages on ALPN `mycel/sync/1` (§7.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncMsg {
+    Envs(Vec<Envelope>),
+    /// BLAKE3 ids of the sender's envelopes; the peer answers with the ones missing here.
+    // shortcut: full ID list, Negentropy when there's >10k events.
+    Have {
+        ids: Vec<Blake3Hash>,
+        reply: bool,
+    },
+    /// Member addresses as EndpointTicket strings.
+    Peers(Vec<String>),
+}
+
+/// Request on ALPN `mycel/join/1` (§4.3); `addr` is the joiner's EndpointTicket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinReq {
+    pub secret: [u8; 16],
+    pub key_package: Vec<u8>,
+    pub addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinResp {
+    pub welcome: Vec<u8>,
+    pub peers: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub id: Blake3Hash,

@@ -6,7 +6,8 @@ use mycel_core::mycel_proto::{Event, EventBody};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--no-relay] <init | id | chat | connect <ticket>>  (connect saves the peer, then chats)";
+const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--no-relay] <init | id | members | chat | invite | join <link>>
+  init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,18 +37,31 @@ async fn main() -> Result<()> {
 
     let (node, mut rx) = Node::open(&dir, &password, port, relay).await?;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-    if let ["connect", ticket] = rest[..] {
-        node.add_peer(ticket)?;
-    }
     match rest[..] {
-        ["init"] => println!("initialized {}", dir.display()),
+        ["init"] => {
+            node.create_space()?;
+            println!("space created in {}", dir.display());
+        }
         ["id"] => println!("{}", node.ticket(relay).await),
-        ["chat"] | ["connect", _] => {
+        ["members"] => {
+            let admin = node.admin()?;
+            for m in node.members() {
+                let tag = if m == admin { " (admin)" } else { "" };
+                println!("{}{tag}", short(&m));
+            }
+        }
+        ["chat"] | ["invite"] | ["join", _] => {
+            if let ["join", link] = rest[..] {
+                node.join(link).await?;
+                println!("joined, {} members", node.members().len());
+            }
+            if rest[..] == ["invite"] {
+                println!("{}", node.invite(relay).await?);
+            }
             let me = node.device_id();
             for ev in node.history()? {
                 print_event(&ev, me);
             }
-            println!("ticket: {}", node.ticket(relay).await);
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
                     print_event(&ev, me);
@@ -55,7 +69,7 @@ async fn main() -> Result<()> {
             });
             while let Some(line) = lines.next_line().await? {
                 if !line.trim().is_empty() {
-                    node.send_text(&line).await?;
+                    node.send_text(&line)?;
                 }
             }
         }
@@ -65,15 +79,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn short(id: &[u8; 32]) -> String {
+    id[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn print_event(ev: &Event, me: [u8; 32]) {
     if let EventBody::Text { text, .. } = &ev.body {
         let who = if ev.author_device == me {
             "me".to_string()
         } else {
-            ev.author_device[..4]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
+            short(&ev.author_device)
         };
         println!("[{who}] {text}");
     }

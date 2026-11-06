@@ -14,7 +14,7 @@ mycel-store = { path = "crates/mycel-store" }
 mycel-net = { path = "crates/mycel-net" }
 mycel-core = { path = "crates/mycel-core" }
 iroh = "1.4.1"
-iroh-base = "1.4.1"
+iroh-base = { version = "1.4.1", features = ["key"] }
 iroh-tickets = "1"
 postcard = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }

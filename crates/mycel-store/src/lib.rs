@@ -35,6 +35,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS events (
                  id BLOB PRIMARY KEY, lamport INTEGER NOT NULL, ts INTEGER NOT NULL, data BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS envelopes (id BLOB PRIMARY KEY, data BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS peers (id BLOB PRIMARY KEY, addr BLOB NOT NULL);",
         )
         .context("wrong password or corrupt database")?;
@@ -54,6 +55,34 @@ impl Store {
             params![k, v],
         )?;
         Ok(())
+    }
+
+    /// Deletes the key; true if it existed (one-time tokens).
+    pub fn take_meta(&self, k: &str) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM meta WHERE k = ?1", [k])? == 1)
+    }
+
+    pub fn insert_envelope(&self, id: &[u8], data: &[u8]) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO envelopes (id, data) VALUES (?1, ?2)",
+            params![id, data],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_envelope(&self, id: &[u8]) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM envelopes WHERE id = ?1", [id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// All (id, data) envelopes.
+    pub fn envelopes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut st = self.db.prepare("SELECT id, data FROM envelopes")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Returns false if the event was already stored.
@@ -100,6 +129,12 @@ impl Store {
             .query_row("SELECT 1 FROM peers WHERE id = ?1", [id], |_| Ok(()))
             .optional()?
             .is_some())
+    }
+
+    pub fn peer(&self, id: &[u8]) -> Result<Vec<u8>> {
+        Ok(self
+            .db
+            .query_row("SELECT addr FROM peers WHERE id = ?1", [id], |r| r.get(0))?)
     }
 
     pub fn peers(&self) -> Result<Vec<Vec<u8>>> {

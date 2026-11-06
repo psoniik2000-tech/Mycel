@@ -1,5 +1,7 @@
 //! Device key and event signing (DESIGN.md §4.1). The device key is the iroh key, so NodeId = device public key.
 
+pub mod mls;
+
 pub use iroh_base::SecretKey;
 use iroh_base::{PublicKey, Signature};
 use mycel_proto::Event;
@@ -21,6 +23,11 @@ pub fn verify_event(ev: &Event) -> bool {
         return false;
     };
     ev.id == event_id(ev) && pk.verify(&ev.id, &Signature::from_bytes(&sig)).is_ok()
+}
+
+/// Content id of an envelope, used by sync.
+pub fn envelope_id(env: &mycel_proto::Envelope) -> [u8; 32] {
+    blake3::hash(&postcard::to_allocvec(env).expect("envelope serializes")).into()
 }
 
 fn event_id(ev: &Event) -> [u8; 32] {
