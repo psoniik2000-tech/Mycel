@@ -1,0 +1,155 @@
+//! Wire types (DESIGN.md §14).
+
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+pub type Blake3Hash = [u8; 32];
+pub type EventId = Blake3Hash;
+pub type DeviceId = [u8; 32];
+pub type UserId = [u8; 32];
+// shortcut: Vec instead of [u8; 64] because serde derives arrays only up to 32; switch to ed25519 Signature in phase 1.
+pub type Ed25519Signature = Vec<u8>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub version: u8,
+    pub space_id: [u8; 16],
+    pub group_id: [u8; 32],
+    pub epoch: u64,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub id: Blake3Hash,
+    pub author_device: DeviceId,
+    pub parents: Vec<Blake3Hash>,
+    pub lamport: u64,
+    pub timestamp_ms: u64,
+    pub body: EventBody,
+    pub signature: Ed25519Signature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventBody {
+    Text {
+        text: String,
+        reply_to: Option<EventId>,
+        mentions: Vec<UserId>,
+    },
+    Media {
+        kind: MediaKind,
+        blob: BlobRef,
+        caption: Option<String>,
+        reply_to: Option<EventId>,
+    },
+    Edit {
+        target: EventId,
+        new_text: String,
+    },
+    Delete {
+        target: EventId,
+    },
+    Reaction {
+        target: EventId,
+        emoji: String,
+        remove: bool,
+    },
+    Receipt {
+        up_to: EventId,
+        kind: ReceiptKind,
+    },
+    Typing {
+        active: bool,
+    },
+    Call {
+        call_id: [u8; 16],
+        action: CallAction,
+    },
+    ChatMeta {
+        name: Option<String>,
+        avatar: Option<BlobRef>,
+        disappearing: Option<Duration>,
+    },
+    Pin {
+        target: EventId,
+        pinned: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub hash: Blake3Hash,
+    pub size: u64,
+    pub key: [u8; 32],
+    pub mime: String,
+    pub name: Option<String>,
+    pub preview: Option<Preview>,
+    pub duration_ms: Option<u32>,
+    pub dims: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Preview {
+    Blurhash(String),
+    Waveform(Vec<u8>),
+    Frame(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    File,
+    Photo,
+    Video,
+    Voice,
+    VideoNote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiptKind {
+    Delivered,
+    Read,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallAction {
+    Offer,
+    Accept,
+    Reject,
+    End,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_roundtrip() {
+        let blob = BlobRef {
+            hash: [1; 32],
+            size: 42,
+            key: [2; 32],
+            mime: "image/jpeg".into(),
+            name: Some("a.jpg".into()),
+            preview: Some(Preview::Blurhash("LEHV6n".into())),
+            duration_ms: None,
+            dims: Some((640, 480)),
+        };
+        let ev = Event {
+            id: [3; 32],
+            author_device: [4; 32],
+            parents: vec![[5; 32]],
+            lamport: 7,
+            timestamp_ms: 1_700_000_000_000,
+            body: EventBody::Media {
+                kind: MediaKind::Photo,
+                blob,
+                caption: None,
+                reply_to: Some([6; 32]),
+            },
+            signature: vec![9; 64],
+        };
+        let bytes = postcard::to_allocvec(&ev).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), ev);
+    }
+}
