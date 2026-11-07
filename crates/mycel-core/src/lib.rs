@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 mod call;
-pub use call::{AUDIO, Frame, VIDEO_DELTA, VIDEO_KEY};
+pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 

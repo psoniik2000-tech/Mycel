@@ -601,10 +601,28 @@ async fn call_listen(st: State<'_, App>, ch: Channel<InvokeResponseBody>) -> R<(
     Ok(())
 }
 
-/// Packet loss since the last query (the UI lowers the video bitrate on loss).
+#[derive(Serialize)]
+struct Link {
+    id: String,
+    rtt: u32,
+    loss: f64,
+    relay: bool,
+}
+
+/// Link quality per participant (short id); the UI shows it and adapts bitrates to the loss.
 #[tauri::command]
-async fn call_loss(st: State<'_, App>) -> R<f64> {
-    Ok(st.node()?.call_loss())
+async fn call_stats(st: State<'_, App>) -> R<Vec<Link>> {
+    Ok(st
+        .node()?
+        .call_stats()
+        .into_iter()
+        .map(|l| Link {
+            id: hex(&l.peer[..4]),
+            rtt: l.rtt_ms,
+            loss: l.loss,
+            relay: l.relay,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -660,7 +678,7 @@ fn main() {
             call_end,
             call_send,
             call_listen,
-            call_loss,
+            call_stats,
             members,
             peers,
             quit

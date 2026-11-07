@@ -11,6 +11,7 @@ import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
+import { Signal, VoiceSettings } from "./voice";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null };
@@ -324,6 +325,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
                   )}
                 </For>
               </div>
+              <VoiceSettings />
               <h3>Связь</h3>
               <label class="check">
                 <input type="checkbox" checked={localStorage.getItem("n0") !== "0"} onChange={(e) => localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0")} />
@@ -671,7 +673,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
               {/* Video shows while frames come; otherwise the avatar. */}
               <div style={{ display: now() - t.videoAt < 1500 ? "contents" : "none" }}>{t.canvas}</div>
               <Show when={now() - t.videoAt >= 1500}><Avatar id={t.id} /></Show>
-              <span class="tile-name">Участник {t.id}</span>
+              <span class="tile-name">Участник {t.id} <Signal net={t.net()} /></span>
             </div>
           )}
         </For>

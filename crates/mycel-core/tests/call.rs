@@ -65,6 +65,12 @@ async fn offer_accept_frames_end() {
     };
     assert_eq!(f.data, big);
 
+    // Link stats: one entry per participant, with an RTT from the live path.
+    let st = a.call_stats();
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].peer, b.device_id());
+    assert!(st[0].rtt_ms < 5_000 && (0.0..=1.0).contains(&st[0].loss));
+
     let mut members = a.call_members(id).unwrap();
     members.sort();
     let mut both = vec![a.device_id(), b.device_id()];

@@ -29,10 +29,21 @@ pub(crate) struct Call {
     id: [u8; 16],
     key: [u8; 32],
     seq: u64,
-    /// Connection and its ordered video queue per participant.
-    conns: HashMap<EndpointId, (Connection, mpsc::Sender<Vec<u8>>)>,
-    /// (sent, lost) packets at the last `call_loss`.
-    stats: (u64, u64),
+    conns: HashMap<EndpointId, CallConn>,
+}
+
+/// Connection, its ordered video queue and (sent, lost) packets at the last `call_stats`.
+type CallConn = (Connection, mpsc::Sender<Vec<u8>>, (u64, u64));
+
+/// Link quality to one participant (the signal icon in the call).
+#[derive(Debug, Clone)]
+pub struct LinkStats {
+    pub peer: [u8; 32],
+    /// Round-trip time of the selected path, ms (QUIC estimate).
+    pub rtt_ms: u32,
+    /// Share of our packets lost since the previous query.
+    pub loss: f64,
+    pub relay: bool,
 }
 
 impl Node {
@@ -66,7 +77,7 @@ impl Node {
         let Some(c) = self.call.lock().unwrap().take() else {
             return Ok(None);
         };
-        for (conn, _) in c.conns.values() {
+        for (conn, ..) in c.conns.values() {
             conn.close(0u32.into(), b"end");
         }
         self.call_event(c.id, CallAction::End).map(Some)
@@ -83,7 +94,7 @@ impl Node {
         let c = g.as_mut().context("not in a call")?;
         c.seq += 1;
         let pkt = mycel_media::seal_frame(&c.key, kind, c.seq, data);
-        for (conn, video) in c.conns.values() {
+        for (conn, video, _) in c.conns.values() {
             if kind == AUDIO {
                 let _ = conn.send_datagram(pkt.clone().into());
             } else {
@@ -101,20 +112,29 @@ impl Node {
         rx
     }
 
-    /// Share of packets lost since the previous query, worst link (simple bitrate adaptation).
-    pub fn call_loss(&self) -> f64 {
+    /// Per-participant RTT and packet loss since the previous query.
+    pub fn call_stats(&self) -> Vec<LinkStats> {
         let mut g = self.call.lock().unwrap();
-        let Some(c) = g.as_mut() else { return 0.0 };
-        let (sent, lost) = c.conns.values().fold((0, 0), |(s, l), (conn, _)| {
-            let st = conn.stats();
-            (s + st.udp_tx.datagrams, l + st.lost_packets)
-        });
-        let (ds, dl) = (
-            sent.saturating_sub(c.stats.0),
-            lost.saturating_sub(c.stats.1),
-        );
-        c.stats = (sent, lost);
-        if ds == 0 { 0.0 } else { dl as f64 / ds as f64 }
+        let Some(c) = g.as_mut() else { return vec![] };
+        c.conns
+            .iter_mut()
+            .map(|(peer, (conn, _, prev))| {
+                let st = conn.stats();
+                let (ds, dl) = (
+                    st.sent_packets.saturating_sub(prev.0),
+                    st.lost_packets.saturating_sub(prev.1),
+                );
+                *prev = (st.sent_packets, st.lost_packets);
+                let paths = conn.paths();
+                let path = paths.iter().find(|p| p.is_selected());
+                LinkStats {
+                    peer: *peer.as_bytes(),
+                    rtt_ms: path.as_ref().map_or(0, |p| p.rtt().as_millis() as u32),
+                    loss: if ds == 0 { 0.0 } else { dl as f64 / ds as f64 },
+                    relay: path.is_some_and(|p| p.is_relay()),
+                }
+            })
+            .collect()
     }
 
     /// Devices in call `id` by the chat history: last action Offer/Accept = in, End/Reject = out.
@@ -154,7 +174,7 @@ impl Node {
                 }
             }
             CallAction::End | CallAction::Reject => {
-                if let Some((conn, _)) = c.conns.remove(&peer) {
+                if let Some((conn, ..)) = c.conns.remove(&peer) {
                     conn.close(0u32.into(), b"end");
                 }
             }
@@ -184,7 +204,6 @@ impl Node {
             key: self.call_key(id, &me)?,
             seq: u64::from_be_bytes(seq) >> 2,
             conns: HashMap::new(),
-            stats: (0, 0),
         });
         for p in self.call_members(id)? {
             if me < p {
@@ -230,7 +249,7 @@ impl Node {
             .as_mut()
             .context("not in a call")?
             .conns
-            .insert(peer, (conn.clone(), vtx));
+            .insert(peer, (conn.clone(), vtx, (0, 0)));
         // Video frames in order, one uni stream each (the receiver reads streams in order).
         let c = conn.clone();
         tokio::spawn(async move {
