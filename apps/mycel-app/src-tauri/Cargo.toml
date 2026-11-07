@@ -9,7 +9,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mycel-core.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+mycel-media = { path = "../../../crates/mycel-media" }
 serde = { version = "1", features = ["derive"] }
 anyhow.workspace = true
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

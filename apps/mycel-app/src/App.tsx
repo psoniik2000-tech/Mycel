@@ -1,13 +1,17 @@
 import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
-  ArrowLeft, Check, CheckCheck, Clock, Copy, Hash, Link, LogOut, MessageCircle, Mic, Paperclip, Plus, Send, Settings, UserPlus, Users,
+  ArrowLeft, Check, CheckCheck, Clock, Copy, Hash, Link, LogOut, MessageCircle, Mic, Paperclip, Plus, Send, Settings, UserPlus, Users, Video, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
+import { label, Media, MediaView } from "./media";
+import { record, Recording, waveform } from "./capture";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
-type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number };
+type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null };
 type Member = { id: string; me: boolean; admin: boolean };
 type Status = { dir: string; exists: boolean; unlocked: boolean; in_space: boolean };
 type Tab = "chats" | "people" | "settings";
@@ -214,7 +218,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
               <div class="grow">
                 <div class="row-top"><b>Общий чат</b><small class="muted">{last() ? time(last()!.ts) : ""}</small></div>
                 <div class="row-bottom">
-                  <span class="muted ellipsis">{last() ? (last()!.mine ? "Вы: " : "") + last()!.text : "Сообщений пока нет"}</span>
+                  <span class="muted ellipsis">{last() ? (last()!.mine ? "Вы: " : "") + (last()!.media ? label(last()!.media!) : last()!.text) : "Сообщений пока нет"}</span>
                   <Show when={unread()}><b class="badge">{unread()}</b></Show>
                 </div>
               </div>
@@ -306,6 +310,99 @@ function People(p: { members: Member[] }) {
 function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void; onSent: (m: Msg) => void }) {
   const [text, setText] = createSignal("");
   const [err, setErr] = createSignal("");
+  const [view, setView] = createSignal("");
+  const [original, setOriginal] = createSignal(false);
+  const [drag, setDrag] = createSignal(false);
+  const [video, setVideo] = createSignal(false);
+  const [rec, setRec] = createSignal<Recording>();
+  const [elapsed, setElapsed] = createSignal(0);
+  const [cancelling, setCancelling] = createSignal(false);
+  let preview!: HTMLVideoElement;
+
+  const sendFiles = async (paths: string[]) => {
+    for (const path of paths) {
+      try {
+        p.onSent(await invoke<Msg>("send_file", { path, original: original() }));
+        setErr("");
+      } catch (e) {
+        setErr(errText(e));
+      }
+    }
+  };
+  const attach = async () => {
+    const paths = await open({ multiple: true });
+    if (paths) sendFiles(paths);
+  };
+  onMount(async () => {
+    // Media that loads later grows the list: keep the newest message in view.
+    const bottom = () => (list.scrollTop = list.scrollHeight);
+    list.addEventListener("load", bottom, true);
+    list.addEventListener("loadedmetadata", bottom, true);
+    const un = await getCurrentWebview().onDragDropEvent((e) => {
+      if (e.payload.type === "drop") {
+        setDrag(false);
+        sendFiles(e.payload.paths);
+      } else setDrag(e.payload.type !== "leave");
+    });
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setView("");
+      if (rec()) stopRec(false);
+    };
+    addEventListener("keydown", esc);
+    onCleanup(() => {
+      un();
+      removeEventListener("keydown", esc);
+    });
+  });
+
+  // 🎤/📹: a tap switches the mode, holding records; release sends, slide left (or Esc) cancels.
+  let holdTimer = 0, tick = 0, startX = 0, holding = false;
+  const stopRec = async (send: boolean) => {
+    const r = rec();
+    clearInterval(tick);
+    setRec(undefined);
+    setCancelling(false);
+    if (!r) return;
+    if (!send || Date.now() - r.started < 500) return r.cancel();
+    const blob = await r.stop();
+    const kind = video() ? "videonote" : "voice";
+    const wave = kind === "voice" ? await waveform(blob) : [];
+    try {
+      p.onSent(await invoke<Msg>("send_rec", new Uint8Array(await blob.arrayBuffer()), {
+        headers: { kind, mime: r.mime, duration: String(Date.now() - r.started), wave: wave.join(",") },
+      }));
+    } catch (e) {
+      setErr(errText(e));
+    }
+  };
+  const down = (e: PointerEvent) => {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    startX = e.clientX;
+    holding = true;
+    holdTimer = window.setTimeout(async () => {
+      try {
+        const r = await record(video());
+        if (!holding) return r.cancel();
+        setRec(r);
+        setElapsed(0);
+        if (video()) preview.srcObject = r.stream;
+        tick = window.setInterval(() => {
+          setElapsed(Date.now() - r.started);
+          if (video() && Date.now() - r.started >= 60_000) stopRec(true);
+        }, 200);
+      } catch (e) {
+        setErr("Нет доступа к микрофону или камере: " + errText(e));
+      }
+    }, 300);
+  };
+  const up = () => {
+    holding = false;
+    clearTimeout(holdTimer);
+    if (rec()) stopRec(!cancelling());
+    else setVideo(!video());
+  };
+  const move = (e: PointerEvent) => rec() && setCancelling(startX - e.clientX > 80);
   let list!: HTMLDivElement;
   let input!: HTMLTextAreaElement;
   createEffect(() => {
@@ -348,7 +445,8 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
                 <Show when={!m.mine && p.msgs[i() - 1]?.author !== m.author}>
                   <div class="author" style={{ color: `hsl(${hue(m.author)} 50% 50%)` }}>Участник {m.author}</div>
                 </Show>
-                <span class="text">{m.text}</span>
+                <Show when={m.media}><MediaView id={m.id} m={m.media!} onView={setView} /></Show>
+                <Show when={m.text}><span class="text">{m.text}</span></Show>
                 <span class="meta">
                   {time(m.ts)}
                   <Show when={m.mine}>
@@ -365,9 +463,22 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
         </For>
       </div>
       <Show when={err()}><p class="error pad-x">{err()}</p></Show>
+      <Show when={drag()}><div class="drop">Отпустите, чтобы отправить</div></Show>
+      <Show when={view()}><div class="viewer" onClick={() => setView("")}><img src={view()} alt="" /></div></Show>
+      <Show when={rec() && video()}><video ref={preview} class="circle live" autoplay muted playsinline /></Show>
       <div class="composer">
-        <button class="icon" disabled title="Вложения появятся позже"><Paperclip size={20} /></button>
-        <textarea ref={input} rows={1} placeholder="Сообщение" value={text()}
+        <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
+        <label class="orig muted small" title="Фото уйдёт файлом как есть, с метаданными">
+          <input type="checkbox" checked={original()} onChange={(e) => setOriginal(e.currentTarget.checked)} /> оригинал
+        </label>
+        <Show when={rec()}>
+          <div class="recording grow" classList={{ cancel: cancelling() }}>
+            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")}
+            <span class="muted small grow">{cancelling() ? "Отпустите — отмена" : "← влево или Esc — отмена"}</span>
+            <X size={18} />
+          </div>
+        </Show>
+        <textarea ref={input} rows={1} placeholder="Сообщение" value={text()} style={{ display: rec() ? "none" : undefined }}
           onInput={(e) => { setText(e.currentTarget.value); grow(); }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -375,7 +486,10 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
               send();
             }
           }} />
-        <button class="icon" disabled title="Голосовые появятся позже"><Mic size={20} /></button>
+        <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
+          title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
+          {video() ? <Video size={20} /> : <Mic size={20} />}
+        </button>
         <button class="icon send" disabled={!text().trim()} onClick={send} title="Отправить"><Send size={20} /></button>
       </div>
     </section>

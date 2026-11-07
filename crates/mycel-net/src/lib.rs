@@ -1,7 +1,7 @@
 //! iroh transport (DESIGN.md §6.1 T1–T2, §14.3): Envelopes over ALPN `mycel/sync/1`.
 
 use anyhow::Result;
-use iroh::endpoint::{Connection, presets};
+use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode};
 use mycel_proto::SyncMsg;
 use std::collections::HashMap;
@@ -9,11 +9,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
+pub use iroh::endpoint::Connection;
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use iroh_tickets::endpoint::EndpointTicket;
 
 pub const ALPN: &[u8] = b"mycel/sync/1";
 pub const JOIN_ALPN: &[u8] = b"mycel/join/1";
+pub const BLOBS_ALPN: &[u8] = b"mycel/blobs/1";
 // shortcut: one message per stream, capped at 16 MiB (a full-history Envs batch); chunk when histories grow.
 const MAX_MSG: usize = 16 << 20;
 
@@ -21,6 +23,8 @@ const MAX_MSG: usize = 16 << 20;
 pub type Inbox = mpsc::Receiver<(EndpointId, SyncMsg)>;
 /// Incoming join requests: (sender, request bytes, reply). Dropping the reply refuses.
 pub type JoinInbox = mpsc::Receiver<(EndpointId, Vec<u8>, oneshot::Sender<Vec<u8>>)>;
+/// Incoming `mycel/blobs/1` connections; the owner checks membership and serves them.
+pub type BlobInbox = mpsc::Receiver<Connection>;
 
 #[derive(Clone)]
 pub struct Net {
@@ -37,7 +41,7 @@ impl Net {
         port: u16,
         relays: &[String],
         n0: bool,
-    ) -> Result<(Self, Inbox, JoinInbox)> {
+    ) -> Result<(Self, Inbox, JoinInbox, BlobInbox)> {
         let mut b = if n0 {
             Endpoint::builder(presets::N0)
         } else {
@@ -45,7 +49,7 @@ impl Net {
         };
         b = b
             .secret_key(key)
-            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]);
+            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), BLOBS_ALPN.to_vec()]);
         if port != 0 {
             b = b
                 .clear_ip_transports()
@@ -54,6 +58,7 @@ impl Net {
         let ep = b.bind().await?;
         let (tx, rx) = mpsc::channel(256);
         let (jtx, jrx) = mpsc::channel(16);
+        let (btx, brx) = mpsc::channel(16);
         let net = Self {
             ep,
             conns: Default::default(),
@@ -65,6 +70,8 @@ impl Net {
                 let Ok(conn) = incoming.await else { continue };
                 if conn.alpn() == JOIN_ALPN {
                     tokio::spawn(serve_join(conn, jtx.clone()));
+                } else if conn.alpn() == BLOBS_ALPN {
+                    let _ = btx.send(conn).await;
                 } else {
                     n.track(conn);
                 }
@@ -73,7 +80,7 @@ impl Net {
         for r in relays {
             net.add_relay(r).await?;
         }
-        Ok((net, rx, jrx))
+        Ok((net, rx, jrx, brx))
     }
 
     /// Adds a relay to the relay map; the endpoint picks the best one as its home relay.
@@ -124,6 +131,11 @@ impl Net {
         let resp = r.read_to_end(MAX_MSG).await?;
         conn.close(0u32.into(), b"");
         Ok(resp)
+    }
+
+    /// A fresh connection on `mycel/blobs/1` (iroh-blobs requests run over it).
+    pub async fn connect_blobs(&self, to: EndpointAddr) -> Result<Connection> {
+        Ok(self.ep.connect(to, BLOBS_ALPN).await?)
     }
 
     pub async fn close(&self) {

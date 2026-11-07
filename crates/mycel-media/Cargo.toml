@@ -3,3 +3,13 @@ name = "mycel-media"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+blurhash = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

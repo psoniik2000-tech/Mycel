@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     let _relay = match rest[..] {
         ["serve", url] => {
             opts.own_relay = Some(url.to_string());
+            opts.keep_blobs = true;
             Some(spawn_relay(url).await?)
         }
         _ => None,
@@ -72,7 +73,9 @@ async fn main() -> Result<()> {
             println!("anchor up, relay {url}, keeping {keep_days} days");
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
             loop {
-                match node.prune(keep_days) {
+                // Retries blobs whose authors were offline when their events came.
+                node.clone().fetch_missing();
+                match node.prune(keep_days).await {
                     Ok(0) => {}
                     Ok(n) => println!("pruned {n} old records"),
                     Err(e) => eprintln!("prune failed: {e}"),
@@ -127,12 +130,15 @@ fn short(id: &[u8; 32]) -> String {
 }
 
 fn print_event(ev: &Event, me: [u8; 32]) {
-    if let EventBody::Text { text, .. } = &ev.body {
-        let who = if ev.author_device == me {
-            "me".to_string()
-        } else {
-            short(&ev.author_device)
-        };
-        println!("[{who}] {text}");
-    }
+    let text = match &ev.body {
+        EventBody::Text { text, .. } => text.clone(),
+        EventBody::Media { kind, blob, .. } => format!("<{kind:?} {} bytes>", blob.size),
+        _ => return,
+    };
+    let who = if ev.author_device == me {
+        "me".to_string()
+    } else {
+        short(&ev.author_device)
+    };
+    println!("[{who}] {text}");
 }

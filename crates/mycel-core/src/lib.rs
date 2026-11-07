@@ -2,15 +2,22 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
+use iroh_blobs::Hash;
+use iroh_blobs::api::remote::GetProgressItem;
+use iroh_blobs::provider::events::EventSender;
+use iroh_blobs::store::GcConfig;
+use iroh_blobs::store::fs::{FsStore, options::Options};
 use mycel_crypto::mls::{Incoming, Mls};
 use mycel_crypto::{SecretKey, envelope_id, sign_addr, sign_event, verify_addr, verify_event};
-use mycel_net::{EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net};
+use mycel_net::{BlobInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net};
 use mycel_proto::{
-    Envelope, Event, EventBody, EventId, JoinReq, JoinResp, ReceiptKind, SignedAddr, SyncMsg,
+    BlobRef, Envelope, Event, EventBody, EventId, JoinReq, JoinResp, MediaKind, ReceiptKind,
+    SignedAddr, SyncMsg,
 };
 use mycel_store::Store;
+use n0_future::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -29,6 +36,10 @@ pub struct Opts {
     pub own_relay: Option<String>,
     /// Also use the public n0 relays and address lookup (off by default, last resort).
     pub n0: bool,
+    /// Download every media blob as soon as its event arrives (anchors, §8.4).
+    pub keep_blobs: bool,
+    /// Largest media file to send or download, bytes; 0 = 4 GiB (§8.1).
+    pub max_blob: u64,
 }
 
 // shortcut: a node is in exactly one space = one MLS group; multiple chats per space later.
@@ -113,6 +124,11 @@ pub struct Node {
     st: Mutex<State>,
     net: Net,
     own_relay: Option<String>,
+    /// Encrypted media blobs (ciphertext, by BLAKE3 hash); a tag per hash keeps it from GC.
+    blobs: FsStore,
+    dir: PathBuf,
+    keep_blobs: bool,
+    max_blob: u64,
 }
 
 impl Node {
@@ -140,11 +156,26 @@ impl Node {
         let st = State { store, mls };
         let mut relays = st.relays()?;
         relays.extend(opts.own_relay.clone());
-        let (net, mut inbox, joins) = Net::bind(key, opts.port, &relays, opts.n0).await?;
+        let (net, mut inbox, joins, blob_conns) =
+            Net::bind(key, opts.port, &relays, opts.n0).await?;
+        let mut bopts = Options::new(&dir.join("blobs"));
+        bopts.gc = Some(GcConfig {
+            interval: std::time::Duration::from_secs(3600),
+            add_protected: None,
+        });
+        let blobs = FsStore::load_with_opts(dir.join("blobs").join("blobs.db"), bopts).await?;
         let node = Arc::new(Self {
             st: Mutex::new(st),
             net,
             own_relay: opts.own_relay.clone(),
+            blobs,
+            dir: std::path::absolute(dir)?,
+            keep_blobs: opts.keep_blobs,
+            max_blob: if opts.max_blob == 0 {
+                4 << 30
+            } else {
+                opts.max_blob
+            },
         });
         let (tx, rx) = mpsc::channel(256);
         let n = node.clone();
@@ -153,6 +184,9 @@ impl Node {
                 match n.handle(from, msg) {
                     Ok(evs) => {
                         n.send_receipt(&evs);
+                        if n.keep_blobs {
+                            n.clone().fetch_all(evs.clone());
+                        }
                         for ev in evs {
                             let _ = tx.send(ev).await;
                         }
@@ -162,6 +196,10 @@ impl Node {
             }
         });
         tokio::spawn(node.clone().serve_joins(joins));
+        tokio::spawn(node.clone().serve_blobs(blob_conns));
+        if node.keep_blobs {
+            node.clone().fetch_missing();
+        }
         node.sync()?;
         if !relays.is_empty() {
             // Again once a relay is up, so peers learn our relay address.
@@ -304,7 +342,7 @@ impl Node {
         }
         Ok(hist
             .iter()
-            .filter(|e| e.author_device == me && matches!(e.body, EventBody::Text { .. }))
+            .filter(|e| e.author_device == me && is_msg(&e.body))
             .map(|e| {
                 let n = others
                     .iter()
@@ -320,15 +358,211 @@ impl Node {
             .collect())
     }
 
-    /// Store-and-forward retention (§7.3): drops envelopes and events older than `days`.
+    /// Store-and-forward retention (§7.3): drops envelopes and events older than `days`,
+    /// and untags blobs no remaining event refers to (the store GC deletes them within an hour).
     // shortcut: time-based only; also drop once every member has receipted, if anchors run out of disk.
-    pub fn prune(&self, days: u64) -> Result<usize> {
+    pub async fn prune(&self, days: u64) -> Result<usize> {
         let cutoff = now_ms()?.saturating_sub(days * 86_400_000);
-        self.st.lock().unwrap().store.prune(cutoff as i64)
+        let n = self.st.lock().unwrap().store.prune(cutoff as i64)?;
+        let keep: HashSet<String> = self
+            .history()?
+            .iter()
+            .filter_map(|e| media(e).map(|(_, b)| hex(&b.hash)))
+            .collect();
+        let tags: Vec<_> = self.blobs.tags().list().await?.collect::<Vec<_>>().await;
+        for t in tags {
+            let name = t?.name;
+            if !keep.contains(String::from_utf8_lossy(name.as_ref()).as_ref()) {
+                self.blobs.tags().delete(name).await?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Encrypts `src`, stores the ciphertext as a blob and sends a Media event (§8.1).
+    /// `meta` carries mime, name, preview, duration and dims; hash, size and key are filled here.
+    pub async fn send_media(
+        &self,
+        kind: MediaKind,
+        src: &Path,
+        mut meta: BlobRef,
+        caption: Option<String>,
+    ) -> Result<Event> {
+        let size = std::fs::metadata(src)?.len();
+        ensure!(
+            size <= self.max_blob,
+            "file is over {} bytes",
+            self.max_blob
+        );
+        let tmp = self.temp()?;
+        let (s, t) = (src.to_owned(), tmp.clone());
+        let key = tokio::task::spawn_blocking(move || mycel_media::encrypt(&s, &t)).await??;
+        let added = self.blobs.add_path(&tmp).temp_tag().await;
+        let _ = std::fs::remove_file(&tmp);
+        let hash = added?.hash();
+        self.blobs.tags().set(hex(hash.as_bytes()), hash).await?;
+        meta.hash = *hash.as_bytes();
+        meta.size = size;
+        meta.key = key;
+        // The sender sees its own media without decrypting it back.
+        let out = self.media_file(&meta);
+        std::fs::create_dir_all(out.parent().context("media dir")?)?;
+        std::fs::copy(src, &out)?;
+        self.send_event(EventBody::Media {
+            kind,
+            blob: meta,
+            caption,
+            reply_to: None,
+        })
+    }
+
+    /// True once the whole blob is here.
+    pub async fn has_blob(&self, blob: &BlobRef) -> bool {
+        self.blobs
+            .has(Hash::from_bytes(blob.hash))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Downloads a blob from its author, else from any other member that has it (e.g. an anchor),
+    /// resuming what is already here. `progress` gets bytes present so far. Returns bytes read now.
+    pub async fn fetch(
+        &self,
+        blob: &BlobRef,
+        author: [u8; 32],
+        mut progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        ensure!(
+            blob.size <= self.max_blob,
+            "blob is over {} bytes",
+            self.max_blob
+        );
+        let hash = Hash::from_bytes(blob.hash);
+        // The tag also keeps a partial download from GC, so it resumes later.
+        self.blobs.tags().set(hex(&blob.hash), hash).await?;
+        if self.blobs.has(hash).await? {
+            return Ok(0);
+        }
+        let mut peers: Vec<_> = self.st.lock().unwrap().store.peers()?;
+        peers.retain(|p| peer_addr(p).is_some_and(|a| a.id != self.net.id()));
+        peers.sort_by_key(|p| peer_addr(p).is_none_or(|a| *a.id.as_bytes() != author));
+        let mut last = anyhow::anyhow!("no member is reachable");
+        for p in peers {
+            let Some(addr) = peer_addr(&p) else { continue };
+            match self.fetch_from(addr, hash, &mut progress).await {
+                Ok(n) => return Ok(n),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    async fn fetch_from(
+        &self,
+        addr: EndpointAddr,
+        hash: Hash,
+        progress: &mut impl FnMut(u64),
+    ) -> Result<u64> {
+        let base = self.blobs.remote().local(hash).await?.local_bytes();
+        let conn = self.net.connect_blobs(addr).await?;
+        let mut s = self.blobs.remote().fetch(conn, hash).stream();
+        while let Some(item) = s.next().await {
+            match item {
+                GetProgressItem::Progress(n) => progress(base + n),
+                GetProgressItem::Done(st) => {
+                    ensure!(self.blobs.has(hash).await?, "peer has only part of it");
+                    return Ok(st.payload_bytes_read);
+                }
+                GetProgressItem::Error(e) => bail!("{e}"),
+            }
+        }
+        bail!("download stopped")
+    }
+
+    /// The decrypted media file, decrypting the blob on first use (the blob must be here).
+    // shortcut: plaintext cache in `dir/media` for <img>/<video> and "open with"; decrypt on the fly via a custom protocol if at-rest secrecy of media matters.
+    pub async fn media_path(&self, blob: &BlobRef) -> Result<PathBuf> {
+        let out = self.media_file(blob);
+        if out.exists() {
+            return Ok(out);
+        }
+        std::fs::create_dir_all(out.parent().context("media dir")?)?;
+        let tmp = self.temp()?;
+        let hash = Hash::from_bytes(blob.hash);
+        self.blobs.export(hash, &tmp).finish().await?;
+        let part = out.with_extension("part");
+        let (t, p, key) = (tmp.clone(), part.clone(), blob.key);
+        let res = tokio::task::spawn_blocking(move || mycel_media::decrypt(&t, &p, &key)).await?;
+        let _ = std::fs::remove_file(&tmp);
+        res?;
+        std::fs::rename(&part, &out)?;
+        Ok(out)
+    }
+
+    /// `dir/media/<hash>.<ext>`, the extension from the name or the mime subtype; exists once decrypted.
+    pub fn media_file(&self, b: &BlobRef) -> PathBuf {
+        let ext = b
+            .name
+            .as_deref()
+            .and_then(|n| Path::new(n).extension()?.to_str())
+            .or_else(|| b.mime.split(['/', ';']).nth(1))
+            .unwrap_or("bin");
+        let ext: String = ext
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        self.dir
+            .join("media")
+            .join(format!("{}.{ext}", hex(&b.hash)))
+    }
+
+    fn temp(&self) -> Result<PathBuf> {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r)?;
+        let d = self.dir.join("tmp");
+        std::fs::create_dir_all(&d)?;
+        Ok(d.join(hex(&r)))
+    }
+
+    /// Downloads every blob of the history that is not here yet (anchors).
+    pub fn fetch_missing(self: Arc<Self>) {
+        if let Ok(h) = self.history() {
+            self.fetch_all(h);
+        }
+    }
+
+    /// Anchors: download the blob of every Media event among `evs` that is not here yet.
+    fn fetch_all(self: Arc<Self>, evs: Vec<Event>) {
+        tokio::spawn(async move {
+            for ev in &evs {
+                if let Some((_, b)) = media(ev)
+                    && let Err(e) = self.fetch(b, ev.author_device, |_| {}).await
+                {
+                    eprintln!("mycel: blob fetch failed: {e}");
+                }
+            }
+        });
+    }
+
+    async fn serve_blobs(self: Arc<Self>, mut conns: BlobInbox) {
+        while let Some(conn) = conns.recv().await {
+            if !self.members().contains(conn.remote_id().as_bytes()) {
+                continue;
+            }
+            let store = (*self.blobs).clone();
+            tokio::spawn(iroh_blobs::provider::handle_connection(
+                conn,
+                store,
+                EventSender::DEFAULT,
+            ));
+        }
     }
 
     pub async fn close(&self) {
-        self.net.close().await
+        self.net.close().await;
+        // Releases the blob database lock, so the same folder can be opened again.
+        let _ = self.blobs.shutdown().await;
     }
 
     /// Peers we currently hold a connection to (the UI's connection indicator).
@@ -372,7 +606,7 @@ impl Node {
         let me = self.device_id();
         let last = evs
             .iter()
-            .filter(|e| e.author_device != me && matches!(e.body, EventBody::Text { .. }))
+            .filter(|e| e.author_device != me && is_msg(&e.body))
             .max_by_key(|e| e.lamport);
         if let Some(e) = last {
             let body = EventBody::Receipt {
@@ -608,6 +842,19 @@ fn peer_addr(p: &[u8]) -> Option<EndpointAddr> {
                 .ok()
         })?;
     Some(t.into())
+}
+
+/// A chat message shown to the user (has delivery ticks and receipts).
+fn is_msg(b: &EventBody) -> bool {
+    matches!(b, EventBody::Text { .. } | EventBody::Media { .. })
+}
+
+/// The media kind and blob of a Media event.
+pub fn media(ev: &Event) -> Option<(MediaKind, &BlobRef)> {
+    match &ev.body {
+        EventBody::Media { kind, blob, .. } => Some((*kind, blob)),
+        _ => None,
+    }
 }
 
 fn now_ms() -> Result<u64> {
