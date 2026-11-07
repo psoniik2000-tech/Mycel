@@ -463,11 +463,15 @@ function Chat(p: {
     setPending((ps) => (ps.some((x) => x.real && ids.has(x.real)) ? ps.filter((x) => !x.real || !ids.has(x.real)) : ps));
   });
   let tmp = 0;
+  // One send at a time: parallel invokes would reach the node (and get their order) in any order.
+  let chain: Promise<unknown> = Promise.resolve();
   const queue = async (m: Partial<Msg>, run: () => Promise<string>, undo?: () => void) => {
     const id = `tmp-${++tmp}`;
     setPending((ps) => [...ps, { id, author: p.me, mine: true, text: "", ts: Date.now(), status: 0, media: null, call: null, reply: null, edited: false, pinned: false, ...m }]);
     try {
-      const real = await run();
+      const job = chain.then(run);
+      chain = job.catch(() => {});
+      const real = await job;
       setPending((ps) => ps.map((x) => (x.id === id ? { ...x, real } : x)));
       setErr("");
       await p.reload();
@@ -548,6 +552,10 @@ function Chat(p: {
     const bottom = () => atBottom() && (list.scrollTop = list.scrollHeight);
     list.addEventListener("load", bottom, true);
     list.addEventListener("loadedmetadata", bottom, true);
+    // The reply bar or a growing input shrinks the list: keep the last message in view.
+    const ro = new ResizeObserver(bottom);
+    ro.observe(list);
+    onCleanup(() => ro.disconnect());
     const un = await getCurrentWebview().onDragDropEvent((e) => {
       if (e.payload.type === "drop") {
         setDrag(false);
@@ -621,9 +629,9 @@ function Chat(p: {
     const all = shown();
     const added = seen < 0 ? 0 : Math.max(0, all.length - seen);
     const stick = seen < 0 || untrack(atBottom) || (added > 0 && all.at(-1)!.mine);
-    const first = seen < 0;
     seen = all.length;
-    queueMicrotask(() => (stick ? toBottom(!first) : setFresh((n) => n + added)));
+    // Instant: a smooth scroll still running when the next message lands would read as "scrolled up".
+    queueMicrotask(() => (stick ? toBottom(false) : setFresh((n) => n + added)));
   });
   const onScroll = () => {
     setAtBottom(near());
