@@ -263,6 +263,11 @@ impl Node {
         self.net.close().await
     }
 
+    /// Peers we currently hold a connection to (the UI's connection indicator).
+    pub fn peers_online(&self) -> usize {
+        self.net.connected()
+    }
+
     /// Asks every known peer for what we miss (and offers what they miss).
     fn sync(&self) -> Result<()> {
         let st = self.st.lock().unwrap();

@@ -114,6 +114,15 @@ impl Net {
         self.ep.close().await
     }
 
+    /// Number of peers with an open sync connection.
+    pub fn connected(&self) -> usize {
+        let conns = self.conns.lock().unwrap();
+        conns
+            .values()
+            .filter(|c| c.close_reason().is_none())
+            .count()
+    }
+
     /// Caches the connection for replies and reads envelopes from it until it closes.
     fn track(&self, conn: Connection) {
         let peer = conn.remote_id();

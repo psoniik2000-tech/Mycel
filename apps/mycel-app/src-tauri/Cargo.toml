@@ -1,0 +1,15 @@
+[package]
+name = "mycel-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mycel-core.workspace = true
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+anyhow.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
