@@ -20,3 +20,10 @@ iroh-relay = { version = "1.4.1", features = ["server"] }
 postcard = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "time"] }
 anyhow = "1"
+
+# Smaller target/debug: line numbers in backtraces only, no debug info for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
