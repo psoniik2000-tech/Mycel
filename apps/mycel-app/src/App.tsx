@@ -649,6 +649,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
   const [now, setNow] = createSignal(Date.now());
   const [mic, setMic] = createSignal(true);
   const [cam, setCam] = createSignal(p.a.video);
+  const [gear, setGear] = createSignal(false);
   const t = setInterval(() => setNow(Date.now()), 500);
   onCleanup(() => clearInterval(t));
   // Ringback until someone answers.
@@ -689,8 +690,12 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
           title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={24} /> : <MicOff size={24} />}</button>
         <button class="round" classList={{ off: !cam() }} onClick={toggleCam}
           title={cam() ? "Выключить камеру" : "Включить камеру"}>{cam() ? <Video size={24} /> : <VideoOff size={24} />}</button>
+        <button class="round" classList={{ off: gear() }} onClick={() => setGear(!gear())} title="Голос и видео"><Settings size={24} /></button>
         <button class="round hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={24} /></button>
       </div>
+      <Show when={gear()}>
+        <div class="call-settings scroll pad"><VoiceSettings /></div>
+      </Show>
     </div>
   );
 }

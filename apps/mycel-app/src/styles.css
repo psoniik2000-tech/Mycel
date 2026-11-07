@@ -257,13 +257,14 @@ button.round.off { background: #eee; color: #222; }
 button.round.hang { background: #d6453a; }
 button.round.accept { background: #2f9e55; }
 
-label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 6px 0; }
+label.check input { width: auto; }
 
 /* Settings → Voice & video */
 .voice-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; }
 .field { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; font-size: 14px; }
 .field select { padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--field); color: var(--text); }
-.field input[type="range"] { accent-color: var(--accent); }
+.field input[type="range"] { accent-color: var(--accent); padding: 0; border: 0; }
 .meter { position: relative; height: 12px; border-radius: 6px; background: var(--hover); overflow: hidden; margin: 6px 0 10px; }
 .meter-fill { position: absolute; inset: 0 auto 0 0; background: var(--muted); transition: width 60ms linear; }
 .meter.open .meter-fill { background: var(--online); }
@@ -279,3 +280,4 @@ label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .signal.q1 i:nth-child(1) { background: var(--offline); }
 .signal-tip { display: none; position: absolute; left: 0; bottom: 18px; white-space: nowrap; background: #000c; color: #fff; padding: 6px 10px; border-radius: 8px; font-size: 12px; line-height: 1.5; z-index: 2; }
 .signal:hover .signal-tip, .signal-tip.shown { display: block; }
+.call-settings { position: absolute; top: 0; right: 0; bottom: 96px; border-radius: 0 0 0 12px; width: min(380px, 100%); background: var(--panel); color: var(--text); box-shadow: var(--shadow); z-index: 3; }
