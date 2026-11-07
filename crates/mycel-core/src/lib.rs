@@ -189,7 +189,13 @@ impl Node {
         tokio::spawn(async move {
             while let Some((from, msg)) = inbox.recv().await {
                 match n.handle(from, msg) {
-                    Ok(evs) => {
+                    Ok(mut evs) => {
+                        if !evs.is_empty() {
+                            match n.apply_deletes() {
+                                Ok(gone) => evs.retain(|e| !gone.contains(&e.id)),
+                                Err(e) => eprintln!("mycel: delete failed: {e}"),
+                            }
+                        }
                         n.send_receipt(&evs);
                         if n.keep_blobs {
                             n.clone().fetch_all(evs.clone());
@@ -320,12 +326,118 @@ impl Node {
     }
 
     /// Signs, encrypts (MLS), stores and sends a text event to every known peer.
-    pub fn send_text(&self, text: &str) -> Result<Event> {
+    pub fn send_text(&self, text: &str, reply_to: Option<EventId>) -> Result<Event> {
         self.send_event(EventBody::Text {
             text: text.into(),
-            reply_to: None,
+            reply_to,
             mentions: vec![],
         })
+    }
+
+    fn event(&self, id: &EventId) -> Result<Event> {
+        let h = self.history()?;
+        h.into_iter()
+            .find(|e| e.id == *id)
+            .context("no such message")
+    }
+
+    /// Replaces the text of an own message (or the caption of own media).
+    pub fn edit(&self, target: EventId, text: &str) -> Result<Event> {
+        let t = self.event(&target)?;
+        ensure!(
+            t.author_device == self.device_id() && is_msg(&t.body),
+            "only own messages can be edited"
+        );
+        self.send_event(EventBody::Edit {
+            target,
+            new_text: text.into(),
+        })
+    }
+
+    /// Deletes a message here; `for_all` also sends a Delete (own messages, or any one by the admin).
+    pub fn delete(&self, target: EventId, for_all: bool) -> Result<()> {
+        if for_all {
+            let t = self.event(&target)?;
+            let me = self.device_id();
+            ensure!(
+                t.author_device == me || self.admin()? == me,
+                "only the author or the admin can delete for everyone"
+            );
+            self.send_event(EventBody::Delete { target })?;
+        }
+        self.wipe(&[target])
+    }
+
+    pub fn pin(&self, target: EventId, pinned: bool) -> Result<Event> {
+        self.send_event(EventBody::Pin { target, pinned })
+    }
+
+    /// Sends a copy of a text or media message as a new own message.
+    pub fn forward(&self, target: EventId) -> Result<Event> {
+        let body = match self.event(&target)?.body {
+            EventBody::Text { text, .. } => EventBody::Text {
+                text,
+                reply_to: None,
+                mentions: vec![],
+            },
+            EventBody::Media {
+                kind,
+                blob,
+                caption,
+                ..
+            } => EventBody::Media {
+                kind,
+                blob,
+                caption,
+                reply_to: None,
+            },
+            _ => bail!("not a message"),
+        };
+        self.send_event(body)
+    }
+
+    /// Erases events with their decrypted media and blobs from this device.
+    fn wipe(&self, ids: &[EventId]) -> Result<()> {
+        let mut gone = vec![];
+        {
+            let st = self.st.lock().unwrap();
+            for id in ids {
+                if let Some(b) = st.store.take_event(id)? {
+                    gone.push(postcard::from_bytes::<Event>(&b)?);
+                }
+            }
+        }
+        for ev in &gone {
+            if let Some((_, b)) = media(ev) {
+                let _ = std::fs::remove_file(self.media_file(b));
+                let (blobs, tag) = (self.blobs.clone(), hex(&b.hash));
+                tokio::spawn(async move { blobs.tags().delete(tag).await });
+            }
+        }
+        Ok(())
+    }
+
+    /// Wipes the targets of valid Delete events still here (a Delete may arrive before its
+    /// target); returns their ids.
+    fn apply_deletes(&self) -> Result<HashSet<EventId>> {
+        let hist = self.history()?;
+        let admin = self.admin()?;
+        let author: HashMap<_, _> = hist.iter().map(|e| (e.id, e.author_device)).collect();
+        let ids: HashSet<_> = hist
+            .iter()
+            .filter_map(|e| match e.body {
+                EventBody::Delete { target }
+                    if author
+                        .get(&target)
+                        .is_some_and(|a| *a == e.author_device || e.author_device == admin) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            })
+            .collect();
+        self.wipe(&ids.iter().copied().collect::<Vec<_>>())?;
+        Ok(ids)
     }
 
     /// Delivery of own text events (§7.4): 0 ⏱ nobody confirmed yet, 1 ✓ some member device has it,
@@ -859,6 +971,30 @@ fn peer_addr(p: &[u8]) -> Option<EndpointAddr> {
 }
 
 /// A chat message shown to the user (has delivery ticks and receipts).
+/// What edits and pins say over a history: the latest text of each edited message (its
+/// author's edits only) and the pinned messages, oldest pin first.
+pub fn edits_and_pins(hist: &[Event]) -> (HashMap<EventId, String>, Vec<EventId>) {
+    let author: HashMap<_, _> = hist.iter().map(|e| (e.id, e.author_device)).collect();
+    let (mut edits, mut pins) = (HashMap::new(), vec![]);
+    for e in hist {
+        match &e.body {
+            EventBody::Edit { target, new_text }
+                if author.get(target) == Some(&e.author_device) =>
+            {
+                edits.insert(*target, new_text.clone());
+            }
+            EventBody::Pin { target, pinned } if author.contains_key(target) => {
+                pins.retain(|p| p != target);
+                if *pinned {
+                    pins.push(*target);
+                }
+            }
+            _ => {}
+        }
+    }
+    (edits, pins)
+}
+
 fn is_msg(b: &EventBody) -> bool {
     matches!(b, EventBody::Text { .. } | EventBody::Media { .. })
 }

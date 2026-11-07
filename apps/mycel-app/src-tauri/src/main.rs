@@ -1,8 +1,8 @@
 //! Tauri shell: thin commands over mycel-core; new events go to the UI as `message`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mycel_core::mycel_proto::{BlobRef, CallAction, Event, EventBody, MediaKind, Preview};
-use mycel_core::{Node, Opts, media};
+use mycel_core::mycel_proto::{BlobRef, CallAction, Event, EventBody, EventId, MediaKind, Preview};
+use mycel_core::{Node, Opts, edits_and_pins, media};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,49 @@ struct Msg {
     status: u8,
     media: Option<Media>,
     call: Option<CallView>,
+    reply: Option<Reply>,
+    edited: bool,
+    pinned: bool,
+}
+
+/// The quoted message above a reply.
+#[derive(Serialize, Clone)]
+struct Reply {
+    id: String,
+    author: String,
+    text: String,
+}
+
+/// What a history says about its messages beyond their own events.
+struct Ctx<'a> {
+    calls: HashMap<String, CallView>,
+    edits: HashMap<EventId, String>,
+    pins: Vec<EventId>,
+    by_id: HashMap<EventId, &'a Event>,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(n: &Node, hist: &'a [Event]) -> Self {
+        let (edits, pins) = edits_and_pins(hist);
+        Ctx {
+            calls: calls(n, hist),
+            edits,
+            pins,
+            by_id: hist.iter().map(|e| (e.id, e)).collect(),
+        }
+    }
+
+    /// Text (or caption) after edits.
+    fn text(&self, ev: &Event) -> String {
+        if let Some(t) = self.edits.get(&ev.id) {
+            return t.clone();
+        }
+        match &ev.body {
+            EventBody::Text { text, .. } => text.clone(),
+            EventBody::Media { caption, .. } => caption.clone().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
 }
 
 /// A call as the chat feed and the Calls tab show it (built from its Call events).
@@ -107,15 +150,15 @@ fn short(id: &[u8; 32]) -> String {
     id[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn msg(n: &Node, ev: &Event, calls: &HashMap<String, CallView>) -> Option<Msg> {
+fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
     if let EventBody::Call {
         call_id,
         action: CallAction::Offer { .. },
     } = &ev.body
     {
-        let c = calls.get(&hex(call_id))?.clone();
+        let c = cx.calls.get(&hex(call_id))?.clone();
         return Some(Msg {
-            id: short(&ev.id),
+            id: hex(&ev.id),
             author: short(&ev.author_device),
             mine: c.mine,
             text: String::new(),
@@ -123,30 +166,48 @@ fn msg(n: &Node, ev: &Event, calls: &HashMap<String, CallView>) -> Option<Msg> {
             status: 2,
             media: None,
             call: Some(c),
+            reply: None,
+            edited: false,
+            pinned: false,
         });
     }
-    let (text, media) = match &ev.body {
-        EventBody::Text { text, .. } => (text.clone(), None),
+    let (mv, reply_to) = match &ev.body {
+        EventBody::Text { reply_to, .. } => (None, reply_to),
         EventBody::Media {
             kind,
             blob,
-            caption,
+            reply_to,
             ..
-        } => (
-            caption.clone().unwrap_or_default(),
-            Some(media_view(n, *kind, blob)),
-        ),
+        } => (Some(media_view(n, *kind, blob)), reply_to),
         _ => return None,
     };
+    let reply = reply_to.map(|r| match cx.by_id.get(&r) {
+        Some(t) => Reply {
+            id: hex(&r),
+            author: short(&t.author_device),
+            text: match (cx.text(t), media(t)) {
+                (s, Some((_, b))) if s.is_empty() => b.name.clone().unwrap_or("Медиа".into()),
+                (s, _) => s,
+            },
+        },
+        None => Reply {
+            id: hex(&r),
+            author: String::new(),
+            text: "Сообщение удалено".into(),
+        },
+    });
     Some(Msg {
-        id: short(&ev.id),
+        id: hex(&ev.id),
         author: short(&ev.author_device),
         mine: ev.author_device == n.device_id(),
-        text,
+        text: cx.text(ev),
         ts: ev.timestamp_ms,
         status: 0,
-        media,
+        media: mv,
         call: None,
+        reply,
+        edited: cx.edits.contains_key(&ev.id),
+        pinned: cx.pins.contains(&ev.id),
     })
 }
 
@@ -154,12 +215,16 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn call_id(s: &str) -> R<[u8; 16]> {
+fn unhex<const N: usize>(s: &str) -> R<[u8; N]> {
     let v: Vec<u8> = (0..s.len())
         .step_by(2)
         .filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect();
-    v.try_into().map_err(|_| "bad call id".into())
+    v.try_into().map_err(|_| "bad id".into())
+}
+
+fn call_id(s: &str) -> R<[u8; 16]> {
+    unhex(s)
 }
 
 /// Every call in the history by hex id.
@@ -240,10 +305,17 @@ fn find_media(n: &Node, id: &str) -> R<(Event, BlobRef)> {
     let hist = n.history().map_err(err)?;
     let ev = hist
         .into_iter()
-        .find(|e| short(&e.id) == id)
+        .find(|e| hex(&e.id) == id)
         .ok_or("no such message")?;
     let b = media(&ev).ok_or("not a media message")?.1.clone();
     Ok((ev, b))
+}
+
+/// A fresh temp path: parallel sends must not share one.
+fn tmp_file(ext: &str) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mycel-{}-{n}.{ext}", std::process::id()))
 }
 
 fn blob_meta(mime: &str, name: Option<String>) -> BlobRef {
@@ -280,7 +352,7 @@ fn mime_of(ext: &str) -> &'static str {
 /// (short id, status) of own messages.
 fn statuses(n: &Node) -> Vec<(String, u8)> {
     let s = n.statuses().unwrap_or_default();
-    s.iter().map(|(id, st)| (short(id), *st)).collect()
+    s.iter().map(|(id, st)| (hex(id), *st)).collect()
 }
 
 /// `MYCEL_DIR` overrides the data folder (a second profile on one PC, tests).
@@ -349,15 +421,12 @@ async fn unlock(app: AppHandle, st: State<'_, App>, password: String, n0: bool) 
                 );
                 continue;
             }
-            match msg(&node, &ev, &HashMap::new()) {
-                Some(m) => {
-                    let _ = app.emit("message", m);
-                }
-                // A receipt (or other non-text event) may change the ticks.
-                None => {
-                    let _ = app.emit("status", statuses(&node));
-                }
-            }
+            // The UI reloads the history on `message` / `changed`; receipts only move the ticks.
+            let _ = match &ev.body {
+                EventBody::Text { .. } | EventBody::Media { .. } => app.emit("message", ()),
+                EventBody::Receipt { .. } => app.emit("status", statuses(&node)),
+                _ => app.emit("changed", ()),
+            };
         }
     });
     Ok(in_space)
@@ -389,10 +458,10 @@ async fn history(st: State<'_, App>) -> R<Vec<Msg>> {
     let n = st.node()?;
     let st: HashMap<_, _> = statuses(n).into_iter().collect();
     let hist = n.history().map_err(err)?;
-    let calls = calls(n, &hist);
+    let cx = Ctx::new(n, &hist);
     Ok(hist
         .iter()
-        .filter_map(|e| msg(n, e, &calls))
+        .filter_map(|e| msg(n, e, &cx))
         .map(|m| Msg {
             status: st.get(&m.id).copied().unwrap_or(0),
             ..m
@@ -401,15 +470,47 @@ async fn history(st: State<'_, App>) -> R<Vec<Msg>> {
 }
 
 #[tauri::command]
-async fn send(st: State<'_, App>, text: String) -> R<Msg> {
+/// Returns the new event's id (the UI swaps its pending bubble for it).
+async fn send(st: State<'_, App>, text: String, reply_to: Option<String>) -> R<String> {
+    let r = reply_to.map(|r| unhex(&r)).transpose()?;
+    let ev = st.node()?.send_text(&text, r).map_err(err)?;
+    Ok(hex(&ev.id))
+}
+
+#[tauri::command]
+async fn edit(st: State<'_, App>, id: String, text: String) -> R<()> {
+    st.node()?.edit(unhex(&id)?, &text).map_err(err)?;
+    Ok(())
+}
+
+/// Several at once (selection mode); stops at the first refusal.
+#[tauri::command]
+async fn delete(st: State<'_, App>, ids: Vec<String>, all: bool) -> R<()> {
     let n = st.node()?;
-    let ev = n.send_text(&text).map_err(err)?;
-    msg(n, &ev, &HashMap::new()).ok_or_else(|| "not a text event".into())
+    for id in ids {
+        n.delete(unhex(&id)?, all).map_err(err)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn forward(st: State<'_, App>, ids: Vec<String>) -> R<()> {
+    let n = st.node()?;
+    for id in ids {
+        n.forward(unhex(&id)?).map_err(err)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn pin(st: State<'_, App>, id: String, pinned: bool) -> R<()> {
+    st.node()?.pin(unhex(&id)?, pinned).map_err(err)?;
+    Ok(())
 }
 
 /// 📎 / drag-and-drop: photos are re-encoded (no EXIF) unless `original`, then they go as a file.
 #[tauri::command]
-async fn send_file(st: State<'_, App>, path: String, original: bool) -> R<Msg> {
+async fn send_file(st: State<'_, App>, path: String, original: bool) -> R<String> {
     let n = st.node()?;
     let src = Path::new(&path);
     let name = src.file_name().map(|s| s.to_string_lossy().into_owned());
@@ -424,7 +525,7 @@ async fn send_file(st: State<'_, App>, path: String, original: bool) -> R<Msg> {
             .await
             .map_err(|e| e.to_string())?
             .map_err(err)?;
-        let tmp = std::env::temp_dir().join(format!("mycel-{}.jpg", std::process::id()));
+        let tmp = tmp_file("jpg");
         std::fs::write(&tmp, &ph.jpeg).map_err(|e| e.to_string())?;
         let mut m = blob_meta("image/jpeg", name.map(|n| format!("{n}.jpg")));
         m.preview = Some(Preview::Blurhash(ph.blurhash));
@@ -443,12 +544,12 @@ async fn send_file(st: State<'_, App>, path: String, original: bool) -> R<Msg> {
             .await
             .map_err(err)?
     };
-    msg(n, &ev, &HashMap::new()).ok_or_else(|| "not a media event".into())
+    Ok(hex(&ev.id))
 }
 
 /// A recording from the WebView (raw body); headers: kind (voice|videonote), mime, duration, wave (csv).
 #[tauri::command]
-async fn send_rec(st: State<'_, App>, request: tauri::ipc::Request<'_>) -> R<Msg> {
+async fn send_rec(st: State<'_, App>, request: tauri::ipc::Request<'_>) -> R<String> {
     let n = st.node()?;
     let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
         return Err("expected raw bytes".into());
@@ -476,11 +577,11 @@ async fn send_rec(st: State<'_, App>, request: tauri::ipc::Request<'_>) -> R<Msg
     if !wave.is_empty() {
         m.preview = Some(Preview::Waveform(wave));
     }
-    let tmp = std::env::temp_dir().join(format!("mycel-rec-{}", std::process::id()));
+    let tmp = tmp_file("rec");
     std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
     let r = n.send_media(kind, &tmp, m, None).await;
     let _ = std::fs::remove_file(&tmp);
-    msg(n, &r.map_err(err)?, &HashMap::new()).ok_or_else(|| "not a media event".into())
+    Ok(hex(&r.map_err(err)?.id))
 }
 
 #[derive(Serialize, Clone)]
@@ -666,6 +767,10 @@ fn main() {
             invite,
             history,
             send,
+            edit,
+            delete,
+            forward,
+            pin,
             send_file,
             send_rec,
             fetch_media,

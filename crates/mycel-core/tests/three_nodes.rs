@@ -62,9 +62,9 @@ async fn invite_join_encrypt_sync_restart() {
     let c_id = c.device_id();
     c.close().await;
     drop(c);
-    a.send_text("hello from a").unwrap();
+    a.send_text("hello from a", None).unwrap();
     assert_eq!(text(&recv(&mut rx_b).await), "hello from a");
-    b.send_text("hello from b").unwrap();
+    b.send_text("hello from b", None).unwrap();
     assert_eq!(text(&recv(&mut rx_a).await), "hello from b");
 
     // Envelopes are MLS ciphertext: no plaintext in what is stored and forwarded.
@@ -87,7 +87,7 @@ async fn invite_join_encrypt_sync_restart() {
     assert_eq!(got[0].author_device, a.device_id());
 
     // MLS keeps working after the restart.
-    c.send_text("c is back").unwrap();
+    c.send_text("c is back", None).unwrap();
     let ev = recv(&mut rx_b).await;
     assert_eq!(text(&ev), "c is back");
     let hist: Vec<_> = c.history().unwrap();
@@ -134,7 +134,7 @@ async fn anchor_store_and_forward_receipts() {
 
     c.close().await;
     drop(c);
-    let ev = a.send_text("for c").unwrap();
+    let ev = a.send_text("for c", None).unwrap();
     assert_eq!(text(&recv(&mut rx_b).await), "for c");
     let status = |n: &Node| {
         let s = n.statuses().unwrap();

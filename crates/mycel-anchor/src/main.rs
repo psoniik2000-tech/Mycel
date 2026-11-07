@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
             });
             while let Some(line) = lines.next_line().await? {
                 if !line.trim().is_empty() {
-                    node.send_text(&line)?;
+                    node.send_text(&line, None)?;
                 }
             }
         }

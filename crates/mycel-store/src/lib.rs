@@ -104,6 +104,16 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Removes an event; returns its data if it was here.
+    pub fn take_event(&self, id: &[u8]) -> Result<Option<Vec<u8>>> {
+        let data = self
+            .db
+            .query_row("SELECT data FROM events WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        self.db.execute("DELETE FROM events WHERE id = ?1", [id])?;
+        Ok(data)
+    }
+
     /// All events, oldest first.
     pub fn events(&self) -> Result<Vec<Vec<u8>>> {
         let mut st = self
