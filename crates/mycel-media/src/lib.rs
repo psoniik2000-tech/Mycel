@@ -2,7 +2,8 @@
 
 use anyhow::{Result, anyhow};
 use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
 use image::{
     DynamicImage, ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder, imageops::FilterType,
 };
@@ -99,6 +100,41 @@ pub fn photo(src: &Path) -> Result<Photo> {
     })
 }
 
+/// Call frame (§9): `kind`, big-endian `seq`, then ChaCha20-Poly1305 of `data` with the header as AAD.
+/// `key` is per sender and call, so `seq` (never repeated by that sender) is a safe nonce.
+pub fn seal_frame(key: &[u8; 32], kind: u8, seq: u64, data: &[u8]) -> Vec<u8> {
+    let mut pkt = vec![kind];
+    pkt.extend_from_slice(&seq.to_be_bytes());
+    let ct = ChaCha20Poly1305::new(key.into())
+        .encrypt(
+            &nonce(seq).into(),
+            Payload {
+                msg: data,
+                aad: &pkt,
+            },
+        )
+        .expect("chacha encrypt");
+    pkt.extend_from_slice(&ct);
+    pkt
+}
+
+/// Opens a `seal_frame` packet: (kind, seq, data).
+pub fn open_frame(key: &[u8; 32], pkt: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
+    anyhow::ensure!(pkt.len() >= 9 + 16, "short frame");
+    let (hdr, ct) = pkt.split_at(9);
+    let seq = u64::from_be_bytes(hdr[1..].try_into()?);
+    let data = ChaCha20Poly1305::new(key.into())
+        .decrypt(&nonce(seq).into(), Payload { msg: ct, aad: hdr })
+        .map_err(|_| anyhow!("bad frame key or tampered"))?;
+    Ok((hdr[0], seq, data))
+}
+
+fn nonce(seq: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[4..].copy_from_slice(&seq.to_be_bytes());
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +157,17 @@ mod tests {
                 assert!(decrypt(&p("t"), &p("c"), &key).is_err());
             }
         }
+    }
+
+    #[test]
+    fn frame_keys() {
+        let (k, other) = ([1; 32], [2; 32]);
+        let pkt = seal_frame(&k, 1, 42, b"opus");
+        assert_eq!(open_frame(&k, &pkt).unwrap(), (1, 42, b"opus".to_vec()));
+        assert!(open_frame(&other, &pkt).is_err());
+        let mut bad = pkt.clone();
+        bad[8] ^= 1; // seq is authenticated
+        assert!(open_frame(&k, &bad).is_err());
     }
 
     #[test]

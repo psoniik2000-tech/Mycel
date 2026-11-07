@@ -166,6 +166,12 @@ impl Mls {
         }
     }
 
+    /// MLS exporter secret of the current epoch (call frame keys, §9).
+    pub fn export(&self, label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+        let g = self.group.as_ref().context("no group")?;
+        Ok(g.export_secret(self.provider.crypto(), label, context, len)?)
+    }
+
     pub fn epoch(&self) -> u64 {
         self.group.as_ref().map_or(0, |g| g.epoch().as_u64())
     }

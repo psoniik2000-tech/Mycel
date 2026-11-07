@@ -4,21 +4,31 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  ArrowLeft, Check, CheckCheck, Clock, Copy, Hash, Link, LogOut, MessageCircle, Mic, Paperclip, Plus, Send, Settings, UserPlus, Users, Video, X,
+  ArrowLeft, Check, CheckCheck, Clock, Copy, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Phone, PhoneMissed, PhoneOff, Plus, Send,
+  Settings, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
 import { record, Recording, waveform } from "./capture";
+import { CallMedia, Peer, ring } from "./call";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
-type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null };
+type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null };
+type CallView = { id: string; video: boolean; author: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
+type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; ts: number };
+type Active = { id: string; video: boolean; started: number; peers: string[] };
 type Member = { id: string; me: boolean; admin: boolean };
 type Status = { dir: string; exists: boolean; unlocked: boolean; in_space: boolean };
-type Tab = "chats" | "people" | "settings";
+type Tab = "chats" | "calls" | "people" | "settings";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 const hue = (id: string) => parseInt(id.slice(0, 4), 16) % 360;
 const errText = (e: unknown) => String(e);
+const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+const callLabel = (c: CallView) =>
+  c.missed ? (c.mine ? "Без ответа" : "Пропущенный звонок")
+  : c.active ? "Идёт звонок"
+  : `${c.video ? "Видеозвонок" : "Звонок"}, ${clock(c.duration_ms ?? 0)}`;
 
 function Avatar(p: { id: string }) {
   return (
@@ -82,7 +92,7 @@ function Lock(p: { exists: boolean; onDone: (inSpace: boolean) => void }) {
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { password: pw() }));
+      p.onDone(await invoke<boolean>("unlock", { password: pw(), n0: localStorage.getItem("n0") !== "0" }));
     } catch (e) {
       setErr(p.exists ? "Неверный пароль" : errText(e));
     }
@@ -156,17 +166,88 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
   createEffect(() => chatVisible() && setUnread(0));
 
   const loadMembers = () => invoke<Member[]>("members").then(setMembers);
+  const reload = () => invoke<Msg[]>("history").then(setMsgs);
+
+  // Calls (§9): `incoming` rings full screen; `active` is the call screen (started = 0 while ringing out).
+  const [incoming, setIncoming] = createSignal<CallSignal>();
+  const [active, setActive] = createSignal<Active>();
+  const [callErr, setCallErr] = createSignal("");
+  let media: CallMedia | undefined;
+  const [tiles, setTiles] = createSignal<Peer[]>([]);
+  const endCall = async () => {
+    media?.stop();
+    media = undefined;
+    setTiles([]);
+    setActive(undefined);
+    await invoke("call_end").catch(() => {});
+    reload();
+  };
+  const openMedia = async (video: boolean) => {
+    media = new CallMedia(setTiles);
+    await media.start(video);
+  };
+  const startCall = async (video: boolean) => {
+    if (active()) return;
+    setCallErr("");
+    try {
+      await openMedia(video);
+      setActive({ id: await invoke<string>("call_start", { video }), video, started: 0, peers: [] });
+      reload();
+      // Nobody answers in 45 s: hang up (the feed shows "no answer").
+      const id = active()!.id;
+      setTimeout(() => active()?.id === id && !active()!.started && endCall(), 45_000);
+    } catch (e) {
+      setCallErr("Не удалось начать звонок: " + errText(e));
+      endCall();
+    }
+  };
+  const acceptCall = async () => {
+    const c = incoming()!;
+    setIncoming(undefined);
+    if (active()) await endCall();
+    setCallErr("");
+    try {
+      await openMedia(c.video);
+      const peers = await invoke<string[]>("call_accept", { id: c.id });
+      setActive({ id: c.id, video: c.video, started: Date.now(), peers });
+    } catch (e) {
+      setCallErr("Не удалось ответить: " + errText(e));
+      endCall();
+    }
+  };
+  const rejectCall = () => {
+    const c = incoming()!;
+    setIncoming(undefined);
+    invoke("call_reject", { id: c.id });
+  };
+  const onCall = (c: CallSignal) => {
+    const a = active();
+    if (c.action === "offer" && Date.now() - c.ts < 60_000 && !incoming()) setIncoming(c);
+    if ((c.action === "end" || c.action === "reject") && incoming()?.id === c.id && incoming()!.author === c.author) setIncoming(undefined);
+    if (a?.id === c.id) {
+      if (c.action === "accept") setActive({ ...a, started: a.started || Date.now(), peers: [...new Set([...a.peers, c.author])] });
+      if (c.action === "end" || c.action === "reject") {
+        const peers = a.peers.filter((p) => p !== c.author);
+        setActive({ ...a, peers });
+        // Everyone left (or the only other member declined): hang up.
+        if ((a.started && !peers.length) || (c.action === "reject" && members().length <= 2)) endCall();
+      }
+    }
+    reload();
+  };
   const pollPeers = () => invoke<number>("peers").then(setPeers);
   onMount(async () => {
     setMsgs(await invoke<Msg[]>("history"));
     loadMembers();
     pollPeers();
-    const timer = setInterval(pollPeers, 3000);
+    // A join comes as an MLS commit, not a message: poll members with peers.
+    const timer = setInterval(() => (pollPeers(), loadMembers()), 3000);
     const un = await listen<Msg>("message", (e) => {
       setMsgs((m) => [...m, e.payload]);
       if (!chatVisible()) setUnread((n) => n + 1);
       loadMembers();
     });
+    const unCall = await listen<CallSignal>("call", (e) => onCall(e.payload));
     const unStatus = await listen<[string, number][]>("status", (e) => {
       const st = new Map(e.payload);
       setMsgs((all) => all.map((m) => (st.has(m.id) ? { ...m, status: st.get(m.id)! } : m)));
@@ -180,7 +261,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     onCleanup(() => {
       clearInterval(timer);
       un();
+      unCall();
       unStatus();
+      media && endCall();
       wideQuery.removeEventListener("change", onWide);
       removeEventListener("focus", onFocus);
       removeEventListener("blur", onBlur);
@@ -188,7 +271,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
   });
 
   const last = () => msgs().at(-1);
-  const titles = { chats: "Чаты", people: "Люди", settings: "Настройки" };
+  const titles = { chats: "Чаты", calls: "Звонки", people: "Люди", settings: "Настройки" };
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
     <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); }} title={label}>
       <Icon size={22} />
@@ -202,6 +285,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       <nav class="rail">
         <img src={logo} class="rail-logo" alt="Mycel" />
         {navItem("chats", "Чаты", MessageCircle)}
+        {navItem("calls", "Звонки", Phone)}
         {navItem("people", "Люди", Users)}
         {navItem("settings", "Настройки", Settings)}
       </nav>
@@ -218,11 +302,14 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
               <div class="grow">
                 <div class="row-top"><b>Общий чат</b><small class="muted">{last() ? time(last()!.ts) : ""}</small></div>
                 <div class="row-bottom">
-                  <span class="muted ellipsis">{last() ? (last()!.mine ? "Вы: " : "") + (last()!.media ? label(last()!.media!) : last()!.text) : "Сообщений пока нет"}</span>
+                  <span class="muted ellipsis">{last() ? (last()!.mine ? "Вы: " : "") + (last()!.call ? callLabel(last()!.call!) : last()!.media ? label(last()!.media!) : last()!.text) : "Сообщений пока нет"}</span>
                   <Show when={unread()}><b class="badge">{unread()}</b></Show>
                 </div>
               </div>
             </button>
+          </Match>
+          <Match when={tab() === "calls"}>
+            <Calls msgs={msgs()} />
           </Match>
           <Match when={tab() === "people"}>
             <People members={members()} />
@@ -237,6 +324,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
                   )}
                 </For>
               </div>
+              <h3>Связь</h3>
+              <label class="check">
+                <input type="checkbox" checked={localStorage.getItem("n0") !== "0"} onChange={(e) => localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0")} />
+                Резервный публичный сервер связи (n0)
+              </label>
+              <p class="muted">Помогает соединиться, когда нет своего якоря. Можно выключить, если якорь настроен. Применяется после перезапуска.</p>
               <h3>Данные</h3>
               <p class="muted">Зашифрованная база хранится здесь:</p>
               <code class="path">{p.dir}</code>
@@ -247,7 +340,13 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       </section>
 
       <Chat msgs={msgs()} members={members().length} peers={peers()} back={() => setChatOpen(false)}
-        onSent={(m) => setMsgs((all) => [...all, m])} />
+        onSent={(m) => setMsgs((all) => [...all, m])} inCall={!!active()} onCall={startCall} callErr={callErr()} />
+      <Show when={incoming()}>
+        <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
+      </Show>
+      <Show when={active()}>
+        <CallScreen a={active()!} tiles={tiles()} media={media!} onEnd={endCall} />
+      </Show>
     </div>
   );
 }
@@ -307,7 +406,10 @@ function People(p: { members: Member[] }) {
   );
 }
 
-function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void; onSent: (m: Msg) => void }) {
+function Chat(p: {
+  msgs: Msg[]; members: number; peers: number; back: () => void; onSent: (m: Msg) => void;
+  inCall: boolean; onCall: (video: boolean) => void; callErr: string;
+}) {
   const [text, setText] = createSignal("");
   const [err, setErr] = createSignal("");
   const [view, setView] = createSignal("");
@@ -435,11 +537,20 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
           <div class="muted small">{p.members} участн.</div>
         </div>
         <NetDot n={p.peers} />
+        <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
+          title={p.members > 2 ? "Групповой звонок" : "Звонок"}><Phone size={20} /></button>
+        <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}
+          title={p.members > 2 ? "Групповой видеозвонок" : "Видеозвонок"}><Video size={20} /></button>
       </header>
       <div class="msgs" ref={list}>
         <Show when={!p.msgs.length}><p class="empty muted">Здесь пока тихо. Напишите первым!</p></Show>
         <For each={p.msgs}>
-          {(m, i) => (
+          {(m, i) => m.call ? (
+            <div class="call-line" classList={{ missed: m.call.missed }}>
+              {m.call.missed ? <PhoneMissed size={14} /> : m.call.video ? <Video size={14} /> : <Phone size={14} />}
+              {m.mine ? "" : `Участник ${m.author} · `}{callLabel(m.call)} · {time(m.ts)}
+            </div>
+          ) : (
             <div class="msg" classList={{ mine: m.mine, cont: p.msgs[i() - 1]?.author === m.author }}>
               <div class="bubble">
                 <Show when={!m.mine && p.msgs[i() - 1]?.author !== m.author}>
@@ -462,7 +573,7 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
           )}
         </For>
       </div>
-      <Show when={err()}><p class="error pad-x">{err()}</p></Show>
+      <Show when={err() || p.callErr}><p class="error pad-x">{err() || p.callErr}</p></Show>
       <Show when={drag()}><div class="drop">Отпустите, чтобы отправить</div></Show>
       <Show when={view()}><div class="viewer" onClick={() => setView("")}><img src={view()} alt="" /></div></Show>
       <Show when={rec() && video()}><video ref={preview} class="circle live" autoplay muted playsinline /></Show>
@@ -493,5 +604,91 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
         <button class="icon send" disabled={!text().trim()} onClick={send} title="Отправить"><Send size={20} /></button>
       </div>
     </section>
+  );
+}
+
+function Calls(p: { msgs: Msg[] }) {
+  const calls = () => p.msgs.filter((m) => m.call).reverse();
+  return (
+    <div class="scroll">
+      <Show when={!calls().length}><p class="empty muted">Звонков пока не было</p></Show>
+      <For each={calls()}>
+        {(m) => (
+          <div class="row">
+            <Avatar id={m.author} />
+            <div class="grow">
+              <b>{m.mine ? "Исходящий" : `Участник ${m.author}`}</b>
+              <div class="muted small" classList={{ error: m.call!.missed && !m.mine }}>{callLabel(m.call!)}</div>
+            </div>
+            <small class="muted">{new Date(m.ts).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function Incoming(p: { c: CallSignal; onAccept: () => void; onReject: () => void }) {
+  onCleanup(ring("in"));
+  return (
+    <div class="call-screen incoming">
+      <Avatar id={p.c.author} />
+      <h2>Участник {p.c.author}</h2>
+      <p class="muted">{p.c.video ? "Входящий видеозвонок" : "Входящий звонок"}</p>
+      <div class="call-buttons">
+        <button class="round hang" onClick={p.onReject} title="Отклонить"><PhoneOff size={26} /></button>
+        <button class="round accept" onClick={p.onAccept} title="Принять">{p.c.video ? <Video size={26} /> : <Phone size={26} />}</button>
+      </div>
+    </div>
+  );
+}
+
+function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () => void }) {
+  const [now, setNow] = createSignal(Date.now());
+  const [mic, setMic] = createSignal(true);
+  const [cam, setCam] = createSignal(p.a.video);
+  const t = setInterval(() => setNow(Date.now()), 500);
+  onCleanup(() => clearInterval(t));
+  // Ringback until someone answers.
+  createEffect(() => {
+    if (!p.a.started) onCleanup(ring("out"));
+  });
+  const toggleCam = async () => {
+    try {
+      await p.media.setCam(!cam());
+      setCam(!cam());
+    } catch {
+      /* no camera: stays off */
+    }
+  };
+  return (
+    <div class="call-screen">
+      <div class="muted">{p.a.started ? clock(now() - p.a.started) : "Вызов…"}</div>
+      <div class="call-grid">
+        <For each={p.tiles}>
+          {(t) => (
+            <div class="tile">
+              {/* Video shows while frames come; otherwise the avatar. */}
+              <div style={{ display: now() - t.videoAt < 1500 ? "contents" : "none" }}>{t.canvas}</div>
+              <Show when={now() - t.videoAt >= 1500}><Avatar id={t.id} /></Show>
+              <span class="tile-name">Участник {t.id}</span>
+            </div>
+          )}
+        </For>
+        <Show when={!p.tiles.length}>
+          <div class="tile"><span class="muted">{p.a.started ? "Соединяемся…" : "Ждём ответа"}</span></div>
+        </Show>
+      </div>
+      <Show when={cam()}>
+        <video class="self" autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
+      </Show>
+      <div class="call-buttons">
+        <button class="round" classList={{ off: !mic() }} onClick={() => { p.media.setMic(!mic()); setMic(!mic()); }}
+          title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={24} /> : <MicOff size={24} />}</button>
+        <button class="round" classList={{ off: !cam() }} onClick={toggleCam}
+          title={cam() ? "Выключить камеру" : "Включить камеру"}>{cam() ? <Video size={24} /> : <VideoOff size={24} />}</button>
+        <button class="round hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={24} /></button>
+      </div>
+    </div>
   );
 }

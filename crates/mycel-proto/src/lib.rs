@@ -151,7 +151,7 @@ pub enum ReceiptKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallAction {
-    Offer,
+    Offer { video: bool },
     Accept,
     Reject,
     End,

@@ -16,6 +16,8 @@ pub use iroh_tickets::endpoint::EndpointTicket;
 pub const ALPN: &[u8] = b"mycel/sync/1";
 pub const JOIN_ALPN: &[u8] = b"mycel/join/1";
 pub const BLOBS_ALPN: &[u8] = b"mycel/blobs/1";
+/// Call media (§9): audio as QUIC datagrams, video one uni stream per frame.
+pub const CALL_ALPN: &[u8] = b"mycel/call/1";
 // shortcut: one message per stream, capped at 16 MiB (a full-history Envs batch); chunk when histories grow.
 const MAX_MSG: usize = 16 << 20;
 
@@ -23,8 +25,8 @@ const MAX_MSG: usize = 16 << 20;
 pub type Inbox = mpsc::Receiver<(EndpointId, SyncMsg)>;
 /// Incoming join requests: (sender, request bytes, reply). Dropping the reply refuses.
 pub type JoinInbox = mpsc::Receiver<(EndpointId, Vec<u8>, oneshot::Sender<Vec<u8>>)>;
-/// Incoming `mycel/blobs/1` connections; the owner checks membership and serves them.
-pub type BlobInbox = mpsc::Receiver<Connection>;
+/// Incoming `mycel/blobs/1` and `mycel/call/1` connections; the owner checks membership and serves them.
+pub type ConnInbox = mpsc::Receiver<Connection>;
 
 #[derive(Clone)]
 pub struct Net {
@@ -41,15 +43,18 @@ impl Net {
         port: u16,
         relays: &[String],
         n0: bool,
-    ) -> Result<(Self, Inbox, JoinInbox, BlobInbox)> {
+    ) -> Result<(Self, Inbox, JoinInbox, ConnInbox)> {
         let mut b = if n0 {
             Endpoint::builder(presets::N0)
         } else {
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(RelayMap::empty()))
         };
-        b = b
-            .secret_key(key)
-            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), BLOBS_ALPN.to_vec()]);
+        b = b.secret_key(key).alpns(vec![
+            ALPN.to_vec(),
+            JOIN_ALPN.to_vec(),
+            BLOBS_ALPN.to_vec(),
+            CALL_ALPN.to_vec(),
+        ]);
         if port != 0 {
             b = b
                 .clear_ip_transports()
@@ -70,7 +75,7 @@ impl Net {
                 let Ok(conn) = incoming.await else { continue };
                 if conn.alpn() == JOIN_ALPN {
                     tokio::spawn(serve_join(conn, jtx.clone()));
-                } else if conn.alpn() == BLOBS_ALPN {
+                } else if conn.alpn() == BLOBS_ALPN || conn.alpn() == CALL_ALPN {
                     let _ = btx.send(conn).await;
                 } else {
                     n.track(conn);
@@ -133,9 +138,9 @@ impl Net {
         Ok(resp)
     }
 
-    /// A fresh connection on `mycel/blobs/1` (iroh-blobs requests run over it).
-    pub async fn connect_blobs(&self, to: EndpointAddr) -> Result<Connection> {
-        Ok(self.ep.connect(to, BLOBS_ALPN).await?)
+    /// A fresh connection on `alpn` (blobs: iroh-blobs requests run over it; calls).
+    pub async fn connect(&self, to: EndpointAddr, alpn: &[u8]) -> Result<Connection> {
+        Ok(self.ep.connect(to, alpn).await?)
     }
 
     pub async fn close(&self) {

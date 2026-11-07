@@ -9,7 +9,9 @@ use iroh_blobs::store::GcConfig;
 use iroh_blobs::store::fs::{FsStore, options::Options};
 use mycel_crypto::mls::{Incoming, Mls};
 use mycel_crypto::{SecretKey, envelope_id, sign_addr, sign_event, verify_addr, verify_event};
-use mycel_net::{BlobInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net};
+use mycel_net::{
+    BLOBS_ALPN, CALL_ALPN, ConnInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net,
+};
 use mycel_proto::{
     BlobRef, Envelope, Event, EventBody, EventId, JoinReq, JoinResp, MediaKind, ReceiptKind,
     SignedAddr, SyncMsg,
@@ -22,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+mod call;
+pub use call::{AUDIO, Frame, VIDEO_DELTA, VIDEO_KEY};
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 
@@ -129,6 +133,8 @@ pub struct Node {
     dir: PathBuf,
     keep_blobs: bool,
     max_blob: u64,
+    call: Mutex<Option<call::Call>>,
+    frames: Mutex<Option<mpsc::Sender<call::Frame>>>,
 }
 
 impl Node {
@@ -156,8 +162,7 @@ impl Node {
         let st = State { store, mls };
         let mut relays = st.relays()?;
         relays.extend(opts.own_relay.clone());
-        let (net, mut inbox, joins, blob_conns) =
-            Net::bind(key, opts.port, &relays, opts.n0).await?;
+        let (net, mut inbox, joins, conns) = Net::bind(key, opts.port, &relays, opts.n0).await?;
         let mut bopts = Options::new(&dir.join("blobs"));
         bopts.gc = Some(GcConfig {
             interval: std::time::Duration::from_secs(3600),
@@ -176,6 +181,8 @@ impl Node {
             } else {
                 opts.max_blob
             },
+            call: Mutex::new(None),
+            frames: Mutex::new(None),
         });
         let (tx, rx) = mpsc::channel(256);
         let n = node.clone();
@@ -188,6 +195,7 @@ impl Node {
                             n.clone().fetch_all(evs.clone());
                         }
                         for ev in evs {
+                            n.on_call_event(&ev);
                             let _ = tx.send(ev).await;
                         }
                     }
@@ -196,7 +204,7 @@ impl Node {
             }
         });
         tokio::spawn(node.clone().serve_joins(joins));
-        tokio::spawn(node.clone().serve_blobs(blob_conns));
+        tokio::spawn(node.clone().serve_conns(conns));
         if node.keep_blobs {
             node.clone().fetch_missing();
         }
@@ -464,7 +472,7 @@ impl Node {
         progress: &mut impl FnMut(u64),
     ) -> Result<u64> {
         let base = self.blobs.remote().local(hash).await?.local_bytes();
-        let conn = self.net.connect_blobs(addr).await?;
+        let conn = self.net.connect(addr, BLOBS_ALPN).await?;
         let mut s = self.blobs.remote().fetch(conn, hash).stream();
         while let Some(item) = s.next().await {
             match item {
@@ -545,8 +553,14 @@ impl Node {
         });
     }
 
-    async fn serve_blobs(self: Arc<Self>, mut conns: BlobInbox) {
+    async fn serve_conns(self: Arc<Self>, mut conns: ConnInbox) {
         while let Some(conn) = conns.recv().await {
+            if conn.alpn() == CALL_ALPN {
+                if let Err(e) = self.add_call_conn(conn, None) {
+                    eprintln!("mycel: call connection refused: {e}");
+                }
+                continue;
+            }
             if !self.members().contains(conn.remote_id().as_bytes()) {
                 continue;
             }
