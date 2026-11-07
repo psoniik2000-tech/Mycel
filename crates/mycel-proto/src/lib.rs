@@ -29,22 +29,32 @@ pub enum SyncMsg {
         ids: Vec<Blake3Hash>,
         reply: bool,
     },
-    /// Member addresses as EndpointTicket strings.
-    Peers(Vec<String>),
+    /// Member addresses, each signed by its owner (§6.2 peer exchange).
+    Peers(Vec<SignedAddr>),
 }
 
-/// Request on ALPN `mycel/join/1` (§4.3); `addr` is the joiner's EndpointTicket.
+/// A node's address (EndpointTicket string), signed by the node key over (ticket, relay, ts_ms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAddr {
+    pub ticket: String,
+    /// URL of the iroh-relay this node serves (anchors only); members use it as a relay.
+    pub relay: Option<String>,
+    pub ts_ms: u64,
+    pub sig: Ed25519Signature,
+}
+
+/// Request on ALPN `mycel/join/1` (§4.3); `addr` is the joiner's own address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinReq {
     pub secret: [u8; 16],
     pub key_package: Vec<u8>,
-    pub addr: String,
+    pub addr: SignedAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinResp {
     pub welcome: Vec<u8>,
-    pub peers: Vec<String>,
+    pub peers: Vec<SignedAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

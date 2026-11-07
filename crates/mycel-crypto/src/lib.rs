@@ -4,7 +4,7 @@ pub mod mls;
 
 pub use iroh_base::SecretKey;
 use iroh_base::{PublicKey, Signature};
-use mycel_proto::Event;
+use mycel_proto::{Event, SignedAddr};
 
 /// Sets author, id (BLAKE3 of the other fields) and signature.
 pub fn sign_event(key: &SecretKey, mut ev: Event) -> Event {
@@ -23,6 +23,34 @@ pub fn verify_event(ev: &Event) -> bool {
         return false;
     };
     ev.id == event_id(ev) && pk.verify(&ev.id, &Signature::from_bytes(&sig)).is_ok()
+}
+
+/// Signs this node's address with its key (§6.2).
+pub fn sign_addr(key: &SecretKey, ticket: String, relay: Option<String>, ts_ms: u64) -> SignedAddr {
+    let mut a = SignedAddr {
+        ticket,
+        relay,
+        ts_ms,
+        sig: vec![],
+    };
+    a.sig = key.sign(&addr_msg(&a)).to_bytes().to_vec();
+    a
+}
+
+/// Checks the signature against `owner` (the id inside the ticket).
+pub fn verify_addr(a: &SignedAddr, owner: &[u8; 32]) -> bool {
+    let (Ok(pk), Ok(sig)) = (
+        PublicKey::from_bytes(owner),
+        <[u8; 64]>::try_from(a.sig.as_slice()),
+    ) else {
+        return false;
+    };
+    pk.verify(&addr_msg(a), &Signature::from_bytes(&sig))
+        .is_ok()
+}
+
+fn addr_msg(a: &SignedAddr) -> Vec<u8> {
+    postcard::to_allocvec(&(b"mycel-addr", &a.ticket, &a.relay, a.ts_ms)).expect("addr serializes")
 }
 
 /// Content id of an envelope, used by sync.
@@ -57,5 +85,14 @@ mod tests {
         assert!(verify_event(&ev));
         ev.lamport = 2;
         assert!(!verify_event(&ev));
+    }
+
+    #[test]
+    fn addr_sign_verify() {
+        let k = SecretKey::generate();
+        let mut a = sign_addr(&k, "t".into(), None, 5);
+        assert!(verify_addr(&a, k.public().as_bytes()));
+        a.relay = Some("http://evil".into());
+        assert!(!verify_addr(&a, k.public().as_bytes()));
     }
 }

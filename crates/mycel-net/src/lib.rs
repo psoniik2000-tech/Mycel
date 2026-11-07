@@ -1,15 +1,15 @@
 //! iroh transport (DESIGN.md §6.1 T1–T2, §14.3): Envelopes over ALPN `mycel/sync/1`.
 
 use anyhow::Result;
-use iroh::Endpoint;
 use iroh::endpoint::{Connection, presets};
+use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode};
 use mycel_proto::SyncMsg;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-pub use iroh::{EndpointAddr, EndpointId, SecretKey};
+pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use iroh_tickets::endpoint::EndpointTicket;
 
 pub const ALPN: &[u8] = b"mycel/sync/1";
@@ -30,13 +30,18 @@ pub struct Net {
 }
 
 impl Net {
-    /// `relay = false`: no relay, no address lookup (LAN / tests). `port = 0`: any free port.
-    pub async fn bind(key: SecretKey, port: u16, relay: bool) -> Result<(Self, Inbox, JoinInbox)> {
-        // shortcut: default n0 relay and discovery; replace with our own iroh-relay on anchors in phase 2.
-        let mut b = if relay {
+    /// Relays are our anchors' iroh-relay URLs (§6.1 T2); more can be added with `add_relay`.
+    /// `n0 = true` also uses the public n0 relays and address lookup (last resort). `port = 0`: any free port.
+    pub async fn bind(
+        key: SecretKey,
+        port: u16,
+        relays: &[String],
+        n0: bool,
+    ) -> Result<(Self, Inbox, JoinInbox)> {
+        let mut b = if n0 {
             Endpoint::builder(presets::N0)
         } else {
-            Endpoint::builder(presets::Minimal)
+            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(RelayMap::empty()))
         };
         b = b
             .secret_key(key)
@@ -65,7 +70,18 @@ impl Net {
                 }
             }
         });
+        for r in relays {
+            net.add_relay(r).await?;
+        }
         Ok((net, rx, jrx))
+    }
+
+    /// Adds a relay to the relay map; the endpoint picks the best one as its home relay.
+    pub async fn add_relay(&self, url: &str) -> Result<()> {
+        let url: RelayUrl = url.parse()?;
+        let cfg = Arc::new(RelayConfig::new(url.clone(), None));
+        self.ep.insert_relay(url, cfg).await;
+        Ok(())
     }
 
     pub fn id(&self) -> EndpointId {
@@ -80,9 +96,9 @@ impl Net {
         self.ep.addr()
     }
 
-    /// Waits until the relay is connected, so `addr()` includes it.
+    /// Waits (up to 5 s) until a relay is connected, so `addr()` includes it.
     pub async fn online(&self) {
-        self.ep.online().await
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.ep.online()).await;
     }
 
     /// One uni stream per message; the stream end is the frame boundary.

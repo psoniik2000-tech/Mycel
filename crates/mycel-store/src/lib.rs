@@ -39,6 +39,16 @@ impl Store {
              CREATE TABLE IF NOT EXISTS peers (id BLOB PRIMARY KEY, addr BLOB NOT NULL);",
         )
         .context("wrong password or corrupt database")?;
+        // Receive time for retention (§7.3); fails harmlessly once the column exists.
+        if db
+            .execute(
+                "ALTER TABLE envelopes ADD COLUMN ts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok()
+        {
+            db.execute("UPDATE envelopes SET ts = ?1", [now_ms()])?;
+        }
         Ok(Self { db })
     }
 
@@ -64,8 +74,8 @@ impl Store {
 
     pub fn insert_envelope(&self, id: &[u8], data: &[u8]) -> Result<()> {
         self.db.execute(
-            "INSERT OR IGNORE INTO envelopes (id, data) VALUES (?1, ?2)",
-            params![id, data],
+            "INSERT OR IGNORE INTO envelopes (id, data, ts) VALUES (?1, ?2, ?3)",
+            params![id, data, now_ms()],
         )?;
         Ok(())
     }
@@ -115,6 +125,16 @@ impl Store {
             .optional()?)
     }
 
+    /// Deletes envelopes received and events written before `before_ms` (anchor retention).
+    pub fn prune(&self, before_ms: i64) -> Result<usize> {
+        Ok(self
+            .db
+            .execute("DELETE FROM envelopes WHERE ts < ?1", [before_ms])?
+            + self
+                .db
+                .execute("DELETE FROM events WHERE ts < ?1", [before_ms])?)
+    }
+
     pub fn upsert_peer(&self, id: &[u8], addr: &[u8]) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO peers (id, addr) VALUES (?1, ?2)",
@@ -144,6 +164,12 @@ impl Store {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +188,12 @@ mod tests {
             vec![b"x".to_vec()]
         );
         assert!(Store::open(&dir, "bad").is_err());
+        let s = Store::open(&dir, "pw").unwrap();
+        s.insert_envelope(b"e", b"y").unwrap();
+        assert_eq!(s.prune(2).unwrap(), 1); // old event ts=1 goes, fresh envelope stays
+        assert_eq!(s.prune(now_ms() + 1).unwrap(), 1);
+        assert!(s.envelopes().unwrap().is_empty());
+        drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

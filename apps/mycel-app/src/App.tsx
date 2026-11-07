@@ -2,11 +2,12 @@ import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switc
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  ArrowLeft, Check, Copy, Hash, Link, LogOut, MessageCircle, Mic, Paperclip, Plus, Send, Settings, UserPlus, Users,
+  ArrowLeft, Check, CheckCheck, Clock, Copy, Hash, Link, LogOut, MessageCircle, Mic, Paperclip, Plus, Send, Settings, UserPlus, Users,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 
-type Msg = { id: string; author: string; mine: boolean; text: string; ts: number };
+// status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
+type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number };
 type Member = { id: string; me: boolean; admin: boolean };
 type Status = { dir: string; exists: boolean; unlocked: boolean; in_space: boolean };
 type Tab = "chats" | "people" | "settings";
@@ -162,6 +163,10 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       if (!chatVisible()) setUnread((n) => n + 1);
       loadMembers();
     });
+    const unStatus = await listen<[string, number][]>("status", (e) => {
+      const st = new Map(e.payload);
+      setMsgs((all) => all.map((m) => (st.has(m.id) ? { ...m, status: st.get(m.id)! } : m)));
+    });
     const onWide = () => setWide(wideQuery.matches);
     const onFocus = () => setFocused(true);
     const onBlur = () => setFocused(false);
@@ -171,6 +176,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     onCleanup(() => {
       clearInterval(timer);
       un();
+      unStatus();
       wideQuery.removeEventListener("change", onWide);
       removeEventListener("focus", onFocus);
       removeEventListener("blur", onBlur);
@@ -345,8 +351,13 @@ function Chat(p: { msgs: Msg[]; members: number; peers: number; back: () => void
                 <span class="text">{m.text}</span>
                 <span class="meta">
                   {time(m.ts)}
-                  {/* shortcut: core has no delivery acks yet (§7.4), so own messages show only ✓ = saved and sent; ⏱/✓✓ come with acks. */}
-                  <Show when={m.mine}><Check size={14} /></Show>
+                  <Show when={m.mine}>
+                    <Switch>
+                      <Match when={m.status === 0}><span title="Отправляется"><Clock size={14} /></span></Match>
+                      <Match when={m.status === 1}><span title="Ушло в сеть"><Check size={14} /></span></Match>
+                      <Match when={m.status === 2}><span title="Доставлено всем"><CheckCheck size={14} /></span></Match>
+                    </Switch>
+                  </Show>
                 </span>
               </div>
             </div>

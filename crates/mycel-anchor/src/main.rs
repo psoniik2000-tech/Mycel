@@ -1,29 +1,46 @@
 //! mycel-anchor: CLI node. Password from MYCEL_PASSWORD or the first stdin line.
 
-use anyhow::{Result, bail};
-use mycel_core::Node;
+use anyhow::{Context, Result, bail};
+use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use mycel_core::mycel_proto::{Event, EventBody};
+use mycel_core::{Node, Opts};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--no-relay] <init | id | members | chat | invite | join <link>>
-  init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat";
+const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] [--keep-days N]
+                    <init | id | members | chat | invite | join <link> | serve <relay-url>>
+  init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat
+  serve http://PUBLIC-IP:PORT: run 24/7 as an anchor: an iroh-relay on PORT (TCP) for the members,
+        store-and-forward for offline members, events kept --keep-days (default 30)
+  --n0-relay: also use the public n0 relays (off by default)";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut dir = PathBuf::from("mycel-data");
-    let mut port = 0u16;
-    let mut relay = true;
+    let mut opts = Opts::default();
+    let mut keep_days = 30u64;
     let mut rest = vec![];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dir" => dir = args.next().unwrap_or_default().into(),
-            "--port" => port = args.next().unwrap_or_default().parse()?,
-            "--no-relay" => relay = false,
+            "--port" => opts.port = args.next().unwrap_or_default().parse()?,
+            "--n0-relay" => opts.n0 = true,
+            "--keep-days" => keep_days = args.next().unwrap_or_default().parse()?,
             _ => rest.push(a),
         }
     }
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+
+    // The relay runs in this process; kept alive until exit.
+    let _relay = match rest[..] {
+        ["serve", url] => {
+            opts.own_relay = Some(url.to_string());
+            Some(spawn_relay(url).await?)
+        }
+        _ => None,
+    };
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let password = match std::env::var("MYCEL_PASSWORD") {
@@ -35,19 +52,32 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (node, mut rx) = Node::open(&dir, &password, port, relay).await?;
-    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let (node, mut rx) = Node::open(&dir, &password, &opts).await?;
     match rest[..] {
         ["init"] => {
             node.create_space()?;
             println!("space created in {}", dir.display());
         }
-        ["id"] => println!("{}", node.ticket(relay).await),
+        ["id"] => println!("{}", node.ticket().await),
         ["members"] => {
             let admin = node.admin()?;
             for m in node.members() {
                 let tag = if m == admin { " (admin)" } else { "" };
                 println!("{}{tag}", short(&m));
+            }
+        }
+        ["serve", url] => {
+            node.admin()
+                .context("join a space first: mycel-anchor join <link>")?;
+            println!("anchor up, relay {url}, keeping {keep_days} days");
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            loop {
+                match node.prune(keep_days) {
+                    Ok(0) => {}
+                    Ok(n) => println!("pruned {n} old records"),
+                    Err(e) => eprintln!("prune failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
         ["chat"] | ["invite"] | ["join", _] => {
@@ -56,7 +86,7 @@ async fn main() -> Result<()> {
                 println!("joined, {} members", node.members().len());
             }
             if rest[..] == ["invite"] {
-                println!("{}", node.invite(relay).await?);
+                println!("{}", node.invite().await?);
             }
             let me = node.device_id();
             for ev in node.history()? {
@@ -77,6 +107,19 @@ async fn main() -> Result<()> {
     }
     node.close().await;
     Ok(())
+}
+
+/// iroh-relay over plain HTTP on the URL's port, all interfaces.
+// shortcut: no TLS (relayed QUIC is end-to-end encrypted anyway, but not disguised as HTTPS);
+// serve HTTPS (ACME) once an anchor has a domain. Needs the TCP port forwarded and NAT loopback on the router.
+async fn spawn_relay(url: &str) -> Result<Server> {
+    let u: mycel_core::RelayUrl = url.parse().context("relay url like http://1.2.3.4:3340")?;
+    let port = u
+        .port_or_known_default()
+        .context("relay url without port")?;
+    let mut cfg = ServerConfig::default();
+    cfg.relay = Some(RelayConfig::new(([0, 0, 0, 0], port)));
+    Ok(Server::spawn(cfg).await?)
 }
 
 fn short(id: &[u8; 32]) -> String {
