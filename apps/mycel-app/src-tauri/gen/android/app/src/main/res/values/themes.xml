@@ -1,0 +1,7 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.mycel_app" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Behind the status and gesture bars: the app panel colour (styles.css panel). -->
+        <item name="android:windowBackground">#fffdf9</item>
+    </style>
+</resources>

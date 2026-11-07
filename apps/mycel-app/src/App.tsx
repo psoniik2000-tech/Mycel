@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Check, CheckCheck, ChevronDown, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Send,
+  ArrowLeft, Camera, Check, CheckCheck, ChevronDown, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Send,
   Settings, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -26,6 +27,7 @@ type Tab = "chats" | "calls" | "people" | "settings";
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 const hue = (id: string) => parseInt(id.slice(0, 4), 16) % 360;
 const errText = (e: unknown) => String(e);
+const android = /Android/.test(navigator.userAgent);
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const callLabel = (c: CallView) =>
   c.missed ? (c.mine ? "Без ответа" : "Пропущенный звонок")
@@ -145,6 +147,16 @@ function Onboard(p: { onDone: () => void }) {
         </button>
         <div class="or"><span>или</span></div>
         <textarea rows={3} placeholder="mycel://join/…" value={link()} onInput={(e) => setLink(e.currentTarget.value)} />
+        <Show when={android}>
+          <button disabled={!!busy()} onClick={async () => {
+            try {
+              const { scan, Format } = await import("@tauri-apps/plugin-barcode-scanner");
+              setLink((await scan({ formats: [Format.QRCode] })).content);
+            } catch (e) {
+              setErr(errText(e));
+            }
+          }}><Camera size={18} /> Сканировать QR</button>
+        </Show>
         <button disabled={!!busy() || !link().trim()} onClick={() => run("join", "join", { link: link() })}>
           <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
         </button>
@@ -267,6 +279,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       setMsgs((all) => all.map((m) => (st.has(m.id) && st.get(m.id) !== m.status ? { ...m, status: st.get(m.id)! } : m)));
     });
     await reload();
+    const onVis = () => invoke("set_visible", { v: !document.hidden });
+    document.addEventListener("visibilitychange", onVis);
+    // Android back closes the chat: opening it pushes a history entry.
+    const onBack = () => setChatOpen(false);
+    addEventListener("popstate", onBack);
+    if (!(await isPermissionGranted())) requestPermission();
     const onWide = () => setWide(wideQuery.matches);
     const onFocus = () => setFocused(true);
     const onBlur = () => setFocused(false);
@@ -275,6 +293,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     addEventListener("blur", onBlur);
     onCleanup(() => {
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+      removeEventListener("popstate", onBack);
       un();
       unChanged();
       unCall();
@@ -313,7 +333,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
         </header>
         <Switch>
           <Match when={tab() === "chats"}>
-            <button class="row chat-row" classList={{ active: wide() }} onClick={() => setChatOpen(true)}>
+            <button class="row chat-row" classList={{ active: wide() }} onClick={() => { if (!chatOpen()) history.pushState(null, ""); setChatOpen(true); }}>
               <div class="avatar group"><Hash size={20} /></div>
               <div class="grow">
                 <div class="row-top"><b>Общий чат</b><small class="muted">{last() ? time(last()!.ts) : ""}</small></div>
@@ -357,7 +377,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       </section>
 
       <Chat msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
-        peers={peers()} back={() => setChatOpen(false)} reload={reload} inCall={!!active()} onCall={startCall} callErr={callErr()} />
+        peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={startCall} callErr={callErr()} />
       <Show when={incoming()}>
         <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
       </Show>
@@ -538,12 +558,22 @@ function Chat(p: {
   const [elapsed, setElapsed] = createSignal(0);
   const [cancelling, setCancelling] = createSignal(false);
   let preview!: HTMLVideoElement;
+  // Android pickers give content:// URIs, not paths: read the files here and stash them for send_file.
+  let picker!: HTMLInputElement;
+  const pick = async () => {
+    const files = [...(picker.files ?? [])];
+    picker.value = "";
+    const paths = await Promise.all(files.map(async (f) =>
+      invoke<string>("stash", new Uint8Array(await f.arrayBuffer()), { headers: { name: encodeURIComponent(f.name) } })));
+    sendFiles(paths);
+  };
 
   const sendFiles = async (paths: string[]) => {
     for (const path of paths)
       await queue({ text: `📎 ${path.split(/[\\/]/).pop()}` }, () => invoke<string>("send_file", { path, original: original() }));
   };
   const attach = async () => {
+    if (android) return picker.click();
     const paths = await open({ multiple: true });
     if (paths) sendFiles(paths);
   };
@@ -819,6 +849,7 @@ function Chat(p: {
           <button class="icon" onClick={cancelCompose} title="Отмена (Esc)"><X size={18} /></button>
         </div>
       </Show>
+      <input ref={picker} type="file" multiple hidden onChange={pick} />
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
         <label class="orig muted small" title="Фото уйдёт файлом как есть, с метаданными">

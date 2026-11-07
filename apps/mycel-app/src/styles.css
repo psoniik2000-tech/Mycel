@@ -58,6 +58,8 @@ body {
   color: var(--text);
   font: 15px/1.4 Inter, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* Phones: keep clear of the status bar, notch and gesture bar. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 button, input, textarea { font: inherit; color: inherit; }
 h1 { font-size: 24px; margin: 4px 0 0; font-weight: 600; }
@@ -260,6 +262,19 @@ button.del { color: var(--danger); }
   .chat-row.active { background: none; }
 }
 
+/* Touch / phone width: finger-sized targets (≥44px) */
+@media (pointer: coarse), (max-width: 599px) {
+  .chat .bar .net { font-size: 0; }
+  .chat .bar b { white-space: nowrap; }
+  button.icon { padding: 12px; }
+  .row { padding: 14px 16px; }
+  .nav { min-height: 56px; }
+  .composer { gap: 2px; padding: 8px; }
+  .composer .orig { display: none; }
+  .msgs { padding: 12px; }
+  .bubble { max-width: 85%; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
@@ -305,7 +320,8 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
   background: var(--hover); padding: 4px 12px; border-radius: 12px; margin: 6px auto; }
 .call-line.missed { color: var(--danger); }
 .call-screen { position: fixed; inset: 0; z-index: 50; background: #111318; color: #eee; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 16px; padding: 24px; }
+  align-items: center; justify-content: center; gap: 16px;
+  padding: max(24px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom)); }
 .call-screen.incoming .avatar { width: 96px; height: 96px; font-size: 32px; }
 .call-screen h2 { margin: 0; }
 .call-grid { flex: 1; width: 100%; display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); align-content: center; }
