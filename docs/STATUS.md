@@ -29,7 +29,7 @@
 4. Вступить: «Сканировать QR» и навести на QR из ПК-версии (Люди → Пригласить).
 5. Чтобы сообщения приходили в фоне, не закрывайте уведомление «Mycel на связи» и отключите для Mycel экономию батареи.
 
-Сборка на ПК разработчика: JDK 17 в `C:\Android\jdk17`, SDK в `C:\Android\Sdk` (NDK 28.2), переменные `JAVA_HOME`, `ANDROID_HOME`, `NDK_HOME`; `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`. Эмулятор: AVD `mycel`, `emulator -avd mycel`. Release-ключ в CI — секреты `ANDROID_KEY_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`; без них APK подписан debug-ключом.
+Сборка на ПК разработчика: JDK 17 в `C:\Android\jdk17`, SDK в `C:\Android\Sdk` (NDK 28.2), переменные `JAVA_HOME`, `ANDROID_HOME`, `NDK_HOME`; `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`. Эмулятор: AVD `mycel`, `emulator -avd mycel`. На этом ПК `npx tauri android build` сам не доходит до конца (нет прав на симлинки, perl из Git урезан), поэтому собирать так: `bash C:\Android\build-apk.sh release aarch64` (или `debug x86_64` для эмулятора). Release-ключ в CI — секреты `ANDROID_KEY_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`; без них APK подписан debug-ключом.
 
 ## Где что лежит
 
@@ -65,5 +65,6 @@
 - «Удалить у всех» стирает текст и файл на устройствах, но зашифрованный MLS-конверт лежит у якоря до конца срока хранения (прочитать его уже нельзя).
 - Якорь не проверен на реальном роутере (проброс порта).
 - Рация (push-to-talk) работает, только когда окно Mycel активно.
+- Android: звонки, голосовые/видеосообщения и QR-сканер проверены только сборкой, не на живом телефоне; «Открыть»/«Сохранить» медиа на Android не сделаны.
 - Видео в звонке проверено только тестами (камера на ПК разработки не включалась).
 - `grep -rn "shortcut:"` — список сознательных упрощений (`/ponytail-debt`).
