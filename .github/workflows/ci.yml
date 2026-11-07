@@ -73,7 +73,12 @@ jobs:
         run: |
           echo "$KEY" | base64 -d > $RUNNER_TEMP/mycel.jks
           printf 'storeFile=%s\nkeyAlias=%s\npassword=%s\n' "$RUNNER_TEMP/mycel.jks" "$ALIAS" "$PASS" > src-tauri/gen/android/keystore.properties
-      - run: NDK_HOME="$ANDROID_NDK_LATEST_HOME" npx tauri android build --apk --target aarch64 armv7
+      # openssl-src (vendored, for sqlcipher) calls <target>-ranlib, which the NDK no longer ships.
+      - run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          export RANLIB_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+          export RANLIB_armv7_linux_androideabi="$RANLIB_aarch64_linux_android"
+          npx tauri android build --apk --target aarch64 armv7
       - uses: actions/upload-artifact@v4
         with:
           name: mycel-android-apk
