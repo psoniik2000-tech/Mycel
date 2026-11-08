@@ -39,12 +39,20 @@ async fn names_and_private_chat_closed_to_third() {
     }
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     a.create_space().unwrap();
+    // Set before the others join: they still get it (members re-send on a join).
+    a.set_profile("Аня", "", 1).unwrap();
     b.join(&a.invite().await.unwrap()).await.unwrap();
     c.join(&a.invite().await.unwrap()).await.unwrap();
     until(|| nodes.iter().all(|n| n.members().len() == 3)).await;
 
     // Names reach everyone.
-    for (n, name) in nodes.iter().zip(["Аня", "Боря", "Вика"]) {
+    until(|| {
+        [b, c]
+            .iter()
+            .all(|n| n.profiles().unwrap().contains_key(&a.device_id()))
+    })
+    .await;
+    for (n, name) in nodes[1..].iter().zip(["Боря", "Вика"]) {
         n.set_profile(name, "", 1).unwrap();
     }
     until(|| nodes.iter().all(|n| n.profiles().unwrap().len() == 3)).await;

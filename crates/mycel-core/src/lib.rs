@@ -289,7 +289,15 @@ impl Node {
         let n = node.clone();
         tokio::spawn(async move {
             while let Some((from, msg)) = inbox.recv().await {
-                match n.handle(from, msg) {
+                let before = n.members().len();
+                let res = n.handle(from, msg);
+                // Someone joined: they cannot read our older profile, so send it again.
+                if n.members().len() > before
+                    && let Err(e) = n.refresh_profile(true)
+                {
+                    eprintln!("mycel: profile resend failed: {e}");
+                }
+                match res {
                     Ok(mut evs) => {
                         if !evs.is_empty() {
                             match n.apply_deletes() {
@@ -317,7 +325,7 @@ impl Node {
             node.clone().fetch_missing();
         }
         node.sync()?;
-        if let Err(e) = node.refresh_profile() {
+        if let Err(e) = node.refresh_profile(false) {
             eprintln!("mycel: profile refresh failed: {e}");
         }
         if !relays.is_empty() {
@@ -412,7 +420,10 @@ impl Node {
         st.save_mls()?;
         st.store
             .upsert_peer(admin_id.as_bytes(), ticket.as_bytes())?;
-        self.add_peers(&st, &resp.peers)
+        self.add_peers(&st, &resp.peers)?;
+        drop(st);
+        // Fetch what was sent since our join (members re-send their profiles for us).
+        self.sync()
     }
 
     /// Device ids of the space members.
@@ -487,8 +498,9 @@ impl Node {
         )
     }
 
-    /// Re-sends our profile when its KeyPackage is a month old (they expire after ~3 months).
-    fn refresh_profile(&self) -> Result<()> {
+    /// Re-sends our profile when its KeyPackage is a month old (they expire after ~3 months),
+    /// or always with `force` (a newcomer cannot read what was sent before its join).
+    fn refresh_profile(&self, force: bool) -> Result<()> {
         let me = self.device_id();
         let last = self
             .history(&None)?
@@ -506,7 +518,7 @@ impl Node {
                 },
             ..
         }) = last
-            && now_ms()?.saturating_sub(timestamp_ms) > 30 * 86_400_000
+            && (force || now_ms()?.saturating_sub(timestamp_ms) > 30 * 86_400_000)
         {
             self.set_profile(&name, &avatar, color)?;
         }
@@ -1150,6 +1162,9 @@ impl Node {
             match self.accept_join(from, &req) {
                 Ok(resp) => {
                     let _ = reply.send(resp);
+                    if let Err(e) = self.refresh_profile(true) {
+                        eprintln!("mycel: profile resend failed: {e}");
+                    }
                 }
                 Err(e) => eprintln!("mycel: join from {} refused: {e}", from.fmt_short()),
             }
