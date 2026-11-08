@@ -12,3 +12,4 @@
 ## РљРѕРґ
 - Cargo workspace, РєСЂРµР№С‚С‹ РІ `crates/`, РїСЂРёР»РѕР¶РµРЅРёРµ РІ `apps/mycel-app` (СЃС‚СЂСѓРєС‚СѓСЂР° вЂ” В§13).
 - РџРµСЂРµРґ РєРѕРјРјРёС‚РѕРј: `cargo fmt`, `cargo clippy`, `cargo test` РґР»СЏ Р·Р°С‚СЂРѕРЅСѓС‚С‹С… РєСЂРµР№С‚РѕРІ.
+- Мусор сборки держит под 5 ГБ задача Windows `MycelClean` (`scripts\clean.ps1`, каждые 15 мин; поставить заново: `scripts\install-clean-task.ps1`). Сессия в worktree после push в main удаляет свой worktree (`git worktree remove --force`).
