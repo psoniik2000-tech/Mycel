@@ -19,27 +19,28 @@ async fn edit_delete_pin_between_two_nodes() {
     a.create_space().unwrap();
     b.join(&a.invite().await.unwrap()).await.unwrap();
     until(|| a.members().len() == 2).await;
-    let has = |n: &Node, id| n.history().unwrap().iter().any(|e| e.id == id);
+    let has = |n: &Node, id| n.history(&None).unwrap().iter().any(|e| e.id == id);
 
     // Edit by the author shows on the other side; a reply keeps its target.
-    let m = a.send_text("helo", None).unwrap();
+    let m = a.send_text(&None, "helo", None).unwrap();
     until(|| has(&b, m.id)).await;
     a.edit(m.id, "hello").unwrap();
-    until(|| edits_and_pins(&b.history().unwrap()).0.get(&m.id) == Some(&"hello".into())).await;
+    until(|| edits_and_pins(&b.history(&None).unwrap()).0.get(&m.id) == Some(&"hello".into()))
+        .await;
     assert!(b.edit(m.id, "hijack").is_err());
-    let r = b.send_text("re", Some(m.id)).unwrap();
+    let r = b.send_text(&None, "re", Some(m.id)).unwrap();
     until(|| has(&a, r.id)).await;
 
     // Pin.
     b.pin(m.id, true).unwrap();
-    until(|| edits_and_pins(&a.history().unwrap()).1 == vec![m.id]).await;
+    until(|| edits_and_pins(&a.history(&None).unwrap()).1 == vec![m.id]).await;
 
     // Only the author or the admin deletes for everyone; it is gone on both nodes.
     assert!(b.delete(m.id, true).is_err());
     b.delete(r.id, true).unwrap();
     assert!(!has(&b, r.id));
     until(|| !has(&a, r.id)).await;
-    let x = b.send_text("spam", None).unwrap();
+    let x = b.send_text(&None, "spam", None).unwrap();
     until(|| has(&a, x.id)).await;
     a.delete(x.id, true).unwrap(); // admin
     until(|| !has(&b, x.id)).await;

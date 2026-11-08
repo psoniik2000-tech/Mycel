@@ -113,6 +113,14 @@ pub enum EventBody {
         target: EventId,
         pinned: bool,
     },
+    /// The author's name and avatar (a letter or emoji, a palette color index), sent to the
+    /// space chat; `key_package` (last resort) lets any member open a 1:1 chat with them.
+    Profile {
+        name: String,
+        avatar: String,
+        color: u8,
+        key_package: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

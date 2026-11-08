@@ -1,4 +1,4 @@
-//! Thin node API: space create/invite/join, send_text, incoming event stream, history, sync.
+//! Thin node API: space create/invite/join, 1:1 chats, send_text, incoming event stream, history, sync.
 
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
@@ -46,7 +46,21 @@ pub struct Opts {
     pub max_blob: u64,
 }
 
-// shortcut: a node is in exactly one space = one MLS group; multiple chats per space later.
+/// A chat: `None` is the space chat, `Some(device)` the 1:1 chat with that member (§17).
+pub type Chat = Option<[u8; 32]>;
+
+/// A member profile: (name, avatar letter, color index, last-resort KeyPackage).
+pub type Profile = (String, String, u8, Vec<u8>);
+
+fn chat_key(c: &Chat) -> &[u8] {
+    c.as_ref().map_or(&[], |p| &p[..])
+}
+
+fn chat_from(k: &[u8]) -> Chat {
+    k.try_into().ok()
+}
+
+// shortcut: a node is in exactly one space = one MLS group, plus one 2-member group per 1:1 chat.
 struct State {
     store: Store,
     mls: Mls,
@@ -55,6 +69,51 @@ struct State {
 impl State {
     fn save_mls(&self) -> Result<()> {
         self.store.set_meta("mls", &self.mls.state())
+    }
+
+    fn in_space(&self) -> Result<bool> {
+        Ok(self.store.meta("group")?.is_some())
+    }
+
+    /// (group id, partner) of every 1:1 group; both sides may have created one, so a partner
+    /// can have two, and the smaller id is the one we send to.
+    fn dms(&self) -> Result<Vec<([u8; 32], [u8; 32])>> {
+        let r = self.store.meta("dms")?;
+        Ok(r.map(|b| postcard::from_bytes(&b))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    fn add_dm(&self, gid: [u8; 32], peer: [u8; 32]) -> Result<()> {
+        let mut d = self.dms()?;
+        d.push((gid, peer));
+        self.store.set_meta("dms", &postcard::to_allocvec(&d)?)
+    }
+
+    /// The MLS group a chat sends to.
+    fn gid(&self, chat: &Chat) -> Result<[u8; 32]> {
+        match chat {
+            None => self.group(),
+            Some(p) => self
+                .dms()?
+                .into_iter()
+                .filter(|(_, q)| q == p)
+                .map(|(g, _)| g)
+                .min()
+                .context("no chat with this member"),
+        }
+    }
+
+    /// The chat of a known group.
+    fn chat_of(&self, gid: &[u8; 32]) -> Result<Option<Chat>> {
+        if *gid == self.group()? {
+            return Ok(Some(None));
+        }
+        Ok(self
+            .dms()?
+            .into_iter()
+            .find(|(g, _)| g == gid)
+            .map(|(_, p)| Some(p)))
     }
 
     fn group(&self) -> Result<[u8; 32]> {
@@ -75,11 +134,10 @@ impl State {
             .unwrap_or_default())
     }
 
-    fn envelope(&self, ciphertext: Vec<u8>, epoch: u64) -> Result<Envelope> {
-        let group_id = self.group()?;
+    fn envelope(&self, group_id: [u8; 32], ciphertext: Vec<u8>, epoch: u64) -> Result<Envelope> {
         Ok(Envelope {
             version: 1,
-            space_id: group_id[..16].try_into()?,
+            space_id: self.group()?[..16].try_into()?,
             group_id,
             epoch,
             ciphertext,
@@ -91,35 +149,76 @@ impl State {
             .insert_envelope(&envelope_id(env), &postcard::to_allocvec(env)?)
     }
 
-    fn store_event(&self, ev: &Event) -> Result<bool> {
+    fn store_event(&self, ev: &Event, chat: &Chat) -> Result<bool> {
         self.store.insert_event(
             &ev.id,
+            chat_key(chat),
             ev.lamport,
             ev.timestamp_ms,
             &postcard::to_allocvec(ev)?,
         )
     }
 
-    /// Decrypts and stores one envelope; returns a new event if any.
-    fn receive(&mut self, env: &Envelope) -> Result<Option<Event>> {
-        ensure!(env.group_id == self.group()?, "foreign group");
+    /// Decrypts and stores one envelope; returns the new events (several when it is the
+    /// Welcome of a 1:1 chat whose messages came first).
+    fn receive(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
+        ensure!(env.space_id == self.group()?[..16], "foreign space");
         if self.store.has_envelope(&envelope_id(env))? {
-            return Ok(None);
+            return Ok(vec![]);
         }
-        let out = match self.mls.process(&env.ciphertext, &self.admin()?) {
-            Ok(Incoming::App { sender, data }) => {
-                let ev: Event = postcard::from_bytes(&data)?;
-                ensure!(verify_event(&ev), "bad signature");
-                ensure!(ev.author_device == sender, "author is not the MLS sender");
-                self.store_event(&ev)?.then_some(ev)
-            }
-            Ok(Incoming::Commit) => None,
-            // Before our join (or past retention): unreadable for us, kept so we can forward it.
-            Err(_) if env.epoch < self.mls.epoch() => None,
-            Err(e) => return Err(e),
+        let out = match self.chat_of(&env.group_id)? {
+            Some(chat) => self.open(env, chat)?.into_iter().collect(),
+            // Someone else's 1:1 chat (kept to forward it), or the Welcome to a new one with us.
+            None => self.join_dm(env, me).unwrap_or_default(),
         };
         self.save_mls()?;
         self.store_env(env)?;
+        Ok(out)
+    }
+
+    fn open(&mut self, env: &Envelope, chat: Chat) -> Result<Option<(Chat, Event)>> {
+        // No commits in 1:1 groups: the Welcome already holds both members.
+        let admin = if chat.is_none() {
+            self.admin()?
+        } else {
+            [0; 32]
+        };
+        Ok(
+            match self.mls.process(&env.group_id, &env.ciphertext, &admin) {
+                Ok(Incoming::App { sender, data }) => {
+                    let ev: Event = postcard::from_bytes(&data)?;
+                    ensure!(verify_event(&ev), "bad signature");
+                    ensure!(ev.author_device == sender, "author is not the MLS sender");
+                    self.store_event(&ev, &chat)?.then_some((chat, ev))
+                }
+                Ok(Incoming::Commit) => None,
+                // Before our join (or past retention): unreadable for us, kept so we can forward it.
+                Err(_) if env.epoch < self.mls.epoch(&env.group_id) => None,
+                Err(e) => return Err(e),
+            },
+        )
+    }
+
+    /// Joins a 1:1 group from its Welcome (fails for anyone but the invited member), then
+    /// reads the messages of that group that are already here.
+    fn join_dm(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
+        let gid = self.mls.join(&env.ciphertext)?;
+        ensure!(gid == env.group_id, "welcome for another group");
+        let m = self.mls.members(&gid);
+        let peer = *m.iter().find(|p| **p != me).context("no partner")?;
+        let space = self.mls.members(&self.group()?);
+        ensure!(m.len() == 2 && m.contains(&me), "not a 1:1 group");
+        ensure!(space.contains(&peer), "partner is not a space member");
+        self.add_dm(env.group_id, peer)?;
+        let mut out = vec![];
+        for (_, data) in self.store.envelopes()? {
+            let e: Envelope = postcard::from_bytes(&data)?;
+            if e.group_id == env.group_id
+                && let Ok(Some(x)) = self.open(&e, Some(peer))
+            {
+                out.push(x);
+            }
+        }
         Ok(out)
     }
 }
@@ -154,12 +253,14 @@ impl Node {
                 k
             }
         };
-        let mls = Mls::new(
-            &key,
-            store.meta("mls")?.as_deref(),
-            store.meta("group")?.as_deref(),
-        )?;
-        let st = State { store, mls };
+        let st = State {
+            mls: Mls::new(&key, None, &[])?,
+            store,
+        };
+        let mut gids: Vec<Vec<u8>> = st.store.meta("group")?.into_iter().collect();
+        gids.extend(st.dms()?.iter().map(|(g, _)| g.to_vec()));
+        let mls = Mls::new(&key, st.store.meta("mls")?.as_deref(), &gids)?;
+        let st = State { mls, ..st };
         let mut relays = st.relays()?;
         relays.extend(opts.own_relay.clone());
         let (net, mut inbox, joins, conns) = Net::bind(key, opts.port, &relays, opts.n0).await?;
@@ -192,11 +293,12 @@ impl Node {
                     Ok(mut evs) => {
                         if !evs.is_empty() {
                             match n.apply_deletes() {
-                                Ok(gone) => evs.retain(|e| !gone.contains(&e.id)),
+                                Ok(gone) => evs.retain(|(_, e)| !gone.contains(&e.id)),
                                 Err(e) => eprintln!("mycel: delete failed: {e}"),
                             }
                         }
                         n.send_receipt(&evs);
+                        let evs: Vec<Event> = evs.into_iter().map(|(_, e)| e).collect();
                         if n.keep_blobs {
                             n.clone().fetch_all(evs.clone());
                         }
@@ -215,6 +317,9 @@ impl Node {
             node.clone().fetch_missing();
         }
         node.sync()?;
+        if let Err(e) = node.refresh_profile() {
+            eprintln!("mycel: profile refresh failed: {e}");
+        }
         if !relays.is_empty() {
             // Again once a relay is up, so peers learn our relay address.
             let n = node.clone();
@@ -248,7 +353,7 @@ impl Node {
     /// Creates a new space with this device as the only admin.
     pub fn create_space(&self) -> Result<()> {
         let mut st = self.st.lock().unwrap();
-        ensure!(!st.mls.has_group(), "already in a space");
+        ensure!(!st.in_space()?, "already in a space");
         let mut gid = [0u8; 32];
         getrandom::fill(&mut gid)?;
         st.mls.create_group(&gid)?;
@@ -283,7 +388,7 @@ impl Node {
         let admin: EndpointAddr = ticket.parse::<EndpointTicket>()?.into();
         {
             let st = self.st.lock().unwrap();
-            ensure!(!st.mls.has_group(), "already in a space");
+            ensure!(!st.in_space()?, "already in a space");
             self.learn_relays(&st, &relays)?;
         }
         if !relays.is_empty() {
@@ -291,7 +396,7 @@ impl Node {
         }
         let req = JoinReq {
             secret,
-            key_package: self.st.lock().unwrap().mls.key_package()?,
+            key_package: self.st.lock().unwrap().mls.key_package(false)?,
             addr: self.my_addr()?,
         };
         let admin_id = admin.id;
@@ -312,69 +417,195 @@ impl Node {
 
     /// Device ids of the space members.
     pub fn members(&self) -> Vec<[u8; 32]> {
-        self.st.lock().unwrap().mls.members()
+        let st = self.st.lock().unwrap();
+        st.group().map_or(vec![], |g| st.mls.members(&g))
+    }
+
+    /// Devices in a chat's MLS group.
+    pub fn chat_members(&self, chat: &Chat) -> Result<Vec<[u8; 32]>> {
+        let st = self.st.lock().unwrap();
+        Ok(st.mls.members(&st.gid(chat)?))
     }
 
     pub fn admin(&self) -> Result<[u8; 32]> {
         self.st.lock().unwrap().admin()
     }
 
-    /// Events ordered by (lamport, ts, id).
-    pub fn history(&self) -> Result<Vec<Event>> {
-        let rows = self.st.lock().unwrap().store.events()?;
+    /// Events of a chat ordered by (lamport, ts, id).
+    pub fn history(&self, chat: &Chat) -> Result<Vec<Event>> {
+        let rows = self.st.lock().unwrap().store.events(chat_key(chat))?;
         rows.iter().map(|b| Ok(postcard::from_bytes(b)?)).collect()
     }
 
-    /// Signs, encrypts (MLS), stores and sends a text event to every known peer.
-    pub fn send_text(&self, text: &str, reply_to: Option<EventId>) -> Result<Event> {
-        self.send_event(EventBody::Text {
-            text: text.into(),
-            reply_to,
-            mentions: vec![],
-        })
+    /// Events of every chat, with their chat, ordered by (lamport, ts, id).
+    pub fn all_events(&self) -> Result<Vec<(Chat, Event)>> {
+        let rows = self.st.lock().unwrap().store.all_events()?;
+        rows.iter()
+            .map(|(c, b)| Ok((chat_from(c), postcard::from_bytes(b)?)))
+            .collect()
     }
 
-    fn event(&self, id: &EventId) -> Result<Event> {
-        let h = self.history()?;
-        h.into_iter()
-            .find(|e| e.id == *id)
-            .context("no such message")
+    /// Partners of our 1:1 chats.
+    pub fn dms(&self) -> Result<Vec<[u8; 32]>> {
+        let mut v: Vec<_> = self.st.lock().unwrap().dms()?;
+        v.sort_by_key(|(_, p)| *p);
+        let mut p: Vec<_> = v.into_iter().map(|(_, p)| p).collect();
+        p.dedup();
+        Ok(p)
+    }
+
+    /// Latest profile of each member: (name, avatar, color, key package).
+    pub fn profiles(&self) -> Result<HashMap<[u8; 32], Profile>> {
+        Ok(self
+            .history(&None)?
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::Profile {
+                    name,
+                    avatar,
+                    color,
+                    key_package,
+                } => Some((e.author_device, (name, avatar, color, key_package))),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Sends our name and avatar to the space chat, with a fresh last-resort KeyPackage.
+    pub fn set_profile(&self, name: &str, avatar: &str, color: u8) -> Result<Event> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "empty name");
+        let key_package = self.st.lock().unwrap().mls.key_package(true)?;
+        self.send_event(
+            &None,
+            EventBody::Profile {
+                name: name.chars().take(64).collect(),
+                avatar: avatar.trim().chars().take(2).collect(),
+                color,
+                key_package,
+            },
+        )
+    }
+
+    /// Re-sends our profile when its KeyPackage is a month old (they expire after ~3 months).
+    fn refresh_profile(&self) -> Result<()> {
+        let me = self.device_id();
+        let last = self
+            .history(&None)?
+            .into_iter()
+            .rev()
+            .find(|e| e.author_device == me && matches!(e.body, EventBody::Profile { .. }));
+        if let Some(Event {
+            timestamp_ms,
+            body:
+                EventBody::Profile {
+                    name,
+                    avatar,
+                    color,
+                    ..
+                },
+            ..
+        }) = last
+            && now_ms()?.saturating_sub(timestamp_ms) > 30 * 86_400_000
+        {
+            self.set_profile(&name, &avatar, color)?;
+        }
+        Ok(())
+    }
+
+    /// Opens a 1:1 chat with a member (no-op if there is one): a new 2-member MLS group from
+    /// the KeyPackage in their profile; the Welcome goes out as an envelope of that group.
+    pub fn open_dm(&self, peer: [u8; 32]) -> Result<()> {
+        let me = self.device_id();
+        ensure!(peer != me, "a chat with yourself");
+        ensure!(self.members().contains(&peer), "not a member");
+        let kp = self
+            .profiles()?
+            .remove(&peer)
+            .context("this member has no profile yet (an older app version)")?
+            .3;
+        let (env, peers) = {
+            let mut st = self.st.lock().unwrap();
+            if st.gid(&Some(peer)).is_ok() {
+                return Ok(());
+            }
+            let mut gid = [0u8; 32];
+            getrandom::fill(&mut gid)?;
+            st.mls.create_group(&gid)?;
+            let (id, _commit, welcome) = st.mls.add_member(&gid, &kp)?;
+            ensure!(id == peer, "KeyPackage is not the member's");
+            st.add_dm(gid, peer)?;
+            st.save_mls()?;
+            let env = st.envelope(gid, welcome, 0)?;
+            st.store_env(&env)?;
+            (env, st.store.peers()?)
+        };
+        self.broadcast(peers, SyncMsg::Envs(vec![env]));
+        Ok(())
+    }
+
+    /// Signs, encrypts (MLS), stores and sends a text event to every known peer.
+    pub fn send_text(&self, chat: &Chat, text: &str, reply_to: Option<EventId>) -> Result<Event> {
+        self.send_event(
+            chat,
+            EventBody::Text {
+                text: text.into(),
+                reply_to,
+                mentions: vec![],
+            },
+        )
+    }
+
+    /// An event of any chat, with its chat.
+    pub fn event(&self, id: &EventId) -> Result<(Chat, Event)> {
+        let (c, b) = self
+            .st
+            .lock()
+            .unwrap()
+            .store
+            .event(id)?
+            .context("no such message")?;
+        Ok((chat_from(&c), postcard::from_bytes(&b)?))
     }
 
     /// Replaces the text of an own message (or the caption of own media).
     pub fn edit(&self, target: EventId, text: &str) -> Result<Event> {
-        let t = self.event(&target)?;
+        let (chat, t) = self.event(&target)?;
         ensure!(
             t.author_device == self.device_id() && is_msg(&t.body),
             "only own messages can be edited"
         );
-        self.send_event(EventBody::Edit {
-            target,
-            new_text: text.into(),
-        })
+        self.send_event(
+            &chat,
+            EventBody::Edit {
+                target,
+                new_text: text.into(),
+            },
+        )
     }
 
     /// Deletes a message here; `for_all` also sends a Delete (own messages, or any one by the admin).
     pub fn delete(&self, target: EventId, for_all: bool) -> Result<()> {
         if for_all {
-            let t = self.event(&target)?;
+            let (chat, t) = self.event(&target)?;
             let me = self.device_id();
             ensure!(
                 t.author_device == me || self.admin()? == me,
                 "only the author or the admin can delete for everyone"
             );
-            self.send_event(EventBody::Delete { target })?;
+            self.send_event(&chat, EventBody::Delete { target })?;
         }
         self.wipe(&[target])
     }
 
     pub fn pin(&self, target: EventId, pinned: bool) -> Result<Event> {
-        self.send_event(EventBody::Pin { target, pinned })
+        let chat = self.event(&target)?.0;
+        self.send_event(&chat, EventBody::Pin { target, pinned })
     }
 
-    /// Sends a copy of a text or media message as a new own message.
-    pub fn forward(&self, target: EventId) -> Result<Event> {
-        let body = match self.event(&target)?.body {
+    /// Sends a copy of a text or media message as a new own message to chat `to`.
+    pub fn forward(&self, target: EventId, to: &Chat) -> Result<Event> {
+        let body = match self.event(&target)?.1.body {
             EventBody::Text { text, .. } => EventBody::Text {
                 text,
                 reply_to: None,
@@ -393,7 +624,7 @@ impl Node {
             },
             _ => bail!("not a message"),
         };
-        self.send_event(body)
+        self.send_event(to, body)
     }
 
     /// Erases events with their decrypted media and blobs from this device.
@@ -420,7 +651,7 @@ impl Node {
     /// Wipes the targets of valid Delete events still here (a Delete may arrive before its
     /// target); returns their ids.
     fn apply_deletes(&self) -> Result<HashSet<EventId>> {
-        let hist = self.history()?;
+        let hist: Vec<_> = self.all_events()?.into_iter().map(|(_, e)| e).collect();
         let admin = self.admin()?;
         let author: HashMap<_, _> = hist.iter().map(|e| (e.id, e.author_device)).collect();
         let ids: HashSet<_> = hist
@@ -443,10 +674,14 @@ impl Node {
     /// Delivery of own text events (§7.4): 0 ⏱ nobody confirmed yet, 1 ✓ some member device has it,
     /// 2 ✓✓ every other member device has it (by their Delivered receipts).
     // shortcut: "has it" = a receipt up to an event with lamport >= ours; use per-author clocks if concurrent sends mislead it.
-    pub fn statuses(&self) -> Result<Vec<(EventId, u8)>> {
+    pub fn statuses(&self, chat: &Chat) -> Result<Vec<(EventId, u8)>> {
         let me = self.device_id();
-        let others: Vec<_> = self.members().into_iter().filter(|m| *m != me).collect();
-        let hist = self.history()?;
+        let others: Vec<_> = self
+            .chat_members(chat)?
+            .into_iter()
+            .filter(|m| *m != me)
+            .collect();
+        let hist = self.history(chat)?;
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
         let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
         for e in &hist {
@@ -485,9 +720,9 @@ impl Node {
         let cutoff = now_ms()?.saturating_sub(days * 86_400_000);
         let n = self.st.lock().unwrap().store.prune(cutoff as i64)?;
         let keep: HashSet<String> = self
-            .history()?
+            .all_events()?
             .iter()
-            .filter_map(|e| media(e).map(|(_, b)| hex(&b.hash)))
+            .filter_map(|(_, e)| media(e).map(|(_, b)| hex(&b.hash)))
             .collect();
         let tags: Vec<_> = self.blobs.tags().list().await?.collect::<Vec<_>>().await;
         for t in tags {
@@ -503,6 +738,7 @@ impl Node {
     /// `meta` carries mime, name, preview, duration and dims; hash, size and key are filled here.
     pub async fn send_media(
         &self,
+        chat: &Chat,
         kind: MediaKind,
         src: &Path,
         mut meta: BlobRef,
@@ -528,12 +764,15 @@ impl Node {
         let out = self.media_file(&meta);
         std::fs::create_dir_all(out.parent().context("media dir")?)?;
         std::fs::copy(src, &out)?;
-        self.send_event(EventBody::Media {
-            kind,
-            blob: meta,
-            caption,
-            reply_to: None,
-        })
+        self.send_event(
+            chat,
+            EventBody::Media {
+                kind,
+                blob: meta,
+                caption,
+                reply_to: None,
+            },
+        )
     }
 
     /// True once the whole blob is here.
@@ -647,7 +886,7 @@ impl Node {
 
     /// Downloads every blob of the history that is not here yet (anchors).
     pub fn fetch_missing(self: Arc<Self>) {
-        if let Ok(h) = self.history() {
+        if let Ok(h) = self.history(&None) {
             self.fetch_all(h);
         }
     }
@@ -696,11 +935,13 @@ impl Node {
         self.net.connected()
     }
 
-    /// Signs, encrypts (MLS), stores and sends an event to every known peer.
-    fn send_event(&self, body: EventBody) -> Result<Event> {
+    /// Signs, encrypts (MLS), stores and sends an event to every known peer; 1:1 chats too,
+    /// so any member (an anchor) can keep and forward the ciphertext while the partner is away.
+    fn send_event(&self, chat: &Chat, body: EventBody) -> Result<Event> {
         let (ev, env, peers) = {
             let mut st = self.st.lock().unwrap();
-            let head = st.store.head()?;
+            let gid = st.gid(chat)?;
+            let head = st.store.head(chat_key(chat))?;
             let ev = Event {
                 id: [0; 32],
                 author_device: [0; 32],
@@ -714,11 +955,11 @@ impl Node {
                 signature: vec![],
             };
             let ev = sign_event(self.net.secret_key(), ev);
-            let epoch = st.mls.epoch();
-            let ct = st.mls.encrypt(&postcard::to_allocvec(&ev)?)?;
+            let epoch = st.mls.epoch(&gid);
+            let ct = st.mls.encrypt(&gid, &postcard::to_allocvec(&ev)?)?;
             st.save_mls()?;
-            let env = st.envelope(ct, epoch)?;
-            st.store_event(&ev)?;
+            let env = st.envelope(gid, ct, epoch)?;
+            st.store_event(&ev, chat)?;
             st.store_env(&env)?;
             (ev, env, st.store.peers()?)
         };
@@ -726,20 +967,25 @@ impl Node {
         Ok(ev)
     }
 
-    /// One Delivered receipt per received batch, up to its newest text from someone else (§7.4).
+    /// One Delivered receipt per chat in a received batch, up to its newest text from someone else (§7.4).
     // shortcut: receipts are stored events (~members per message); prune or aggregate if history grows too big.
-    fn send_receipt(&self, evs: &[Event]) {
+    fn send_receipt(&self, evs: &[(Chat, Event)]) {
         let me = self.device_id();
-        let last = evs
-            .iter()
-            .filter(|e| e.author_device != me && is_msg(&e.body))
-            .max_by_key(|e| e.lamport);
-        if let Some(e) = last {
+        let mut last: HashMap<Chat, &Event> = HashMap::new();
+        for (c, e) in evs {
+            if e.author_device != me && is_msg(&e.body) {
+                let l = last.entry(*c).or_insert(e);
+                if e.lamport > l.lamport {
+                    *l = e;
+                }
+            }
+        }
+        for (c, e) in last {
             let body = EventBody::Receipt {
                 up_to: e.id,
                 kind: ReceiptKind::Delivered,
             };
-            if let Err(e) = self.send_event(body) {
+            if let Err(e) = self.send_event(&c, body) {
                 eprintln!("mycel: receipt failed: {e}");
             }
         }
@@ -780,7 +1026,7 @@ impl Node {
 
     /// Stores verified, newer addresses of members and learns their relays (§6.2).
     fn add_peers(&self, st: &State, list: &[SignedAddr]) -> Result<()> {
-        let members = st.mls.members();
+        let members = st.mls.members(&st.group()?);
         let mut relays = vec![];
         for a in list {
             let Ok(t) = a.ticket.parse::<EndpointTicket>() else {
@@ -822,7 +1068,7 @@ impl Node {
     /// Exchanges addresses with every known peer and asks for what we miss (offering what they miss).
     fn sync(&self) -> Result<()> {
         let st = self.st.lock().unwrap();
-        if !st.mls.has_group() {
+        if !st.in_space()? {
             return Ok(());
         }
         let peers = st.store.peers()?;
@@ -851,12 +1097,14 @@ impl Node {
         }
     }
 
-    fn handle(&self, from: EndpointId, msg: SyncMsg) -> Result<Vec<Event>> {
+    fn handle(&self, from: EndpointId, msg: SyncMsg) -> Result<Vec<(Chat, Event)>> {
         let mut st = self.st.lock().unwrap();
+        let space = st.group()?;
         ensure!(
-            st.mls.members().contains(from.as_bytes()),
+            st.mls.members(&space).contains(from.as_bytes()),
             "sender is not a member"
         );
+        let me = self.device_id();
         if !st.store.has_peer(from.as_bytes())? {
             let t = EndpointTicket::new(EndpointAddr::new(from));
             st.store
@@ -865,12 +1113,11 @@ impl Node {
         let mut out = vec![];
         match msg {
             SyncMsg::Envs(mut envs) => {
-                // Commits must apply before later-epoch messages.
+                // Commits (and 1:1 Welcomes, epoch 0) must apply before later-epoch messages.
                 envs.sort_by_key(|e| e.epoch);
                 for env in envs {
-                    match st.receive(&env) {
-                        Ok(Some(ev)) => out.push(ev),
-                        Ok(None) => {}
+                    match st.receive(&env, me) {
+                        Ok(evs) => out.extend(evs),
                         Err(e) => eprintln!("mycel: bad envelope: {e}"),
                     }
                 }
@@ -925,11 +1172,12 @@ impl Node {
         {
             bail!("unknown or used invite");
         }
-        let epoch = st.mls.epoch();
-        let (id, commit, welcome) = st.mls.add_member(&req.key_package)?;
+        let gid = st.group()?;
+        let epoch = st.mls.epoch(&gid);
+        let (id, commit, welcome) = st.mls.add_member(&gid, &req.key_package)?;
         ensure!(id == *from.as_bytes(), "KeyPackage is not the sender's");
         st.save_mls()?;
-        let env = st.envelope(commit, epoch)?;
+        let env = st.envelope(gid, commit, epoch)?;
         st.store_env(&env)?;
         let peers = st.store.peers()?;
         let list = self.peer_list(&st)?;

@@ -41,8 +41,8 @@ async fn offer_accept_frames_end() {
     b.join(&a.invite().await.unwrap()).await.unwrap();
     let (mut fa, mut fb) = (a.call_frames(), b.call_frames());
 
-    let (id, _) = a.call_offer(false).unwrap();
-    assert!(a.call_offer(false).is_err(), "one call at a time");
+    let (id, _) = a.call_offer(&None, false).unwrap();
+    assert!(a.call_offer(&None, false).is_err(), "one call at a time");
     assert_eq!(
         recv_call(&mut rx_b).await,
         (id, CallAction::Offer { video: false })

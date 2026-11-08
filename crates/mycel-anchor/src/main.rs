@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
                 println!("{}", node.invite().await?);
             }
             let me = node.device_id();
-            for ev in node.history()? {
+            for ev in node.history(&None)? {
                 print_event(&ev, me);
             }
             tokio::spawn(async move {
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
             });
             while let Some(line) = lines.next_line().await? {
                 if !line.trim().is_empty() {
-                    node.send_text(&line, None)?;
+                    node.send_text(&None, &line, None)?;
                 }
             }
         }

@@ -1,4 +1,4 @@
-//! MLS group (DESIGN.md §5): one group per space, state kept in a byte blob the caller persists.
+//! MLS groups (DESIGN.md §5): the space group plus 1:1 chat groups, state kept in a byte blob the caller persists.
 
 use anyhow::{Context, Result, anyhow, ensure};
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::types::SignatureScheme;
+use std::collections::HashMap;
 
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 /// Old-epoch app messages stay decryptable for a while (late delivery via sync).
@@ -45,16 +46,16 @@ pub struct Mls {
     provider: Provider,
     signer: SignatureKeyPair,
     cred: CredentialWithKey,
-    group: Option<MlsGroup>,
+    groups: HashMap<Vec<u8>, MlsGroup>,
 }
 
 impl Mls {
     /// The MLS identity and signature key are the device key, so MLS sender == NodeId.
-    /// `state` is a previous `state()` dump; `group_id` loads that group from it.
+    /// `state` is a previous `state()` dump; the groups `group_ids` are loaded from it.
     pub fn new(
         key: &crate::SecretKey,
         state: Option<&[u8]>,
-        group_id: Option<&[u8]>,
+        group_ids: &[Vec<u8>],
     ) -> Result<Self> {
         let provider = Provider::default();
         if let Some(s) = state {
@@ -71,18 +72,17 @@ impl Mls {
             credential: BasicCredential::new(pk.clone()).into(),
             signature_key: pk.into(),
         };
-        let group = match group_id {
-            Some(id) => Some(
-                MlsGroup::load(&provider.storage, &GroupId::from_slice(id))?
-                    .context("MLS group missing from state")?,
-            ),
-            None => None,
-        };
+        let mut groups = HashMap::new();
+        for id in group_ids {
+            let g = MlsGroup::load(&provider.storage, &GroupId::from_slice(id))?
+                .context("MLS group missing from state")?;
+            groups.insert(id.clone(), g);
+        }
         Ok(Self {
             provider,
             signer,
             cred,
-            group,
+            groups,
         })
     }
 
@@ -100,23 +100,29 @@ impl Mls {
             .max_past_epochs(PAST_EPOCHS)
             .use_ratchet_tree_extension(true)
             .build(&self.provider, &self.signer, self.cred.clone())?;
-        self.group = Some(g);
+        self.groups.insert(group_id.to_vec(), g);
         Ok(())
     }
 
-    /// Fresh KeyPackage to send to the admin; its private part stays in our state.
-    pub fn key_package(&self) -> Result<Vec<u8>> {
-        let kp =
-            KeyPackage::builder().build(SUITE, &self.provider, &self.signer, self.cred.clone())?;
+    /// Fresh KeyPackage; its private part stays in our state. A last-resort one survives
+    /// being used (the one in our profile, for anyone who opens a 1:1 chat with us).
+    pub fn key_package(&self, last_resort: bool) -> Result<Vec<u8>> {
+        let mut b = KeyPackage::builder();
+        if last_resort {
+            let caps =
+                Capabilities::new(None, None, Some(&[ExtensionType::LastResort]), None, None);
+            b = b.mark_as_last_resort().leaf_node_capabilities(caps);
+        }
+        let kp = b.build(SUITE, &self.provider, &self.signer, self.cred.clone())?;
         Ok(kp.key_package().tls_serialize_detached()?)
     }
 
     /// Adds the KeyPackage owner. Returns (new member's device id, commit, welcome); commit already merged.
-    pub fn add_member(&mut self, kp: &[u8]) -> Result<([u8; 32], Vec<u8>, Vec<u8>)> {
+    pub fn add_member(&mut self, gid: &[u8], kp: &[u8]) -> Result<([u8; 32], Vec<u8>, Vec<u8>)> {
         let kp = KeyPackageIn::tls_deserialize_exact(kp)?
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
         let id = device(kp.leaf_node().credential())?;
-        let g = self.group.as_mut().context("no group")?;
+        let g = self.groups.get_mut(gid).context("no group")?;
         let (commit, welcome, _) = g.add_members(&self.provider, &self.signer, &[kp])?;
         g.merge_pending_commit(&self.provider)?;
         Ok((id, commit.to_bytes()?, welcome.to_bytes()?))
@@ -135,19 +141,19 @@ impl Mls {
         let g = StagedWelcome::new_from_welcome(&self.provider, &cfg, w, None)?
             .into_group(&self.provider)?;
         let id = g.group_id().as_slice().to_vec();
-        self.group = Some(g);
+        self.groups.insert(id.clone(), g);
         Ok(id)
     }
 
-    pub fn encrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let g = self.group.as_mut().context("no group")?;
+    pub fn encrypt(&mut self, gid: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+        let g = self.groups.get_mut(gid).context("no group")?;
         Ok(g.create_message(&self.provider, &self.signer, data)?
             .to_bytes()?)
     }
 
     /// Decrypts a message; commits are merged only if sent by `admin`.
-    pub fn process(&mut self, msg: &[u8], admin: &[u8; 32]) -> Result<Incoming> {
-        let g = self.group.as_mut().context("no group")?;
+    pub fn process(&mut self, gid: &[u8], msg: &[u8], admin: &[u8; 32]) -> Result<Incoming> {
+        let g = self.groups.get_mut(gid).context("no group")?;
         let m = MlsMessageIn::tls_deserialize_exact(msg)?.try_into_protocol_message()?;
         let p = g.process_message(&self.provider, m)?;
         let sender = device(p.credential())?;
@@ -167,21 +173,17 @@ impl Mls {
     }
 
     /// MLS exporter secret of the current epoch (call frame keys, §9).
-    pub fn export(&self, label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
-        let g = self.group.as_ref().context("no group")?;
+    pub fn export(&self, gid: &[u8], label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+        let g = self.groups.get(gid).context("no group")?;
         Ok(g.export_secret(self.provider.crypto(), label, context, len)?)
     }
 
-    pub fn epoch(&self) -> u64 {
-        self.group.as_ref().map_or(0, |g| g.epoch().as_u64())
+    pub fn epoch(&self, gid: &[u8]) -> u64 {
+        self.groups.get(gid).map_or(0, |g| g.epoch().as_u64())
     }
 
-    pub fn has_group(&self) -> bool {
-        self.group.is_some()
-    }
-
-    pub fn members(&self) -> Vec<[u8; 32]> {
-        let Some(g) = &self.group else {
+    pub fn members(&self, gid: &[u8]) -> Vec<[u8; 32]> {
+        let Some(g) = self.groups.get(gid) else {
             return vec![];
         };
         g.members()
@@ -206,27 +208,36 @@ mod tests {
     fn add_encrypt_restart() {
         let (ka, kb) = (SecretKey::generate(), SecretKey::generate());
         let admin = *ka.public().as_bytes();
-        let mut a = Mls::new(&ka, None, None).unwrap();
-        a.create_group(&[7; 32]).unwrap();
-        let mut b = Mls::new(&kb, None, None).unwrap();
-        let (id, _commit, welcome) = a.add_member(&b.key_package().unwrap()).unwrap();
+        let g = &[7; 32];
+        let mut a = Mls::new(&ka, None, &[]).unwrap();
+        a.create_group(g).unwrap();
+        let mut b = Mls::new(&kb, None, &[]).unwrap();
+        let (id, _commit, welcome) = a.add_member(g, &b.key_package(false).unwrap()).unwrap();
         assert_eq!(id, *kb.public().as_bytes());
-        assert_eq!(b.join(&welcome).unwrap(), vec![7; 32]);
-        assert_eq!(a.members().len(), 2);
+        assert_eq!(b.join(&welcome).unwrap(), g.to_vec());
+        assert_eq!(a.members(g).len(), 2);
 
-        let ct = a.encrypt(b"secret").unwrap();
+        let ct = a.encrypt(g, b"secret").unwrap();
         assert!(!ct.windows(6).any(|w| w == b"secret"));
-        let Incoming::App { sender, data } = b.process(&ct, &admin).unwrap() else {
+        let Incoming::App { sender, data } = b.process(g, &ct, &admin).unwrap() else {
             panic!("not app")
         };
         assert_eq!((sender, data.as_slice()), (admin, &b"secret"[..]));
 
         // Restart B from its dumped state.
-        let mut b = Mls::new(&kb, Some(&b.state()), Some(&[7; 32])).unwrap();
-        let ct = b.encrypt(b"back").unwrap();
-        let Incoming::App { data, .. } = a.process(&ct, &admin).unwrap() else {
+        let mut b = Mls::new(&kb, Some(&b.state()), &[g.to_vec()]).unwrap();
+        let ct = b.encrypt(g, b"back").unwrap();
+        let Incoming::App { data, .. } = a.process(g, &ct, &admin).unwrap() else {
             panic!("not app")
         };
         assert_eq!(data, b"back");
+
+        // A last-resort KeyPackage (profile) lets several groups add B.
+        let kp = b.key_package(true).unwrap();
+        for gid in [[8; 32], [9; 32]] {
+            a.create_group(&gid).unwrap();
+            let (_, _, w) = a.add_member(&gid, &kp).unwrap();
+            assert_eq!(b.join(&w).unwrap(), gid.to_vec());
+        }
     }
 }

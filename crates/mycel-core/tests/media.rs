@@ -84,7 +84,7 @@ async fn blobs_send_anchor_resume() {
         .collect();
     std::fs::write(&src, &five).unwrap();
     let ev = a
-        .send_media(MediaKind::File, &src, meta("five.bin"), None)
+        .send_media(&None, MediaKind::File, &src, meta("five.bin"), None)
         .await
         .unwrap();
     let blob = media(&ev).unwrap().1.clone();
@@ -106,7 +106,7 @@ async fn blobs_send_anchor_resume() {
         .collect();
     std::fs::write(&big, &data).unwrap();
     let ev2 = a
-        .send_media(MediaKind::Video, &big, meta("big.mp4"), None)
+        .send_media(&None, MediaKind::Video, &big, meta("big.mp4"), None)
         .await
         .unwrap();
     let blob2 = media(&ev2).unwrap().1.clone();

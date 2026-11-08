@@ -2,7 +2,7 @@
 //! Mesh: each pair of participants holds one connection, dialled by the smaller device id.
 //! Frames are encoded in the UI (WebCodecs); here they are only encrypted and moved.
 
-use crate::{Node, hex};
+use crate::{Chat, Node, hex};
 use anyhow::{Context, Result, ensure};
 use mycel_net::{CALL_ALPN, Connection, EndpointId};
 use mycel_proto::{CallAction, Event, EventBody};
@@ -27,6 +27,8 @@ pub struct Frame {
 
 pub(crate) struct Call {
     id: [u8; 16],
+    /// The chat whose members take part (the space chat: a group call; a 1:1 chat: just us two).
+    chat: Chat,
     key: [u8; 32],
     seq: u64,
     conns: HashMap<EndpointId, CallConn>,
@@ -48,28 +50,37 @@ pub struct LinkStats {
 
 impl Node {
     /// Starts a call: sends an Offer to the chat. Others join with `call_accept`.
-    pub fn call_offer(self: &Arc<Self>, video: bool) -> Result<([u8; 16], Event)> {
+    pub fn call_offer(self: &Arc<Self>, chat: &Chat, video: bool) -> Result<([u8; 16], Event)> {
         ensure!(self.call.lock().unwrap().is_none(), "already in a call");
         let mut id = [0u8; 16];
         getrandom::fill(&mut id)?;
-        Ok((id, self.join_call(id, CallAction::Offer { video })?))
+        Ok((id, self.join_call(id, *chat, CallAction::Offer { video })?))
     }
 
     pub fn call_accept(self: &Arc<Self>, id: [u8; 16]) -> Result<Event> {
         ensure!(self.call.lock().unwrap().is_none(), "already in a call");
-        self.join_call(id, CallAction::Accept)
+        self.join_call(id, self.call_chat(id)?, CallAction::Accept)
     }
 
     /// In the call before the event goes out, so a peer dialling us on it is not refused.
-    fn join_call(self: &Arc<Self>, id: [u8; 16], action: CallAction) -> Result<Event> {
-        self.enter_call(id)?;
-        self.call_event(id, action).inspect_err(|_| {
+    fn join_call(self: &Arc<Self>, id: [u8; 16], chat: Chat, action: CallAction) -> Result<Event> {
+        self.enter_call(id, chat)?;
+        self.call_event(id, &chat, action).inspect_err(|_| {
             self.call.lock().unwrap().take();
         })
     }
 
     pub fn call_reject(&self, id: [u8; 16]) -> Result<Event> {
-        self.call_event(id, CallAction::Reject)
+        self.call_event(id, &self.call_chat(id)?, CallAction::Reject)
+    }
+
+    /// The chat a call was offered in.
+    pub fn call_chat(&self, id: [u8; 16]) -> Result<Chat> {
+        self.all_events()?
+            .into_iter()
+            .find(|(_, e)| matches!(e.body, EventBody::Call { call_id, .. } if call_id == id))
+            .map(|(c, _)| c)
+            .context("no such call")
     }
 
     /// Leaves the current call (sends End); no-op outside a call.
@@ -80,7 +91,7 @@ impl Node {
         for (conn, ..) in c.conns.values() {
             conn.close(0u32.into(), b"end");
         }
-        self.call_event(c.id, CallAction::End).map(Some)
+        self.call_event(c.id, &c.chat, CallAction::End).map(Some)
     }
 
     /// Id of the call we are in.
@@ -140,7 +151,7 @@ impl Node {
     /// Devices in call `id` by the chat history: last action Offer/Accept = in, End/Reject = out.
     pub fn call_members(&self, id: [u8; 16]) -> Result<Vec<[u8; 32]>> {
         let mut last = HashMap::new();
-        for e in self.history()? {
+        for (_, e) in self.all_events()? {
             if let EventBody::Call { call_id, action } = e.body
                 && call_id == id
             {
@@ -182,26 +193,28 @@ impl Node {
         }
     }
 
-    /// Per-sender frame key: MLS exporter of the current epoch over (call id, sender).
+    /// Per-sender frame key: MLS exporter of the chat's group, current epoch, over (call id, sender).
     // shortcut: key from the epoch at connect time; a commit mid-call desyncs keys only if it lands between two peers' connects.
-    fn call_key(&self, id: [u8; 16], sender: &[u8; 32]) -> Result<[u8; 32]> {
-        let k =
-            self.st
-                .lock()
-                .unwrap()
-                .mls
-                .export("mycel call", &[&id[..], sender].concat(), 32)?;
+    fn call_key(&self, id: [u8; 16], chat: &Chat, sender: &[u8; 32]) -> Result<[u8; 32]> {
+        let st = self.st.lock().unwrap();
+        let k = st.mls.export(
+            &st.gid(chat)?,
+            "mycel call",
+            &[&id[..], sender].concat(),
+            32,
+        )?;
         Ok(k.try_into().expect("32 bytes"))
     }
 
-    fn enter_call(self: &Arc<Self>, id: [u8; 16]) -> Result<()> {
+    fn enter_call(self: &Arc<Self>, id: [u8; 16], chat: Chat) -> Result<()> {
         let me = self.device_id();
         let mut seq = [0u8; 8];
         // Random start: rejoining the same call must not reuse nonces.
         getrandom::fill(&mut seq)?;
         *self.call.lock().unwrap() = Some(Call {
             id,
-            key: self.call_key(id, &me)?,
+            chat,
+            key: self.call_key(id, &chat, &me)?,
             seq: u64::from_be_bytes(seq) >> 2,
             conns: HashMap::new(),
         });
@@ -230,7 +243,7 @@ impl Node {
     }
 
     /// Keeps a call connection (ours or incoming) and forwards its decrypted frames.
-    // shortcut: any space member may connect while we are in a call; they could derive the keys anyway (same MLS group).
+    // shortcut: any member of the call's chat may connect while we are in a call; they could derive the keys anyway (same MLS group).
     pub(crate) fn add_call_conn(
         self: &Arc<Self>,
         conn: Connection,
@@ -238,10 +251,19 @@ impl Node {
     ) -> Result<()> {
         let peer = conn.remote_id();
         let from = *peer.as_bytes();
-        ensure!(self.members().contains(&from), "not a member");
-        let call_id = self.call_id().context("not in a call")?;
+        let (call_id, chat) = self
+            .call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| (c.id, c.chat))
+            .context("not in a call")?;
+        ensure!(
+            self.chat_members(&chat)?.contains(&from),
+            "not in this chat"
+        );
         ensure!(id.is_none_or(|i| i == call_id), "call ended");
-        let key = self.call_key(call_id, &from)?;
+        let key = self.call_key(call_id, &chat, &from)?;
         let (vtx, mut vrx) = mpsc::channel::<Vec<u8>>(60);
         self.call
             .lock()
@@ -296,7 +318,7 @@ impl Node {
         }
     }
 
-    fn call_event(&self, call_id: [u8; 16], action: CallAction) -> Result<Event> {
-        self.send_event(EventBody::Call { call_id, action })
+    fn call_event(&self, call_id: [u8; 16], chat: &Chat, action: CallAction) -> Result<Event> {
+        self.send_event(chat, EventBody::Call { call_id, action })
     }
 }

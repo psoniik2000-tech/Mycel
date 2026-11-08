@@ -17,15 +17,31 @@ import { Signal, VoiceSettings } from "./voice";
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
   reply: { id: string; author: string; text: string } | null; edited: boolean; pinned: boolean };
-type CallView = { id: string; video: boolean; author: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
-type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; ts: number };
-type Active = { id: string; video: boolean; started: number; peers: string[] };
-type Member = { id: string; me: boolean; admin: boolean };
+type CallView = { id: string; video: boolean; author: string; chat: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
+// chat: "" = the space chat (group call), else the 1:1 partner's id.
+type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
+type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
+type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null };
+type ChatRow = { id: string; last: Msg | null; unread: number };
 type Status = { dir: string; exists: boolean; unlocked: boolean; in_space: boolean };
 type Tab = "chats" | "calls" | "people" | "settings";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 const hue = (id: string) => parseInt(id.slice(0, 4), 16) % 360;
+// Avatar colors a member can pick (profile `color` is an index here).
+const PALETTE = [210, 0, 25, 45, 130, 175, 265, 320];
+// Members with their profiles, for names and avatars everywhere.
+const [people, setPeople] = createSignal<Member[]>([]);
+const memberOf = (id: string) => people().find((m) => m.id === id);
+const nameOf = (id: string) => memberOf(id)?.name ?? `Участник ${id}`;
+const colorOf = (id: string) => {
+  const c = memberOf(id)?.color;
+  return c == null ? hue(id) : PALETTE[c % PALETTE.length];
+};
+const initials = (id: string) => {
+  const m = memberOf(id);
+  return m?.avatar || (m?.name ? m.name.trim().split(/\s+/).slice(0, 2).map((w) => [...w][0]).join("").toUpperCase() : id.slice(0, 2).toUpperCase());
+};
 const errText = (e: unknown) => String(e);
 const android = /Android/.test(navigator.userAgent);
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -34,11 +50,54 @@ const callLabel = (c: CallView) =>
   : c.active ? "Идёт звонок"
   : `${c.video ? "Видеозвонок" : "Звонок"}, ${clock(c.duration_ms ?? 0)}`;
 
-function Avatar(p: { id: string }) {
+function Avatar(p: { id: string; onClick?: () => void }) {
   return (
-    <div class="avatar" style={{ background: `hsl(${hue(p.id)} 45% 55%)` }}>
-      {p.id.slice(0, 2).toUpperCase()}
+    <div class="avatar" classList={{ link: !!p.onClick }} style={{ background: `hsl(${colorOf(p.id)} 45% 55%)` }}
+      onClick={(e) => p.onClick && (e.stopPropagation(), p.onClick())}>
+      {initials(p.id)}
     </div>
+  );
+}
+
+// Name and avatar letter/color: asked on first entry, changed in Settings.
+function ProfileForm(p: { submit: string; onDone?: () => void }) {
+  const me = () => people().find((m) => m.me);
+  const [name, setName] = createSignal(me()?.name ?? "");
+  const [avatar, setAvatar] = createSignal(me()?.avatar ?? "");
+  const [color, setColor] = createSignal(me()?.color ?? Math.floor(Math.random() * PALETTE.length));
+  const [err, setErr] = createSignal("");
+  const [saved, setSaved] = createSignal(false);
+  const save = async (e: Event) => {
+    e.preventDefault();
+    try {
+      await invoke("set_profile", { name: name().trim(), avatar: avatar().trim(), color: color() });
+      setPeople(await invoke<Member[]>("members"));
+      setErr("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+      p.onDone?.();
+    } catch (e) {
+      setErr(errText(e));
+    }
+  };
+  const letter = () => avatar().trim() || name().trim().split(/\s+/).slice(0, 2).map((w) => [...w][0] ?? "").join("").toUpperCase() || "?";
+  return (
+    <form class="profile" onSubmit={save}>
+      <div class="profile-top">
+        <div class="avatar big" style={{ background: `hsl(${PALETTE[color()]} 45% 55%)` }}>{letter()}</div>
+        <input placeholder="Ваше имя" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
+      </div>
+      <div class="swatches">
+        <For each={PALETTE}>
+          {(h, i) => <button type="button" class="swatch" classList={{ active: color() === i() }} style={{ background: `hsl(${h} 45% 55%)` }}
+            onClick={() => setColor(i())} title="Цвет аватара" />}
+        </For>
+        <input class="letter" placeholder="Буква" maxLength={2} value={avatar()} onInput={(e) => setAvatar(e.currentTarget.value)}
+          title="Буква или эмодзи на аватаре (пусто — инициалы)" />
+      </div>
+      <Show when={err()}><p class="error">{err()}</p></Show>
+      <button class="primary" disabled={!name().trim()}>{saved() ? "Сохранено" : p.submit}</button>
+    </form>
   );
 }
 
@@ -122,6 +181,7 @@ function Lock(p: { exists: boolean; onDone: (inSpace: boolean) => void }) {
 }
 
 function Onboard(p: { onDone: () => void }) {
+  const [name, setName] = createSignal("");
   const [link, setLink] = createSignal("");
   const [err, setErr] = createSignal("");
   const [busy, setBusy] = createSignal("");
@@ -130,6 +190,8 @@ function Onboard(p: { onDone: () => void }) {
     setErr("");
     try {
       await invoke(cmd, args);
+      // Main asks again if this fails.
+      await invoke("set_profile", { name: name().trim(), avatar: "", color: Math.floor(Math.random() * PALETTE.length) }).catch(() => {});
       p.onDone();
     } catch (e) {
       setErr(errText(e));
@@ -142,7 +204,9 @@ function Onboard(p: { onDone: () => void }) {
         <img src={logo} class="logo" alt="" />
         <h1>Добро пожаловать</h1>
         <p class="muted">Создайте своё пространство или вступите в существующее по ссылке-приглашению</p>
-        <button class="primary" disabled={!!busy()} onClick={() => run("create", "create_space")}>
+        <input placeholder="Как вас зовут?" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
+        <Show when={!name().trim()}><p class="muted small">Имя увидят другие участники</p></Show>
+        <button class="primary" disabled={!!busy() || !name().trim()} onClick={() => run("create", "create_space")}>
           <Plus size={18} /> {busy() === "create" ? "Создаём…" : "Создать пространство"}
         </button>
         <div class="or"><span>или</span></div>
@@ -157,7 +221,7 @@ function Onboard(p: { onDone: () => void }) {
             }
           }}><Camera size={18} /> Сканировать QR</button>
         </Show>
-        <button disabled={!!busy() || !link().trim()} onClick={() => run("join", "join", { link: link() })}>
+        <button disabled={!!busy() || !link().trim() || !name().trim()} onClick={() => run("join", "join", { link: link() })}>
           <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
         </button>
         <Show when={err()}><p class="error">{err()}</p></Show>
@@ -169,28 +233,66 @@ function Onboard(p: { onDone: () => void }) {
 function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) {
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
+  // The open chat: "" = the space chat, else the 1:1 partner's id.
+  const [chat, setChat] = createSignal("");
   const [msgs, setMsgs] = createSignal<Msg[]>([]);
-  const [members, setMembers] = createSignal<Member[]>([]);
+  const members = people;
   const [peers, setPeers] = createSignal(0);
-  const [unread, setUnread] = createSignal(0);
+  const [rows, setRows] = createSignal<ChatRow[]>([]);
+  const [callList, setCallList] = createSignal<CallView[]>([]);
   const [focused, setFocused] = createSignal(document.hasFocus());
   const wideQuery = matchMedia("(min-width: 900px)");
   const [wide, setWide] = createSignal(wideQuery.matches);
   const chatVisible = () => (wide() || chatOpen()) && focused();
-  createEffect(() => chatVisible() && setUnread(0));
+  // Read marks per chat (newest message ts seen), kept on this device.
+  const readMap = (): Record<string, number> => {
+    try {
+      return JSON.parse(localStorage.getItem("read") ?? "{}");
+    } catch {
+      return {};
+    }
+  };
+  const loadChats = () => invoke<ChatRow[]>("chats", { read: readMap() }).then(setRows);
+  const markRead = () => {
+    const ts = Math.max(Date.now(), ...msgs().map((m) => m.ts));
+    localStorage.setItem("read", JSON.stringify({ ...readMap(), [chat()]: ts }));
+    loadChats();
+  };
+  createEffect(() => chatVisible() && msgs() && untrack(markRead));
+  const unread = () => rows().reduce((n, r) => n + r.unread, 0);
 
-  const loadMembers = () => invoke<Member[]>("members").then(setMembers);
+  const loadMembers = () => invoke<Member[]>("members").then(setPeople);
+  const loadCalls = () => invoke<CallView[]>("calls_list").then(setCallList);
   // Latest call wins; unchanged messages keep their objects, so their bubbles (and media) don't re-render.
   let seq = 0;
   const reload = async () => {
     const s = ++seq;
-    const fresh = await invoke<Msg[]>("history");
-    if (s !== seq) return;
+    const c = chat();
+    const fresh = await invoke<Msg[]>("history", { chat: c });
+    if (s !== seq || c !== chat()) return;
     const old = new Map(msgs().map((m) => [m.id, m]));
     setMsgs(fresh.map((m) => {
       const o = old.get(m.id);
       return o && JSON.stringify(o) === JSON.stringify(m) ? o : m;
     }));
+    loadChats();
+  };
+  const openChat = async (id: string) => {
+    if (id && memberOf(id)?.me) return;
+    setCallErr("");
+    try {
+      if (id) await invoke("open_dm", { peer: id });
+    } catch (e) {
+      return setCallErr("Не удалось открыть чат: " + errText(e));
+    }
+    setTab("chats");
+    if (chat() !== id) {
+      setMsgs([]);
+      setChat(id);
+      await reload();
+    }
+    if (!chatOpen()) history.pushState(null, "");
+    setChatOpen(true);
   };
 
   // Calls (§9): `incoming` rings full screen; `active` is the call screen (started = 0 while ringing out).
@@ -211,13 +313,15 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     media = new CallMedia(setTiles);
     await media.start(video);
   };
-  const startCall = async (video: boolean) => {
+  const startCall = async (video: boolean, to = chat()) => {
     if (active()) return;
     setCallErr("");
     try {
+      if (to) await invoke("open_dm", { peer: to });
       await openMedia(video);
-      setActive({ id: await invoke<string>("call_start", { video }), video, started: 0, peers: [] });
+      setActive({ id: await invoke<string>("call_start", { chat: to, video }), video, started: 0, peers: [], chat: to });
       reload();
+      loadCalls();
       // Nobody answers in 45 s: hang up (the feed shows "no answer").
       const id = active()!.id;
       setTimeout(() => active()?.id === id && !active()!.started && endCall(), 45_000);
@@ -234,7 +338,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     try {
       await openMedia(c.video);
       const peers = await invoke<string[]>("call_accept", { id: c.id });
-      setActive({ id: c.id, video: c.video, started: Date.now(), peers });
+      setActive({ id: c.id, video: c.video, started: Date.now(), peers, chat: c.chat });
     } catch (e) {
       setCallErr("Не удалось ответить: " + errText(e));
       endCall();
@@ -254,25 +358,25 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
       if (c.action === "end" || c.action === "reject") {
         const peers = a.peers.filter((p) => p !== c.author);
         setActive({ ...a, peers });
-        // Everyone left (or the only other member declined): hang up.
-        if ((a.started && !peers.length) || (c.action === "reject" && members().length <= 2)) endCall();
+        // Everyone left (or the only other person declined): hang up.
+        if ((a.started && !peers.length) || (c.action === "reject" && (a.chat || members().length <= 2))) endCall();
       }
     }
-    reload();
+    if (c.chat === chat()) reload();
+    else loadChats();
+    loadCalls();
   };
   const pollPeers = () => invoke<number>("peers").then(setPeers);
   onMount(async () => {
     loadMembers();
+    loadCalls();
     pollPeers();
     // A join comes as an MLS commit, not a message: poll members with peers.
     const timer = setInterval(() => (pollPeers(), loadMembers()), 3000);
     // Listen before the first load, so nothing that arrives in between is lost.
-    const un = await listen("message", () => {
-      reload();
-      if (!chatVisible()) setUnread((n) => n + 1);
-      loadMembers();
-    });
-    const unChanged = await listen("changed", reload);
+    const onMsg = (c: string) => (c === chat() ? reload() : loadChats());
+    const un = await listen<string>("message", (e) => onMsg(e.payload));
+    const unChanged = await listen<string>("changed", (e) => (onMsg(e.payload), loadMembers()));
     const unCall = await listen<CallSignal>("call", (e) => onCall(e.payload));
     const unStatus = await listen<[string, number][]>("status", (e) => {
       const st = new Map(e.payload);
@@ -306,7 +410,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     });
   });
 
-  const last = () => msgs().at(-1);
+  const sortedRows = () => [...rows()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
   const titles = { chats: "Чаты", calls: "Звонки", people: "Люди", settings: "Настройки" };
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
     <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); }} title={label}>
@@ -333,25 +437,37 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
         </header>
         <Switch>
           <Match when={tab() === "chats"}>
-            <button class="row chat-row" classList={{ active: wide() }} onClick={() => { if (!chatOpen()) history.pushState(null, ""); setChatOpen(true); }}>
-              <div class="avatar group"><Hash size={20} /></div>
-              <div class="grow">
-                <div class="row-top"><b>Общий чат</b><small class="muted">{last() ? time(last()!.ts) : ""}</small></div>
-                <div class="row-bottom">
-                  <span class="muted ellipsis">{last() ? (last()!.mine ? "Вы: " : "") + (last()!.call ? callLabel(last()!.call!) : last()!.media ? label(last()!.media!) : last()!.text) : "Сообщений пока нет"}</span>
-                  <Show when={unread()}><b class="badge">{unread()}</b></Show>
-                </div>
-              </div>
-            </button>
+            <div class="scroll">
+              <For each={sortedRows()}>
+                {(r) => {
+                  const l = () => r.last;
+                  return (
+                    <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => openChat(r.id)}>
+                      {r.id ? <Avatar id={r.id} /> : <div class="avatar group"><Hash size={20} /></div>}
+                      <div class="grow">
+                        <div class="row-top"><b class="ellipsis">{r.id ? nameOf(r.id) : "Общий чат"}</b><small class="muted">{l() ? time(l()!.ts) : ""}</small></div>
+                        <div class="row-bottom">
+                          <span class="muted ellipsis">{l() ? (l()!.mine ? "Вы: " : !r.id && !l()!.call ? `${nameOf(l()!.author)}: ` : "") + (l()!.call ? callLabel(l()!.call!) : l()!.media ? label(l()!.media!) : l()!.text) : "Сообщений пока нет"}</span>
+                          <Show when={r.unread}><b class="badge">{r.unread}</b></Show>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                }}
+              </For>
+              <p class="muted small pad">Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате</p>
+            </div>
           </Match>
           <Match when={tab() === "calls"}>
-            <Calls msgs={msgs()} />
+            <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
           </Match>
           <Match when={tab() === "people"}>
-            <People members={members()} />
+            <People members={members()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
             <div class="scroll pad">
+              <h3>Профиль</h3>
+              <ProfileForm submit="Сохранить" />
               <h3>Тема</h3>
               <div class="segmented">
                 <For each={[["system", "Как в системе"], ["light", "Светлая"], ["dark", "Тёмная"]]}>
@@ -376,8 +492,22 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
         </Switch>
       </section>
 
-      <Chat msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
-        peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={startCall} callErr={callErr()} />
+      <Show when={{ c: chat() }} keyed>
+        {(k) => (
+          <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
+            peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
+            openChat={openChat} />
+        )}
+      </Show>
+      <Show when={people().some((m) => m.me && !m.name)}>
+        <div class="modal">
+          <div class="card dialog">
+            <h3>Как вас зовут?</h3>
+            <p class="muted small">Имя и аватар увидят другие участники. Поменять можно в Настройках.</p>
+            <ProfileForm submit="Готово" />
+          </div>
+        </div>
+      </Show>
       <Show when={incoming()}>
         <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
       </Show>
@@ -388,7 +518,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
   );
 }
 
-function People(p: { members: Member[] }) {
+function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (id: string, video: boolean) => void; inCall: boolean }) {
   const [inv, setInv] = createSignal<{ link: string; svg: string }>();
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
@@ -429,13 +559,17 @@ function People(p: { members: Member[] }) {
       <p class="section muted">Участники · {p.members.length}</p>
       <For each={p.members}>
         {(m) => (
-          <div class="row">
-            <Avatar id={m.id} />
+          <div class="row person">
+            <Avatar id={m.id} onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
-              <b>{m.me ? "Вы" : `Участник ${m.id}`}</b>
-              <div class="muted small mono">{m.id}</div>
+              <b>{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
+              <div class="muted small mono">{m.id}<Show when={m.admin}> · админ</Show></div>
             </div>
-            <Show when={m.admin}><span class="tag">админ</span></Show>
+            <Show when={!m.me}>
+              <button class="icon" onClick={() => p.onWrite(m.id)} title="Написать"><MessageCircle size={20} /></button>
+              <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, false)} title="Позвонить"><Phone size={20} /></button>
+              <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, true)} title="Видеозвонок"><Video size={20} /></button>
+            </Show>
           </div>
         )}
       </For>
@@ -459,8 +593,8 @@ const plain = (m: Msg) => m.text || (m.media ? label(m.media) : "");
 type Dialog = { kind: "delete" | "forward"; ids: string[] };
 
 function Chat(p: {
-  msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
-  inCall: boolean; onCall: (video: boolean) => void; callErr: string;
+  chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
+  inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void;
 }) {
   const [text, setText] = createSignal("");
   // Sent but not in the history yet (⏱); `real` is the event id once the node has it.
@@ -473,7 +607,7 @@ function Chat(p: {
   const [atBottom, setAtBottom] = createSignal(true);
   const [fresh, setFresh] = createSignal(0);
   const [pinIx, setPinIx] = createSignal(0);
-  const name = (id: string) => (id === p.me ? "Вы" : `Участник ${id}`);
+  const name = (id: string) => (id === p.me ? "Вы" : nameOf(id));
   const shown = () => {
     const ids = new Set(p.msgs.map((m) => m.id));
     return [...p.msgs, ...pending().filter((x) => !x.real || !ids.has(x.real))];
@@ -570,7 +704,7 @@ function Chat(p: {
 
   const sendFiles = async (paths: string[]) => {
     for (const path of paths)
-      await queue({ text: `📎 ${path.split(/[\\/]/).pop()}` }, () => invoke<string>("send_file", { path, original: original() }));
+      await queue({ text: `📎 ${path.split(/[\\/]/).pop()}` }, () => invoke<string>("send_file", { chat: p.chat, path, original: original() }));
   };
   const attach = async () => {
     if (android) return picker.click();
@@ -619,7 +753,7 @@ function Chat(p: {
     const kind = video() ? "videonote" : "voice";
     const wave = kind === "voice" ? await waveform(blob) : [];
     const body = new Uint8Array(await blob.arrayBuffer());
-    const headers = { kind, mime: r.mime, duration: String(Date.now() - r.started), wave: wave.join(",") };
+    const headers = { chat: p.chat, kind, mime: r.mime, duration: String(Date.now() - r.started), wave: wave.join(",") };
     await queue({ text: kind === "voice" ? "🎤 Голосовое" : "📹 Видеосообщение" }, () => invoke<string>("send_rec", body, { headers }));
   };
   const down = (e: PointerEvent) => {
@@ -681,7 +815,7 @@ function Chat(p: {
     queueMicrotask(grow);
     if (ed) return t !== ed.text && act(invoke("edit", { id: ed.id, text: t }));
     queue({ text: t, reply: r ? { id: r.id, author: r.author, text: plain(r) } : null },
-      () => invoke<string>("send", { text: t, replyTo: r?.id ?? null }),
+      () => invoke<string>("send", { chat: p.chat, text: t, replyTo: r?.id ?? null }),
       () => (setText(t), setReply(r), queueMicrotask(grow)));
   };
   const canAll = (ids: string[]) => p.admin || ids.every((id) => p.msgs.find((m) => m.id === id)?.mine);
@@ -689,16 +823,16 @@ function Chat(p: {
     <section class="chat">
       <Show when={sel().length} fallback={<header class="bar">
         <button class="icon back" onClick={p.back} title="Назад"><ArrowLeft size={20} /></button>
-        <div class="avatar group small-av"><Hash size={18} /></div>
-        <div class="grow">
-          <b>Общий чат</b>
-          <div class="muted small">{p.members} участн.</div>
+        {p.chat ? <Avatar id={p.chat} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
+        <div class="grow ellipsis">
+          <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
+          <div class="muted small">{p.chat ? "личный чат" : `${p.members} участн.`}</div>
         </div>
         <NetDot n={p.peers} />
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
-          title={p.members > 2 ? "Групповой звонок" : "Звонок"}><Phone size={20} /></button>
+          title={p.chat ? "Звонок" : "Групповой звонок"}><Phone size={20} /></button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}
-          title={p.members > 2 ? "Групповой видеозвонок" : "Видеозвонок"}><Video size={20} /></button>
+          title={p.chat ? "Видеозвонок" : "Групповой видеозвонок"}><Video size={20} /></button>
       </header>}>
         <header class="bar selbar">
           <button class="icon" onClick={() => setSel([])} title="Отмена (Esc)"><X size={20} /></button>
@@ -732,7 +866,7 @@ function Chat(p: {
                   {m.call ? (
                     <div class="call-line" classList={{ missed: m.call.missed }}>
                       {m.call.missed ? <PhoneMissed size={14} /> : m.call.video ? <Video size={14} /> : <Phone size={14} />}
-                      {m.mine ? "" : `Участник ${m.author} · `}{callLabel(m.call)} · {time(m.ts)}
+                      {m.mine || p.chat ? "" : `${nameOf(m.author)} · `}{callLabel(m.call)} · {time(m.ts)}
                     </div>
                   ) : (
                     <div class="msg" data-id={m.id}
@@ -743,11 +877,14 @@ function Chat(p: {
                         <Show when={sel().includes(m.id)}><Check size={14} /></Show>
                       </button>
                       <Show when={!m.mine}>
-                        <Show when={!same(m, next())} fallback={<div class="av-gap" />}><Avatar id={m.author} /></Show>
+                        <Show when={!same(m, next())} fallback={<div class="av-gap" />}>
+                          <Avatar id={m.author} onClick={p.chat ? undefined : () => p.openChat(m.author)} />
+                        </Show>
                       </Show>
                       <div class="bubble">
-                        <Show when={!m.mine && !same(prev(), m)}>
-                          <div class="author" style={{ color: `hsl(${hue(m.author)} 50% 50%)` }}>Участник {m.author}</div>
+                        <Show when={!m.mine && !p.chat && !same(prev(), m)}>
+                          <div class="author link" style={{ color: `hsl(${colorOf(m.author)} 50% 50%)` }} title="Написать лично"
+                            onClick={(e) => (e.stopPropagation(), p.openChat(m.author))}>{nameOf(m.author)}</div>
                         </Show>
                         <Show when={m.reply}>
                           {(r) => (
@@ -810,14 +947,21 @@ function Chat(p: {
               <Show when={d().kind === "delete"} fallback={
                 <>
                   <h3>Переслать в чат</h3>
-                  <button class="row chat-row" onClick={() => {
-                    const ids = d().ids;
-                    setDlg(undefined);
-                    setSel([]);
-                    act(invoke("forward", { ids }));
-                  }}>
-                    <div class="avatar group small-av"><Hash size={18} /></div><b>Общий чат</b>
-                  </button>
+                  <div class="dialog-list">
+                    <For each={["", ...people().filter((m) => !m.me).map((m) => m.id)]}>
+                      {(to) => (
+                        <button class="row chat-row" onClick={() => {
+                          const ids = d().ids;
+                          setDlg(undefined);
+                          setSel([]);
+                          act(invoke("forward", { ids, to }));
+                        }}>
+                          {to ? <Avatar id={to} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
+                          <b>{to ? nameOf(to) : "Общий чат"}</b>
+                        </button>
+                      )}
+                    </For>
+                  </div>
                 </>
               }>
                 <h3>{d().ids.length > 1 ? `Удалить ${d().ids.length} сообщ.?` : "Удалить сообщение?"}</h3>
@@ -882,22 +1026,28 @@ function Chat(p: {
   );
 }
 
-function Calls(p: { msgs: Msg[] }) {
-  const calls = () => p.msgs.filter((m) => m.call).reverse();
+function Calls(p: { calls: CallView[]; onCall: (video: boolean, to: string) => void; inCall: boolean }) {
   return (
     <div class="scroll">
-      <Show when={!calls().length}><p class="empty muted">Звонков пока не было</p></Show>
-      <For each={calls()}>
-        {(m) => (
-          <div class="row">
-            <Avatar id={m.author} />
-            <div class="grow">
-              <b>{m.mine ? "Исходящий" : `Участник ${m.author}`}</b>
-              <div class="muted small" classList={{ error: m.call!.missed && !m.mine }}>{callLabel(m.call!)}</div>
+      <Show when={!p.calls.length}><p class="empty muted">Звонков пока не было</p></Show>
+      <For each={p.calls}>
+        {(c) => {
+          // Who the call was with: the partner of a 1:1 chat, else the offerer (group call).
+          const who = () => c.chat || c.author;
+          return (
+            <div class="row">
+              {c.chat || !c.mine ? <Avatar id={who()} /> : <div class="avatar group"><Hash size={20} /></div>}
+              <div class="grow">
+                <b>{c.chat ? nameOf(c.chat) : c.mine ? "Общий чат" : `${nameOf(c.author)} · общий чат`}</b>
+                <div class="muted small" classList={{ error: c.missed && !c.mine }}>{c.mine ? "↗ " : "↙ "}{callLabel(c)}</div>
+              </div>
+              <small class="muted">{new Date(c.ts).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small>
+              <button class="icon" disabled={p.inCall} onClick={() => p.onCall(c.video, c.chat)} title="Позвонить снова">
+                {c.video ? <Video size={20} /> : <Phone size={20} />}
+              </button>
             </div>
-            <small class="muted">{new Date(m.ts).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small>
-          </div>
-        )}
+          );
+        }}
       </For>
     </div>
   );
@@ -908,8 +1058,8 @@ function Incoming(p: { c: CallSignal; onAccept: () => void; onReject: () => void
   return (
     <div class="call-screen incoming">
       <Avatar id={p.c.author} />
-      <h2>Участник {p.c.author}</h2>
-      <p class="muted">{p.c.video ? "Входящий видеозвонок" : "Входящий звонок"}</p>
+      <h2>{nameOf(p.c.author)}</h2>
+      <p class="muted">{p.c.video ? "Входящий видеозвонок" : "Входящий звонок"}{p.c.chat ? "" : " · общий чат"}</p>
       <div class="call-buttons">
         <button class="round hang" onClick={p.onReject} title="Отклонить"><PhoneOff size={26} /></button>
         <button class="round accept" onClick={p.onAccept} title="Принять">{p.c.video ? <Video size={26} /> : <Phone size={26} />}</button>
@@ -947,7 +1097,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
               {/* Video shows while frames come; otherwise the avatar. */}
               <div style={{ display: now() - t.videoAt < 1500 ? "contents" : "none" }}>{t.canvas}</div>
               <Show when={now() - t.videoAt >= 1500}><Avatar id={t.id} /></Show>
-              <span class="tile-name">Участник {t.id} <Signal net={t.net()} /></span>
+              <span class="tile-name">{nameOf(t.id)} <Signal net={t.net()} /></span>
             </div>
           )}
         </For>

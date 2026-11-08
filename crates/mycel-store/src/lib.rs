@@ -49,6 +49,11 @@ impl Store {
         {
             db.execute("UPDATE envelopes SET ts = ?1", [now_ms()])?;
         }
+        // Chat of an event: empty = the space chat, else the 1:1 partner's device id.
+        let _ = db.execute(
+            "ALTER TABLE events ADD COLUMN chat BLOB NOT NULL DEFAULT x''",
+            [],
+        );
         Ok(Self { db })
     }
 
@@ -96,12 +101,29 @@ impl Store {
     }
 
     /// Returns false if the event was already stored.
-    pub fn insert_event(&self, id: &[u8], lamport: u64, ts: u64, data: &[u8]) -> Result<bool> {
+    pub fn insert_event(
+        &self,
+        id: &[u8],
+        chat: &[u8],
+        lamport: u64,
+        ts: u64,
+        data: &[u8],
+    ) -> Result<bool> {
         let n = self.db.execute(
-            "INSERT OR IGNORE INTO events (id, lamport, ts, data) VALUES (?1, ?2, ?3, ?4)",
-            params![id, lamport as i64, ts as i64, data],
+            "INSERT OR IGNORE INTO events (id, chat, lamport, ts, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, chat, lamport as i64, ts as i64, data],
         )?;
         Ok(n == 1)
+    }
+
+    /// (chat, data) of an event.
+    pub fn event(&self, id: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .db
+            .query_row("SELECT chat, data FROM events WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
     }
 
     /// Removes an event; returns its data if it was here.
@@ -114,22 +136,31 @@ impl Store {
         Ok(data)
     }
 
-    /// All events, oldest first.
-    pub fn events(&self) -> Result<Vec<Vec<u8>>> {
+    /// Events of one chat, oldest first.
+    pub fn events(&self, chat: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut st = self
             .db
-            .prepare("SELECT data FROM events ORDER BY lamport, ts, id")?;
-        let rows = st.query_map([], |r| r.get(0))?;
+            .prepare("SELECT data FROM events WHERE chat = ?1 ORDER BY lamport, ts, id")?;
+        let rows = st.query_map([chat], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// (id, lamport) of the latest event.
-    pub fn head(&self) -> Result<Option<(Vec<u8>, u64)>> {
+    /// (chat, data) of every event, oldest first.
+    pub fn all_events(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut st = self
+            .db
+            .prepare("SELECT chat, data FROM events ORDER BY lamport, ts, id")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// (id, lamport) of the latest event of a chat.
+    pub fn head(&self, chat: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT id, lamport FROM events ORDER BY lamport DESC, ts DESC LIMIT 1",
-                [],
+                "SELECT id, lamport FROM events WHERE chat = ?1 ORDER BY lamport DESC, ts DESC LIMIT 1",
+                [chat],
                 |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
             )
             .optional()?)
@@ -190,17 +221,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         {
             let s = Store::open(&dir, "pw").unwrap();
-            assert!(s.insert_event(b"a", 1, 1, b"x").unwrap());
-            assert!(!s.insert_event(b"a", 1, 1, b"x").unwrap());
+            assert!(s.insert_event(b"a", b"", 1, 1, b"x").unwrap());
+            assert!(!s.insert_event(b"a", b"", 1, 1, b"x").unwrap());
+            assert!(s.insert_event(b"b", b"dm", 2, 1, b"y").unwrap());
         }
+        let s = Store::open(&dir, "pw").unwrap();
+        assert_eq!(s.events(b"").unwrap(), vec![b"x".to_vec()]);
         assert_eq!(
-            Store::open(&dir, "pw").unwrap().events().unwrap(),
-            vec![b"x".to_vec()]
+            s.event(b"b").unwrap(),
+            Some((b"dm".to_vec(), b"y".to_vec()))
         );
+        drop(s);
         assert!(Store::open(&dir, "bad").is_err());
         let s = Store::open(&dir, "pw").unwrap();
         s.insert_envelope(b"e", b"y").unwrap();
-        assert_eq!(s.prune(2).unwrap(), 1); // old event ts=1 goes, fresh envelope stays
+        assert_eq!(s.prune(2).unwrap(), 2); // old events ts=1 go, fresh envelope stays
         assert_eq!(s.prune(now_ms() + 1).unwrap(), 1);
         assert!(s.envelopes().unwrap().is_empty());
         drop(s);
