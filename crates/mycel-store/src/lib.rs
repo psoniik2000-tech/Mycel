@@ -10,25 +10,10 @@ pub struct Store {
 
 impl Store {
     /// Opens (or creates) `dir/mycel.db`, keyed by Argon2id(password, salt).
-    // shortcut: key derived from a CLI password, no OS keystore; wrap with DPAPI/Keystore in the app phase.
+    /// The app keeps the password in the OS keystore (DPAPI / Android Keystore).
     pub fn open(dir: &Path, password: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let salt_path = dir.join("salt");
-        let salt = match std::fs::read(&salt_path) {
-            Ok(s) => s,
-            Err(_) => {
-                let mut s = vec![0u8; 16];
-                getrandom::fill(&mut s).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
-                std::fs::write(&salt_path, &s)?;
-                s
-            }
-        };
-        let mut key = [0u8; 32];
-        argon2::Argon2::default()
-            .hash_password_into(password.as_bytes(), &salt, &mut key)
-            .map_err(|e| anyhow::anyhow!("argon2: {e}"))?;
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-
+        let hex = derive(dir, password)?;
         let db = Connection::open(dir.join("mycel.db"))?;
         db.pragma_update(None, "key", format!("x'{hex}'"))?;
         db.execute_batch(
@@ -55,6 +40,13 @@ impl Store {
             [],
         );
         Ok(Self { db })
+    }
+
+    /// Re-encrypts the database under a new password (the salt stays).
+    pub fn rekey(&self, dir: &Path, password: &str) -> Result<()> {
+        self.db
+            .pragma_update(None, "rekey", format!("x'{}'", derive(dir, password)?))?;
+        Ok(())
     }
 
     pub fn meta(&self, k: &str) -> Result<Option<Vec<u8>>> {
@@ -211,6 +203,25 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Hex SQLCipher key: Argon2id(password, `dir/salt`), the salt made on first use.
+fn derive(dir: &Path, password: &str) -> Result<String> {
+    let salt_path = dir.join("salt");
+    let salt = match std::fs::read(&salt_path) {
+        Ok(s) => s,
+        Err(_) => {
+            let mut s = vec![0u8; 16];
+            getrandom::fill(&mut s).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+            std::fs::write(&salt_path, &s)?;
+            s
+        }
+    };
+    let mut key = [0u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .map_err(|e| anyhow::anyhow!("argon2: {e}"))?;
+    Ok(key.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +249,12 @@ mod tests {
         assert_eq!(s.prune(2).unwrap(), 2); // old events ts=1 go, fresh envelope stays
         assert_eq!(s.prune(now_ms() + 1).unwrap(), 1);
         assert!(s.envelopes().unwrap().is_empty());
+        s.set_meta("k", b"v").unwrap();
+        s.rekey(&dir, "new").unwrap();
+        drop(s);
+        assert!(Store::open(&dir, "pw").is_err());
+        let s = Store::open(&dir, "new").unwrap();
+        assert_eq!(s.meta("k").unwrap(), Some(b"v".to_vec()));
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }

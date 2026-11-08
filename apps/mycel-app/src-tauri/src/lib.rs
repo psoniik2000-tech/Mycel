@@ -6,19 +6,48 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
+mod spaces;
+mod vault;
+
 type R<T> = Result<T, String>;
 
+/// The open space: one node at a time, swapped without restarting the app.
 #[derive(Default)]
-struct App(OnceLock<Arc<Node>>);
+struct App(Mutex<Option<Open>>);
+
+struct Open {
+    node: Arc<Node>,
+    id: String,
+    /// Kept to turn "remember" on later and to check the old one on change.
+    password: String,
+}
 
 impl App {
-    fn node(&self) -> R<&Arc<Node>> {
-        self.0.get().ok_or_else(|| "locked".into())
+    fn node(&self) -> R<Arc<Node>> {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|o| o.node.clone())
+            .ok_or_else(|| "locked".into())
+    }
+
+    fn is_open(&self, id: &str) -> bool {
+        self.0.lock().unwrap().as_ref().is_some_and(|o| o.id == id)
+    }
+
+    /// Ends the call and closes the open node, if any.
+    async fn close(&self) {
+        let open = self.0.lock().unwrap().take();
+        if let Some(o) = open {
+            let _ = o.node.call_end();
+            o.node.close().await;
+        }
     }
 }
 
@@ -136,10 +165,21 @@ struct Media {
 
 #[derive(Serialize)]
 struct Status {
+    spaces: Vec<SpaceRow>,
+    last: Option<String>,
+    /// The open space, if any.
+    current: Option<String>,
+    /// Its data folder.
     dir: String,
-    exists: bool,
-    unlocked: bool,
     in_space: bool,
+}
+
+#[derive(Serialize)]
+struct SpaceRow {
+    id: String,
+    name: String,
+    /// The password is in the OS keystore: opens without asking.
+    remembered: bool,
 }
 
 #[derive(Serialize)]
@@ -425,26 +465,71 @@ fn data_dir(app: &AppHandle) -> R<PathBuf> {
 // Commands that touch the node are async: they run on the tokio runtime, which core needs for spawn.
 #[tauri::command]
 fn status(app: AppHandle, st: State<App>) -> R<Status> {
-    let dir = data_dir(&app)?;
-    let node = st.0.get();
+    let root = data_dir(&app)?;
+    let list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    let open = st.0.lock().unwrap();
+    let current = open.as_ref().map(|o| o.id.clone());
     Ok(Status {
-        exists: dir.join("mycel.db").exists(),
-        dir: dir.display().to_string(),
-        unlocked: node.is_some(),
-        in_space: node.is_some_and(|n| n.admin().is_ok()),
+        spaces: list
+            .spaces
+            .into_iter()
+            .map(|s| SpaceRow {
+                remembered: vault::load(&root, &s.id).is_some(),
+                id: s.id,
+                name: s.name,
+            })
+            .collect(),
+        last: list.last,
+        dir: spaces::dir(&root, current.as_deref().unwrap_or(""))
+            .display()
+            .to_string(),
+        in_space: open.as_ref().is_some_and(|o| o.node.admin().is_ok()),
+        current,
     })
 }
 
+/// Opens space `id` (a new one named `name` if None), closing the open one. Without `password` it
+/// comes from the keystore; with it, `remember` puts it there or takes it out.
 #[tauri::command]
-async fn unlock(app: AppHandle, st: State<'_, App>, password: String, n0: bool) -> R<bool> {
-    if let Some(n) = st.0.get() {
-        return Ok(n.admin().is_ok());
+#[allow(clippy::too_many_arguments)]
+async fn unlock(
+    app: AppHandle,
+    st: State<'_, App>,
+    id: Option<String>,
+    name: String,
+    password: Option<String>,
+    remember: bool,
+    n0: bool,
+) -> R<bool> {
+    let root = data_dir(&app)?;
+    let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    let id = match id {
+        Some(id) => id,
+        None => {
+            let id = spaces::new_id();
+            list.spaces.push(spaces::Space {
+                id: id.clone(),
+                name: name.trim().to_string(),
+            });
+            id
+        }
+    };
+    if st.is_open(&id) {
+        return Ok(st.node()?.admin().is_ok());
     }
+    let pw = match &password {
+        Some(p) => p.clone(),
+        None => vault::load(&root, &id).ok_or("no saved password")?,
+    };
+    // Listed before the node creates its folder, so List::load never takes it for an orphan.
+    list.last = Some(id.clone());
+    list.save(&root).map_err(|e| e.to_string())?;
+    st.close().await;
     // Anchors' relays come via invite/peer exchange; n0 (Settings, on by default) is the public fallback.
-    let dir = data_dir(&app)?;
+    let dir = spaces::dir(&root, &id);
     let (node, mut rx) = Node::open(
         &dir,
-        &password,
+        &pw,
         &Opts {
             n0,
             ..Default::default()
@@ -452,15 +537,31 @@ async fn unlock(app: AppHandle, st: State<'_, App>, password: String, n0: bool) 
     )
     .await
     .map_err(err)?;
+    if password.is_some() {
+        if remember {
+            vault::save(&root, &id, &pw)?;
+        } else {
+            vault::forget(&root, &id);
+        }
+    }
     // <img>/<video> load decrypted media through the asset protocol.
     let _ = app.asset_protocol_scope().allow_directory(
         std::path::absolute(dir.join("media")).map_err(|e| e.to_string())?,
         true,
     );
     let in_space = node.admin().is_ok();
-    st.0.set(node.clone()).map_err(|_| "already unlocked")?;
+    *st.0.lock().unwrap() = Some(Open {
+        node: node.clone(),
+        id,
+        password: pw,
+    });
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            // Another space was opened since: its own loop reports.
+            let current = app.state::<App>().node();
+            if !current.is_ok_and(|n| Arc::ptr_eq(&n, &node)) {
+                break;
+            }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
             if let EventBody::Call { call_id, action } = &ev.body {
                 let (action, video) = match action {
@@ -546,14 +647,14 @@ async fn invite(st: State<'_, App>) -> R<Invite> {
 
 #[tauri::command]
 async fn history(st: State<'_, App>, chat: String) -> R<Vec<Msg>> {
-    let n = st.node()?;
+    let n = &st.node()?;
     chat_msgs(n, &chat_of(n, &chat)?)
 }
 
 /// The space chat and every 1:1 chat with its last message; `read`: chat → ts read up to.
 #[tauri::command]
 async fn chats(st: State<'_, App>, read: HashMap<String, u64>) -> R<Vec<ChatRow>> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let mut list = vec![None];
     list.extend(n.dms().map_err(err)?.into_iter().map(Some));
     list.iter()
@@ -572,7 +673,7 @@ async fn chats(st: State<'_, App>, read: HashMap<String, u64>) -> R<Vec<ChatRow>
 
 #[tauri::command]
 async fn open_dm(st: State<'_, App>, peer: String) -> R<()> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let p = chat_of(n, &peer)?.ok_or("no such member")?;
     n.open_dm(p).map_err(err)
 }
@@ -593,7 +694,7 @@ async fn send(
     text: String,
     reply_to: Option<String>,
 ) -> R<String> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let r = reply_to.map(|r| unhex(&r)).transpose()?;
     let ev = n.send_text(&chat_of(n, &chat)?, &text, r).map_err(err)?;
     Ok(hex(&ev.id))
@@ -608,7 +709,7 @@ async fn edit(st: State<'_, App>, id: String, text: String) -> R<()> {
 /// Several at once (selection mode); stops at the first refusal.
 #[tauri::command]
 async fn delete(st: State<'_, App>, ids: Vec<String>, all: bool) -> R<()> {
-    let n = st.node()?;
+    let n = &st.node()?;
     for id in ids {
         n.delete(unhex(&id)?, all).map_err(err)?;
     }
@@ -618,7 +719,7 @@ async fn delete(st: State<'_, App>, ids: Vec<String>, all: bool) -> R<()> {
 /// To any chat: `to` is "" or a member's short id (a 1:1 chat is opened if there is none).
 #[tauri::command]
 async fn forward(st: State<'_, App>, ids: Vec<String>, to: String) -> R<()> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let to = chat_of(n, &to)?;
     if let Some(p) = to {
         n.open_dm(p).map_err(err)?;
@@ -638,7 +739,7 @@ async fn pin(st: State<'_, App>, id: String, pinned: bool) -> R<()> {
 /// 📎 / drag-and-drop: photos are re-encoded (no EXIF) unless `original`, then they go as a file.
 #[tauri::command]
 async fn send_file(st: State<'_, App>, chat: String, path: String, original: bool) -> R<String> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let chat = &chat_of(n, &chat)?;
     let src = Path::new(&path);
     let name = src.file_name().map(|s| s.to_string_lossy().into_owned());
@@ -707,7 +808,7 @@ fn stash(request: tauri::ipc::Request<'_>) -> R<String> {
 /// A recording from the WebView (raw body); headers: chat, kind (voice|videonote), mime, duration, wave (csv).
 #[tauri::command]
 async fn send_rec(st: State<'_, App>, request: tauri::ipc::Request<'_>) -> R<String> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let data = &body(&request)?;
     let h = |k: &str| {
         request
@@ -749,7 +850,7 @@ struct Progress {
 /// Downloads (resuming) and decrypts a media message; emits `progress`; returns the file path.
 #[tauri::command]
 async fn fetch_media(app: AppHandle, st: State<'_, App>, id: String) -> R<String> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let (ev, b) = find_media(n, &id)?;
     let mut last = 0;
     n.fetch(&b, ev.author_device, |done| {
@@ -773,14 +874,14 @@ async fn fetch_media(app: AppHandle, st: State<'_, App>, id: String) -> R<String
 
 #[tauri::command]
 async fn save_media(st: State<'_, App>, id: String, to: String) -> R<()> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let p = n.media_path(&find_media(n, &id)?.1).await.map_err(err)?;
     std::fs::copy(p, to).map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn open_media(st: State<'_, App>, id: String) -> R<()> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let p = n.media_path(&find_media(n, &id)?.1).await.map_err(err)?;
     tauri_plugin_opener::open_path(p, None::<&str>).map_err(|e| e.to_string())
 }
@@ -788,7 +889,7 @@ async fn open_media(st: State<'_, App>, id: String) -> R<()> {
 /// Calls tab: newest first.
 #[tauri::command]
 async fn calls_list(st: State<'_, App>) -> R<Vec<CallView>> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let mut list = vec![None];
     list.extend(n.dms().map_err(err)?.into_iter().map(Some));
     let mut v = vec![];
@@ -803,7 +904,7 @@ async fn calls_list(st: State<'_, App>) -> R<Vec<CallView>> {
 /// 📞/📹: sends an Offer to a chat (space chat: group call; 1:1 chat: just that member); returns the call id.
 #[tauri::command]
 async fn call_start(st: State<'_, App>, chat: String, video: bool) -> R<String> {
-    let n = st.node()?;
+    let n = &st.node()?;
     Ok(hex(&n
         .call_offer(&chat_of(n, &chat)?, video)
         .map_err(err)?
@@ -813,7 +914,7 @@ async fn call_start(st: State<'_, App>, chat: String, video: bool) -> R<String> 
 #[tauri::command]
 /// Returns the other participants already in the call (short ids).
 async fn call_accept(st: State<'_, App>, id: String) -> R<Vec<String>> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let id = call_id(&id)?;
     // Answering while still in another call: leave that one.
     n.call_end().map_err(err)?;
@@ -892,7 +993,7 @@ async fn call_stats(st: State<'_, App>) -> R<Vec<Link>> {
 
 #[tauri::command]
 async fn members(st: State<'_, App>) -> R<Vec<Member>> {
-    let n = st.node()?;
+    let n = &st.node()?;
     let (me, admin) = (n.device_id(), n.admin().map_err(err)?);
     let mut prof = n.profiles().map_err(err)?;
     Ok(n.members()
@@ -917,12 +1018,57 @@ async fn peers(st: State<'_, App>) -> R<usize> {
 }
 
 #[tauri::command]
-async fn quit(app: AppHandle, st: State<'_, App>) -> R<()> {
-    if let Some(n) = st.0.get() {
-        let _ = n.call_end();
-        n.close().await;
+async fn close_space(st: State<'_, App>) -> R<()> {
+    st.close().await;
+    Ok(())
+}
+
+/// Deletes a space's data from this device (the space itself lives on with the others).
+#[tauri::command]
+async fn remove_space(app: AppHandle, st: State<'_, App>, id: String) -> R<()> {
+    let root = data_dir(&app)?;
+    if st.is_open(&id) {
+        st.close().await;
     }
-    app.exit(0);
+    let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    list.spaces.retain(|s| s.id != id);
+    if list.last.as_deref() == Some(id.as_str()) {
+        list.last = None;
+    }
+    list.save(&root).map_err(|e| e.to_string())?;
+    vault::forget(&root, &id);
+    // Fails while the closed node's last references still hold files; List::load retries at start.
+    let _ = std::fs::remove_dir_all(spaces::dir(&root, &id));
+    Ok(())
+}
+
+/// Settings: remember the open space's password on this device (no password at start).
+#[tauri::command]
+fn set_remember(app: AppHandle, st: State<App>, on: bool) -> R<()> {
+    let root = data_dir(&app)?;
+    let open = st.0.lock().unwrap();
+    let o = open.as_ref().ok_or("locked")?;
+    if on {
+        vault::save(&root, &o.id, &o.password)
+    } else {
+        vault::forget(&root, &o.id);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn change_password(app: AppHandle, st: State<App>, old: String, new: String) -> R<()> {
+    let root = data_dir(&app)?;
+    let mut open = st.0.lock().unwrap();
+    let o = open.as_mut().ok_or("locked")?;
+    if o.password != old {
+        return Err("Неверный текущий пароль".into());
+    }
+    o.node.change_password(&new).map_err(err)?;
+    o.password = new;
+    if vault::load(&root, &o.id).is_some() {
+        vault::save(&root, &o.id, &o.password)?;
+    }
     Ok(())
 }
 
@@ -965,7 +1111,10 @@ pub fn run() {
             peers,
             set_visible,
             stash,
-            quit
+            close_space,
+            remove_space,
+            set_remember,
+            change_password
         ])
         .setup(|_app| {
             #[cfg(mobile)]

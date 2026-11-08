@@ -22,3 +22,5 @@
 # ML Kit (QR scanner) finds its parts by reflection; R8 stripped them and the release app crashed on scan.
 -keep class com.google.mlkit.** { *; }
 -keep class com.google.android.gms.internal.mlkit_** { *; }
+# Called only from Rust over JNI.
+-keep class org.mycel.app.Vault { *; }

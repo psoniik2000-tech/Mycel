@@ -23,7 +23,8 @@ type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; v
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null };
 type ChatRow = { id: string; last: Msg | null; unread: number };
-type Status = { dir: string; exists: boolean; unlocked: boolean; in_space: boolean };
+type Space = { id: string; name: string; remembered: boolean };
+type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
 type Tab = "chats" | "calls" | "people" | "settings";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
@@ -46,6 +47,10 @@ const initials = (id: string) => {
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : typeof (e as any)?.message === "string" ? (e as any).message : JSON.stringify(e);
 const android = /Android/.test(navigator.userAgent);
+const n0 = () => localStorage.getItem("n0") !== "0";
+// The open space: per-space keys in localStorage (the first space keeps the old ones).
+let spaceId = "";
+const readKey = () => (spaceId === "main" ? "read" : `read:${spaceId}`);
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const callLabel = (c: CallView) =>
   c.missed ? (c.mine ? "Без ответа" : "Пропущенный звонок")
@@ -115,29 +120,65 @@ function NetDot(p: { n: number }) {
 
 export default function App() {
   const [status, setStatus] = createSignal<Status>();
-  const [stage, setStage] = createSignal<"lock" | "onboard" | "main">("lock");
+  // lock: the password of `space` (none = a new space); spaces: the list.
+  const [stage, setStage] = createSignal<"spaces" | "lock" | "onboard" | "main">();
+  const [space, setSpace] = createSignal<Space>();
   const [theme, setTheme] = createSignal(localStorage.getItem("theme") ?? "system");
   createEffect(() => {
     document.documentElement.dataset.theme = theme();
     localStorage.setItem("theme", theme());
   });
-  onMount(async () => {
+  const refresh = async () => {
     const s = await invoke<Status>("status");
-    if (s.unlocked) setStage(s.in_space ? "main" : "onboard");
     setStatus(s);
+    spaceId = s.current ?? "";
+    return s;
+  };
+  const opened = async (inSpace: boolean) => {
+    await refresh();
+    setStage(inSpace ? "main" : "onboard");
+  };
+  // A remembered space opens at once; otherwise (or if the saved password no longer fits) the password screen.
+  const enter = async (sp?: Space) => {
+    setSpace(sp);
+    if (sp?.remembered) {
+      try {
+        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0() }));
+      } catch {
+        // falls through to the password screen
+      }
+    }
+    setStage("lock");
+  };
+  const leave = async () => {
+    await invoke("close_space");
+    setPeople([]);
+    const s = await refresh();
+    if (s.spaces.length) setStage("spaces");
+    else enter();
+  };
+  onMount(async () => {
+    const s = await refresh();
+    if (s.current) return setStage(s.in_space ? "main" : "onboard");
+    const last = s.spaces.find((x) => x.id === s.last);
+    if (last || !s.spaces.length) return enter(last);
+    setStage("spaces");
   });
   return (
     <Show when={status()}>
       {(s) => (
         <Switch>
+          <Match when={stage() === "spaces"}>
+            <Spaces spaces={s().spaces} onOpen={enter} onNew={() => enter()} onRemoved={refresh} />
+          </Match>
           <Match when={stage() === "lock"}>
-            <Lock exists={s().exists} onDone={(inSpace) => setStage(inSpace ? "main" : "onboard")} />
+            <Lock space={space()} count={s().spaces.length} onDone={opened} onBack={s().spaces.length ? () => setStage("spaces") : undefined} />
           </Match>
           <Match when={stage() === "onboard"}>
             <Onboard onDone={() => setStage("main")} />
           </Match>
-          <Match when={stage() === "main"}>
-            <Main dir={s().dir} theme={theme()} setTheme={setTheme} />
+          <Match when={stage() === "main" && s().spaces.find((x) => x.id === s().current)}>
+            {(sp) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh} />}
           </Match>
         </Switch>
       )}
@@ -145,21 +186,25 @@ export default function App() {
   );
 }
 
-function Lock(p: { exists: boolean; onDone: (inSpace: boolean) => void }) {
+function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => void; onBack?: () => void }) {
+  const [name, setName] = createSignal(p.count ? `Пространство ${p.count + 1}` : "Моё пространство");
   const [pw, setPw] = createSignal("");
   const [pw2, setPw2] = createSignal("");
+  const [remember, setRemember] = createSignal(true);
   const [err, setErr] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  const exists = () => !!p.space;
   const submit = async (e: Event) => {
     e.preventDefault();
-    if (!p.exists && pw() !== pw2()) return setErr("Пароли не совпадают");
+    if (!exists() && !name().trim()) return setErr("Введите название");
+    if (!exists() && pw() !== pw2()) return setErr("Пароли не совпадают");
     if (!pw()) return setErr("Введите пароль");
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { password: pw(), n0: localStorage.getItem("n0") !== "0" }));
+      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name(), password: pw(), remember: remember(), n0: n0() }));
     } catch (e) {
-      setErr(p.exists ? "Неверный пароль" : errText(e));
+      setErr(exists() ? "Неверный пароль" : errText(e));
     }
     setBusy(false);
   };
@@ -167,18 +212,113 @@ function Lock(p: { exists: boolean; onDone: (inSpace: boolean) => void }) {
     <div class="center">
       <form class="card intro" onSubmit={submit}>
         <img src={logo} class="logo" alt="" />
-        <h1>Mycel</h1>
+        <h1>{p.space?.name ?? (p.count ? "Новое пространство" : "Mycel")}</h1>
         <p class="muted">
-          {p.exists ? "Введите пароль, чтобы открыть переписку" : "Придумайте пароль: им шифруются все данные на этом устройстве"}
+          {exists() ? "Введите пароль, чтобы открыть переписку" : "Придумайте пароль: им шифруются все данные на этом устройстве"}
         </p>
+        <Show when={!exists()}>
+          <input placeholder="Название пространства" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+        </Show>
         <input type="password" placeholder="Пароль" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} autofocus />
-        <Show when={!p.exists}>
+        <Show when={!exists()}>
           <input type="password" placeholder="Повторите пароль" value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} />
         </Show>
+        <label class="check">
+          <input type="checkbox" checked={remember()} onChange={(e) => setRemember(e.currentTarget.checked)} />
+          Запомнить на этом устройстве
+        </label>
         <Show when={err()}><p class="error">{err()}</p></Show>
-        <button class="primary" disabled={busy()}>{busy() ? "Открываем…" : p.exists ? "Открыть" : "Продолжить"}</button>
+        <button class="primary" disabled={busy()}>{busy() ? "Открываем…" : exists() ? "Открыть" : "Продолжить"}</button>
+        <Show when={p.onBack}><button type="button" onClick={p.onBack}><ArrowLeft size={18} /> Все пространства</button></Show>
       </form>
     </div>
+  );
+}
+
+function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: () => void; onRemoved: () => void }) {
+  const [del, setDel] = createSignal<Space>();
+  return (
+    <div class="center">
+      <div class="card intro">
+        <img src={logo} class="logo" alt="" />
+        <h1>Пространства</h1>
+        <For each={p.spaces}>
+          {(s) => (
+            <div class="actions">
+              <button class="grow" onClick={() => p.onOpen(s)}><Hash size={18} /> <span class="ellipsis">{s.name}</span></button>
+              <button class="icon" title="Удалить с этого устройства" onClick={() => setDel(s)}><Trash2 size={18} /></button>
+            </div>
+          )}
+        </For>
+        <div class="or"><span>или</span></div>
+        <button class="primary" onClick={p.onNew}><Plus size={18} /> Создать новое</button>
+        <button onClick={p.onNew}><Link size={18} /> Вступить по ссылке</button>
+      </div>
+      <Show when={del()}>
+        {(s) => <RemoveSpace space={s()} onClose={() => setDel()} onDone={() => (setDel(), p.onRemoved())} />}
+      </Show>
+    </div>
+  );
+}
+
+function RemoveSpace(p: { space: Space; onClose: () => void; onDone: () => void }) {
+  const [err, setErr] = createSignal("");
+  return (
+    <div class="modal" onClick={(e) => e.target === e.currentTarget && p.onClose()}>
+      <div class="card dialog">
+        <h3>Удалить «{p.space.name}» с этого устройства?</h3>
+        <p class="muted small">
+          Вся переписка и файлы этого пространства на этом устройстве будут стёрты. У других участников всё останется. Вернуться можно
+          только по новому приглашению.
+        </p>
+        <Show when={err()}><p class="error">{err()}</p></Show>
+        <div class="actions">
+          <button class="danger" onClick={() => invoke("remove_space", { id: p.space.id }).then(p.onDone, (e) => setErr(errText(e)))}>
+            <Trash2 size={18} /> Удалить
+          </button>
+          <button onClick={p.onClose}>Отмена</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Settings → Вход: password at start, password change.
+function LoginSettings(p: { space: Space; refresh: () => void }) {
+  const [old, setOld] = createSignal("");
+  const [pw, setPw] = createSignal("");
+  const [pw2, setPw2] = createSignal("");
+  const [msg, setMsg] = createSignal("");
+  const change = async (e: Event) => {
+    e.preventDefault();
+    if (!pw()) return setMsg("Введите новый пароль");
+    if (pw() !== pw2()) return setMsg("Пароли не совпадают");
+    try {
+      await invoke("change_password", { old: old(), new: pw() });
+      setOld("");
+      setPw("");
+      setPw2("");
+      setMsg("Пароль изменён");
+    } catch (e) {
+      setMsg(errText(e));
+    }
+  };
+  return (
+    <>
+      <h3>Вход</h3>
+      <label class="check">
+        <input type="checkbox" checked={!p.space.remembered}
+          onChange={(e) => invoke("set_remember", { on: !e.currentTarget.checked }).then(p.refresh, (e) => setMsg(errText(e)))} />
+        Требовать пароль при запуске
+      </label>
+      <form class="section" onSubmit={change}>
+        <input type="password" placeholder="Текущий пароль" value={old()} onInput={(e) => setOld(e.currentTarget.value)} />
+        <input type="password" placeholder="Новый пароль" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
+        <input type="password" placeholder="Повторите новый пароль" value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} />
+        <button>Сменить пароль</button>
+        <Show when={msg()}><p class="muted small">{msg()}</p></Show>
+      </form>
+    </>
   );
 }
 
@@ -256,7 +396,8 @@ function Onboard(p: { onDone: () => void }) {
   );
 }
 
-function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) {
+function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void }) {
+  const [del, setDel] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
   // The open chat: "" = the space chat, else the 1:1 partner's id.
@@ -273,7 +414,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
   // Read marks per chat (newest message ts seen), kept on this device.
   const readMap = (): Record<string, number> => {
     try {
-      return JSON.parse(localStorage.getItem("read") ?? "{}");
+      return JSON.parse(localStorage.getItem(readKey()) ?? "{}");
     } catch {
       return {};
     }
@@ -281,7 +422,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
   const loadChats = () => invoke<ChatRow[]>("chats", { read: readMap() }).then(setRows);
   const markRead = () => {
     const ts = Math.max(Date.now(), ...msgs().map((m) => m.ts));
-    localStorage.setItem("read", JSON.stringify({ ...readMap(), [chat()]: ts }));
+    localStorage.setItem(readKey(), JSON.stringify({ ...readMap(), [chat()]: ts }));
     loadChats();
   };
   createEffect(() => chatVisible() && msgs() && untrack(markRead));
@@ -513,10 +654,17 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
                 Резервный публичный сервер связи (n0)
               </label>
               <p class="muted">Помогает соединиться, когда нет своего якоря. Можно выключить, если якорь настроен. Применяется после перезапуска.</p>
-              <h3>Данные</h3>
+              <LoginSettings space={p.space} refresh={p.refresh} />
+              <h3>Пространство «{p.space.name}»</h3>
               <p class="muted">Зашифрованная база хранится здесь:</p>
               <code class="path">{p.dir}</code>
-              <button class="danger" onClick={() => invoke("quit")}><LogOut size={18} /> Выйти</button>
+              <div class="actions">
+                <button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button>
+                <button class="danger" onClick={() => setDel(true)}><Trash2 size={18} /> Удалить с этого устройства</button>
+              </div>
+              <Show when={del()}>
+                <RemoveSpace space={p.space} onClose={() => setDel(false)} onDone={p.onLeave} />
+              </Show>
             </div>
           </Match>
         </Switch>

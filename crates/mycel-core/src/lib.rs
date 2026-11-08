@@ -959,6 +959,11 @@ impl Node {
         }
     }
 
+    /// Re-encrypts the local database under a new password.
+    pub fn change_password(&self, password: &str) -> Result<()> {
+        self.st.lock().unwrap().store.rekey(&self.dir, password)
+    }
+
     pub async fn close(&self) {
         self.net.close().await;
         // Releases the blob database lock, so the same folder can be opened again.
