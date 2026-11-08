@@ -185,11 +185,18 @@ function Lock(p: { exists: boolean; onDone: (inSpace: boolean) => void }) {
 function Onboard(p: { onDone: () => void }) {
   const [name, setName] = createSignal("");
   const [link, setLink] = createSignal("");
-  const [err, setErr] = createSignal("");
+  // Set while the camera scanner is open: if it is still set on the next start, the scanner crashed the app.
+  const crashed = localStorage.getItem("scanning") === "1";
+  localStorage.removeItem("scanning");
+  const [err, setErr] = createSignal(crashed ? "Сканер QR не сработал на этом телефоне. Скопируйте ссылку-приглашение и вставьте её в поле выше" : "");
   const [busy, setBusy] = createSignal("");
+  const [stage, setStage] = createSignal("");
   const run = async (what: string, cmd: string, args?: Record<string, unknown>) => {
     setBusy(what);
     setErr("");
+    // Joining is one call: the hint just follows the clock (the core gives up after 40 s).
+    setStage("Ищу пригласившего…");
+    const slow = setTimeout(() => setStage("Всё ещё ищу… Mycel у пригласившего должен быть открыт и в сети"), 12000);
     try {
       await invoke(cmd, args);
       // Main asks again if this fails.
@@ -198,6 +205,7 @@ function Onboard(p: { onDone: () => void }) {
     } catch (e) {
       setErr(errText(e));
     }
+    clearTimeout(slow);
     setBusy("");
   };
   return (
@@ -225,9 +233,11 @@ function Onboard(p: { onDone: () => void }) {
               let back = false;
               const onBack = () => ((back = true), bs.cancel());
               addEventListener("popstate", onBack, { once: true });
+              localStorage.setItem("scanning", "1");
               try {
                 setLink((await bs.scan({ formats: [bs.Format.QRCode] })).content);
               } finally {
+                localStorage.removeItem("scanning");
                 removeEventListener("popstate", onBack);
                 if (!back) history.back();
               }
@@ -239,6 +249,7 @@ function Onboard(p: { onDone: () => void }) {
         <button disabled={!!busy() || !link().trim() || !name().trim()} onClick={() => run("join", "join", { link: link() })}>
           <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
         </button>
+        <Show when={busy() === "join"}><p class="muted small">{stage()}</p></Show>
         <Show when={err()}><p class="error">{err()}</p></Show>
       </div>
     </div>

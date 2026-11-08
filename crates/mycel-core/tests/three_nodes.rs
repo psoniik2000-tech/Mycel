@@ -48,10 +48,21 @@ async fn invite_join_encrypt_sync_restart() {
 
     let link = a.invite().await.unwrap();
     assert!(link.starts_with("mycel://join/"));
-    b.join(&link).await.unwrap();
-    // One-time secret: a second use is refused.
+    // Pasted from a messenger: wrapped and padded with spaces.
+    let (head, tail) = link.split_at(30);
+    b.join(&format!(
+        "  {head}
+ {tail} 
+"
+    ))
+    .await
+    .unwrap();
+    // One-time secret: a second use is refused, and says so.
     let (d, _rx_d) = open(&dirs[3], "pd").await;
-    assert!(d.join(&link).await.is_err());
+    let e = d.join(&link).await.unwrap_err().to_string();
+    assert!(e.starts_with(mycel_core::JOIN_USED), "{e}");
+    let e = d.join("mycel://join/xyz").await.unwrap_err().to_string();
+    assert!(e.starts_with(mycel_core::JOIN_BAD_LINK), "{e}");
     d.close().await;
 
     c.join(&a.invite().await.unwrap()).await.unwrap();
@@ -156,4 +167,47 @@ async fn anchor_store_and_forward_receipts() {
     for n in [a, c, x] {
         n.close().await;
     }
+}
+
+/// A phone in another network: the invite's ticket has only the relay, no direct address.
+#[tokio::test(flavor = "multi_thread")]
+async fn join_through_relay_only() {
+    use data_encoding::BASE32_NOPAD;
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    use mycel_net::{EndpointAddr, EndpointTicket};
+    let mut cfg = ServerConfig::default();
+    cfg.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+    let relay = Server::spawn(cfg).await.unwrap();
+    let url = format!("http://{}", relay.http_addr().unwrap());
+
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let pc = Opts {
+        own_relay: Some(url.clone()),
+        ..Default::default()
+    };
+    let (a, _rx_a) = Node::open(dirs[0].path(), "pa", &pc).await.unwrap();
+    let (b, _rx_b) = open(&dirs[1], "pb").await;
+    a.create_space().unwrap();
+
+    let link = a.invite().await.unwrap();
+    let raw = BASE32_NOPAD
+        .decode(link.strip_prefix("mycel://join/").unwrap().as_bytes())
+        .unwrap();
+    let (gid, secret, ticket, relays): ([u8; 32], [u8; 16], String, Vec<String>) =
+        postcard::from_bytes(&raw).unwrap();
+    let full: EndpointAddr = ticket.parse::<EndpointTicket>().unwrap().into();
+    let only_relay = EndpointAddr::new(full.id).with_relay_url(url.parse().unwrap());
+    let bytes = postcard::to_allocvec(&(
+        gid,
+        secret,
+        EndpointTicket::new(only_relay).to_string(),
+        relays,
+    ))
+    .unwrap();
+    b.join(&format!("mycel://join/{}", BASE32_NOPAD.encode(&bytes)))
+        .await
+        .unwrap();
+    until(|| a.members().len() == 2).await;
+    a.close().await;
+    b.close().await;
 }

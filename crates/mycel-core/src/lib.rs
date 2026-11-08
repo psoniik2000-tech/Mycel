@@ -30,6 +30,11 @@ pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 
 const LINK: &str = "mycel://join/";
+/// Join error prefixes (the UI shows a matching text).
+pub const JOIN_BAD_LINK: &str = "not a mycel invite link";
+pub const JOIN_UNREACHABLE: &str = "inviter unreachable";
+pub const JOIN_USED: &str = "invite already used or unknown";
+const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 
 /// Network options of a node.
 #[derive(Debug, Default, Clone)]
@@ -227,6 +232,7 @@ pub struct Node {
     st: Mutex<State>,
     net: Net,
     own_relay: Option<String>,
+    n0: bool,
     /// Encrypted media blobs (ciphertext, by BLAKE3 hash); a tag per hash keeps it from GC.
     blobs: FsStore,
     dir: PathBuf,
@@ -274,6 +280,7 @@ impl Node {
             st: Mutex::new(st),
             net,
             own_relay: opts.own_relay.clone(),
+            n0: opts.n0,
             blobs,
             dir: std::path::absolute(dir)?,
             keep_blobs: opts.keep_blobs,
@@ -341,10 +348,15 @@ impl Node {
 
     /// Ticket with this node's id and current addresses (waits briefly for a relay if we know any).
     pub async fn ticket(&self) -> String {
-        if !self.relays().is_empty() {
+        self.wait_relay().await;
+        EndpointTicket::new(self.net.addr()).to_string()
+    }
+
+    /// Without a relay in our address, a peer in another network cannot reach us.
+    async fn wait_relay(&self) {
+        if self.n0 || !self.relays().is_empty() {
             self.net.online().await;
         }
-        EndpointTicket::new(self.net.addr()).to_string()
     }
 
     /// Relay URLs this node uses (own and learned).
@@ -386,30 +398,41 @@ impl Node {
     }
 
     /// Joins a space by invite link: proves the secret, sends a KeyPackage, applies the Welcome.
+    /// Errors start with [`JOIN_BAD_LINK`], [`JOIN_UNREACHABLE`] or [`JOIN_USED`] when they are those.
     pub async fn join(&self, link: &str) -> Result<()> {
-        let b32 = link
-            .trim()
-            .strip_prefix(LINK)
-            .context("not a mycel invite")?;
-        let (gid, secret, ticket, relays): ([u8; 32], [u8; 16], String, Vec<String>) =
-            postcard::from_bytes(&BASE32_NOPAD.decode(b32.as_bytes())?)?;
-        let admin: EndpointAddr = ticket.parse::<EndpointTicket>()?.into();
+        // Messengers and notes wrap long links: drop every whitespace, not only the ends.
+        let link: String = link.split_whitespace().collect();
+        let parsed = || -> Result<_> {
+            let b32 = link.strip_prefix(LINK).context("no mycel://join/ prefix")?;
+            let (gid, secret, ticket, relays): ([u8; 32], [u8; 16], String, Vec<String>) =
+                postcard::from_bytes(&BASE32_NOPAD.decode(b32.as_bytes())?)?;
+            let admin: EndpointAddr = ticket.parse::<EndpointTicket>()?.into();
+            Ok((gid, secret, ticket, relays, admin))
+        };
+        let (gid, secret, ticket, relays, admin) = parsed().context(JOIN_BAD_LINK)?;
         {
             let st = self.st.lock().unwrap();
             ensure!(!st.in_space()?, "already in a space");
             self.learn_relays(&st, &relays)?;
         }
-        if !relays.is_empty() {
-            self.net.online().await;
-        }
+        self.wait_relay().await;
         let req = JoinReq {
             secret,
             key_package: self.st.lock().unwrap().mls.key_package(false)?,
             addr: self.my_addr()?,
         };
         let admin_id = admin.id;
-        let resp = self.net.join(admin, &postcard::to_allocvec(&req)?).await?;
-        let resp: JoinResp = postcard::from_bytes(&resp).context("join refused")?;
+        let resp = tokio::time::timeout(
+            JOIN_TIMEOUT,
+            self.net.join(admin, &postcard::to_allocvec(&req)?),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .context(JOIN_UNREACHABLE)?;
+        // The admin answers an empty message when it refuses (unknown or used secret).
+        ensure!(!resp.is_empty(), JOIN_USED);
+        let resp: JoinResp = postcard::from_bytes(&resp).context("bad join response")?;
         let mut st = self.st.lock().unwrap();
         ensure!(
             st.mls.join(&resp.welcome)? == gid,
@@ -1172,7 +1195,10 @@ impl Node {
                         eprintln!("mycel: profile resend failed: {e}");
                     }
                 }
-                Err(e) => eprintln!("mycel: join from {} refused: {e}", from.fmt_short()),
+                Err(e) => {
+                    let _ = reply.send(vec![]);
+                    eprintln!("mycel: join from {} refused: {e}", from.fmt_short());
+                }
             }
         }
     }

@@ -517,7 +517,20 @@ async fn create_space(st: State<'_, App>) -> R<()> {
 
 #[tauri::command]
 async fn join(st: State<'_, App>, link: String) -> R<()> {
-    st.node()?.join(&link).await.map_err(err)
+    st.node()?.join(&link).await.map_err(|e| {
+        let t = err(e);
+        let why = if t.starts_with(mycel_core::JOIN_BAD_LINK) {
+            "Это не ссылка-приглашение Mycel: скопируйте её целиком"
+        } else if t.starts_with(mycel_core::JOIN_UNREACHABLE) {
+            "Нет связи с тем, кто пригласил: его Mycel должен быть открыт и в сети. Попробуйте ещё раз"
+        } else if t.starts_with(mycel_core::JOIN_USED) {
+            "Приглашение уже использовано или отменено: попросите новое"
+        } else {
+            return t;
+        };
+        format!("{why}
+({t})")
+    })
 }
 
 #[tauri::command]
