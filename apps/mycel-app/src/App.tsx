@@ -42,7 +42,9 @@ const initials = (id: string) => {
   const m = memberOf(id);
   return m?.avatar || (m?.name ? m.name.trim().split(/\s+/).slice(0, 2).map((w) => [...w][0]).join("").toUpperCase() : id.slice(0, 2).toUpperCase());
 };
-const errText = (e: unknown) => String(e);
+/** Any thrown value as readable text: string, Error, or a plugin's `{ message }` object. */
+const errText = (e: unknown): string =>
+  typeof e === "string" ? e : e instanceof Error ? e.message : typeof (e as any)?.message === "string" ? (e as any).message : JSON.stringify(e);
 const android = /Android/.test(navigator.userAgent);
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const callLabel = (c: CallView) =>
@@ -214,10 +216,23 @@ function Onboard(p: { onDone: () => void }) {
         <Show when={android}>
           <button disabled={!!busy()} onClick={async () => {
             try {
-              const { scan, Format } = await import("@tauri-apps/plugin-barcode-scanner");
-              setLink((await scan({ formats: [Format.QRCode] })).content);
+              const bs = await import("@tauri-apps/plugin-barcode-scanner");
+              // The plugin's scan() fails unless the camera permission was asked for first.
+              if ((await bs.checkPermissions()) !== "granted" && (await bs.requestPermissions()) !== "granted")
+                return setErr("Нет доступа к камере: разрешите его Mycel в настройках телефона");
+              // Android back cancels the scan (otherwise it closes the app): give it a history entry to pop.
+              history.pushState(null, "");
+              let back = false;
+              const onBack = () => ((back = true), bs.cancel());
+              addEventListener("popstate", onBack, { once: true });
+              try {
+                setLink((await bs.scan({ formats: [bs.Format.QRCode] })).content);
+              } finally {
+                removeEventListener("popstate", onBack);
+                if (!back) history.back();
+              }
             } catch (e) {
-              setErr(errText(e));
+              if (errText(e) !== "cancelled") setErr(errText(e));
             }
           }}><Camera size={18} /> Сканировать QR</button>
         </Show>
@@ -349,9 +364,13 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
     setIncoming(undefined);
     invoke("call_reject", { id: c.id });
   };
+  // Retried sends can deliver a call's End before its Offer: never ring an ended call.
+  const ended = new Set<string>();
   const onCall = (c: CallSignal) => {
     const a = active();
-    if (c.action === "offer" && Date.now() - c.ts < 60_000 && !incoming()) setIncoming(c);
+    if (c.action === "end") ended.add(c.id + c.author);
+    // A stale ring (its End got lost) must not block a new call.
+    if (c.action === "offer" && !ended.has(c.id + c.author) && Date.now() - c.ts < 60_000 && !(incoming() && Date.now() - incoming()!.ts < 60_000)) setIncoming(c);
     if ((c.action === "end" || c.action === "reject") && incoming()?.id === c.id && incoming()!.author === c.author) setIncoming(undefined);
     if (a?.id === c.id) {
       if (c.action === "accept") setActive({ ...a, started: a.started || Date.now(), peers: [...new Set([...a.peers, c.author])] });
@@ -508,11 +527,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void }) 
           </div>
         </div>
       </Show>
-      <Show when={incoming()}>
-        <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
-      </Show>
       <Show when={active()}>
         <CallScreen a={active()!} tiles={tiles()} media={media!} onEnd={endCall} />
+      </Show>
+      {/* After the call screen: a new call rings on top of an active one. */}
+      <Show when={incoming()}>
+        <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
       </Show>
     </div>
   );
@@ -1073,6 +1093,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
   const [mic, setMic] = createSignal(true);
   const [cam, setCam] = createSignal(p.a.video);
   const [gear, setGear] = createSignal(false);
+  const [camErr, setCamErr] = createSignal("");
   const t = setInterval(() => setNow(Date.now()), 500);
   onCleanup(() => clearInterval(t));
   // Ringback until someone answers.
@@ -1083,8 +1104,8 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
     try {
       await p.media.setCam(!cam());
       setCam(!cam());
-    } catch {
-      /* no camera: stays off */
+    } catch (e) {
+      setCamErr("Камера не включилась: " + errText(e));
     }
   };
   return (
@@ -1108,6 +1129,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
       <Show when={cam()}>
         <video class="self" autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
       </Show>
+      <Show when={camErr()}><p class="error">{camErr()}</p></Show>
       <div class="call-buttons">
         <button class="round" classList={{ off: !mic() }} onClick={() => { p.media.setMic(!mic()); setMic(!mic()); }}
           title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={24} /> : <MicOff size={24} />}</button>

@@ -20,6 +20,8 @@ pub const BLOBS_ALPN: &[u8] = b"mycel/blobs/1";
 pub const CALL_ALPN: &[u8] = b"mycel/call/1";
 // shortcut: one message per stream, capped at 16 MiB (a full-history Envs batch); chunk when histories grow.
 const MAX_MSG: usize = 16 << 20;
+/// How long a cached connection gets to acknowledge a message before it is replaced.
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Incoming sync messages with the authenticated sender.
 pub type Inbox = mpsc::Receiver<(EndpointId, SyncMsg)>;
@@ -117,10 +119,13 @@ impl Net {
     pub async fn send(&self, to: EndpointAddr, msg: &SyncMsg) -> Result<()> {
         let bytes = postcard::to_allocvec(msg)?;
         let cached = self.conns.lock().unwrap().get(&to.id).cloned();
-        if let Some(conn) = cached
-            && write(&conn, &bytes).await.is_ok()
-        {
-            return Ok(());
+        if let Some(conn) = cached {
+            // A cached connection can be half-dead (phone switched network, VPN): the write
+            // succeeds locally but never arrives. No ack in time → drop it and dial afresh.
+            if let Ok(Ok(())) = tokio::time::timeout(ACK_TIMEOUT, write(&conn, &bytes)).await {
+                return Ok(());
+            }
+            conn.close(0u32.into(), b"stale");
         }
         let conn = self.ep.connect(to, ALPN).await?;
         self.track(conn.clone());
@@ -180,6 +185,8 @@ async fn write(conn: &Connection, bytes: &[u8]) -> Result<()> {
     let mut s = conn.open_uni().await?;
     s.write_all(bytes).await?;
     s.finish()?;
+    // Delivered only once the peer acknowledged all of it.
+    s.stopped().await?;
     Ok(())
 }
 

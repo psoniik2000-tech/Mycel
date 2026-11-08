@@ -1090,7 +1090,8 @@ impl Node {
         Ok(())
     }
 
-    /// Fire-and-forget send to each peer; sync on the next connection covers failures.
+    /// Send to each peer in the background, retrying a few times: sync runs only at start,
+    /// so a message dropped by a flaky link (VPN, relay, network switch) would stay lost.
     fn broadcast(&self, peers: Vec<Vec<u8>>, msg: SyncMsg) {
         for p in peers {
             let Some(addr) = peer_addr(&p) else {
@@ -1101,9 +1102,14 @@ impl Node {
             }
             let (net, msg) = (self.net.clone(), msg.clone());
             tokio::spawn(async move {
-                let id = addr.id;
-                if let Err(e) = net.send(addr, &msg).await {
-                    eprintln!("mycel: send to {} failed: {e}", id.fmt_short());
+                for wait in [1, 3, 9, 0] {
+                    match net.send(addr.clone(), &msg).await {
+                        Ok(()) => break,
+                        Err(e) if wait == 0 => {
+                            eprintln!("mycel: send to {} failed: {e}", addr.id.fmt_short())
+                        }
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_secs(wait)).await,
+                    }
                 }
             });
         }

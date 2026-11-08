@@ -87,3 +87,51 @@ async fn offer_accept_frames_end() {
     }
     assert_eq!(a.call_members(id).unwrap(), vec![a.device_id()]);
 }
+
+/// Repeated calls both ways: every Offer arrives, media flows, End reaches the other side.
+#[tokio::test(flavor = "multi_thread")]
+async fn five_calls_in_a_row_both_ways() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (a, mut rx_a) = Node::open(dirs[0].path(), "pa", &Opts::default())
+        .await
+        .unwrap();
+    let (b, mut rx_b) = Node::open(dirs[1].path(), "pb", &Opts::default())
+        .await
+        .unwrap();
+    a.create_space().unwrap();
+    b.join(&a.invite().await.unwrap()).await.unwrap();
+    let (mut fa, mut fb) = (a.call_frames(), b.call_frames());
+
+    for i in 0..10 {
+        // Alternate the caller; the callee hangs up every other time.
+        let ((caller, rx_caller, f_caller), (callee, rx_callee, f_callee)) = if i % 2 == 0 {
+            ((&a, &mut rx_a, &mut fa), (&b, &mut rx_b, &mut fb))
+        } else {
+            ((&b, &mut rx_b, &mut fb), (&a, &mut rx_a, &mut fa))
+        };
+        let (id, _) = caller.call_offer(&None, i % 3 == 0).unwrap();
+        assert_eq!(
+            recv_call(rx_callee).await,
+            (id, CallAction::Offer { video: i % 3 == 0 }),
+            "call {i}: offer lost"
+        );
+        callee.call_accept(id).unwrap();
+        assert_eq!(recv_call(rx_caller).await, (id, CallAction::Accept));
+        exchange(caller, f_callee, AUDIO, b"hi").await;
+        exchange(callee, f_caller, AUDIO, b"hi").await;
+        let ((ender, ender_rx), (other, other_rx)) = if i % 4 < 2 {
+            ((caller, rx_caller), (callee, rx_callee))
+        } else {
+            ((callee, rx_callee), (caller, rx_caller))
+        };
+        ender.call_end().unwrap();
+        assert_eq!(recv_call(other_rx).await, (id, CallAction::End));
+        // The UI hangs up when the last peer left.
+        other.call_end().unwrap();
+        assert_eq!(recv_call(ender_rx).await, (id, CallAction::End));
+        assert!(a.call_id().is_none() && b.call_id().is_none());
+        // Drop stale frames of this call.
+        while fa.try_recv().is_ok() {}
+        while fb.try_recv().is_ok() {}
+    }
+}
