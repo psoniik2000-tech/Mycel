@@ -14,6 +14,15 @@
 6. Открыть адрес Worker'а (вида `https://mycel-box.ИМЯ.workers.dev`) в браузере. Должно появиться «Mycel mailbox works».
 7. В Mycel на каждом устройстве: «Настройки» → «Связь» → «Почтовый ящик» → вставить адрес → «Сохранить». Или один раз вписать его в `DEFAULT_MAILBOX` в `apps/mycel-app/src/App.tsx` и пересобрать: тогда он будет у всех по умолчанию.
 
+## Пуши на телефоны (Firebase, по желанию)
+
+Ящик будит телефоны через Firebase Cloud Messaging, даже когда Mycel закрыт. В пуше нет содержимого, только сигнал «есть новое».
+
+1. На console.firebase.google.com → Project settings → Service accounts → «Generate new private key». Скачается `.json`, это секрет.
+2. В Cloudflare: Worker `mycel-box` → «Settings» → «Variables and Secrets» → «Add» → Type: **Secret**, Name: `FCM_KEY`, Value: всё содержимое этого `.json` (открыть в Блокноте, Ctrl+A, Ctrl+C) → «Deploy».
+
+Проект Firebase зашит в `Push.kt` (Android). Для своего проекта поменяйте там значения из `google-services.json`.
+
 ## Как это работает
 
 - Каждое новое сообщение (и квитанция о доставке) дополнительно отправляется в ящик: `POST /box/<тема>/<id>`.

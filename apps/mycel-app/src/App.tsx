@@ -802,7 +802,10 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       setMsgs((all) => all.map((m) => (st.has(m.id) && st.get(m.id) !== m.status ? { ...m, status: st.get(m.id)! } : m)));
     });
     await reload();
-    const onVis = () => invoke("set_visible", { v: !document.hidden });
+    const onVis = () => {
+      invoke("set_visible", { v: !document.hidden });
+      if (!document.hidden) invoke("sync_now").catch(() => {});
+    };
     document.addEventListener("visibilitychange", onVis);
     // Android back closes the chat: opening it pushes a history entry.
     const onBack = () => setChatOpen(false);

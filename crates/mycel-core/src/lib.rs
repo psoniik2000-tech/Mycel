@@ -263,6 +263,11 @@ pub struct Node {
     call: Mutex<Option<call::Call>>,
     frames: Mutex<Option<mpsc::Sender<call::Frame>>>,
     mailbox: Option<Mailbox>,
+    /// Feeds envelopes pulled from the mailbox to the inbox loop.
+    box_tx: mpsc::Sender<Vec<Envelope>>,
+    /// This phone's FCM token: the mailbox wakes it when something new is posted.
+    push_token: Mutex<Option<String>>,
+    push_registered: std::sync::atomic::AtomicBool,
 }
 
 /// Store-and-forward when no member is online: every new envelope is also posted to an HTTP
@@ -340,6 +345,7 @@ impl Node {
             add_protected: None,
         });
         let blobs = FsStore::load_with_opts(dir.join("blobs").join("blobs.db"), bopts).await?;
+        let (box_tx, mut box_rx) = mpsc::channel::<Vec<Envelope>>(16);
         let node = Arc::new(Self {
             st: Mutex::new(st),
             net,
@@ -357,9 +363,11 @@ impl Node {
             call: Mutex::new(None),
             frames: Mutex::new(None),
             mailbox,
+            box_tx,
+            push_token: Mutex::new(None),
+            push_registered: Default::default(),
         });
         let (tx, rx) = mpsc::channel(256);
-        let (box_tx, mut box_rx) = mpsc::channel::<Vec<Envelope>>(16);
         let n = node.clone();
         tokio::spawn(async move {
             loop {
@@ -417,7 +425,7 @@ impl Node {
                     n.net.online().await;
                     let _ = n.sync();
                 }
-                n.poll_box(&box_tx).await;
+                n.poll_box().await;
             }
             loop {
                 tokio::time::sleep(RESYNC).await;
@@ -428,7 +436,7 @@ impl Node {
                 if let Err(e) = n.sync() {
                     eprintln!("mycel: resync failed: {e}");
                 }
-                n.poll_box(&box_tx).await;
+                n.poll_box().await;
             }
         });
         Ok((node, rx))
@@ -675,7 +683,7 @@ impl Node {
             st.store_env(&env)?;
             (env, st.store.peers()?)
         };
-        self.post_box(&env);
+        self.post_box(&env, false);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(())
     }
@@ -1079,6 +1087,15 @@ impl Node {
     /// Signs, encrypts (MLS), stores and sends an event to every known peer; 1:1 chats too,
     /// so any member (an anchor) can keep and forward the ciphertext while the partner is away.
     fn send_event(&self, chat: &Chat, body: EventBody) -> Result<Event> {
+        // Messages and incoming calls wake the other phones; receipts and edits wait for the next pull.
+        let push = is_msg(&body)
+            || matches!(
+                body,
+                EventBody::Call {
+                    action: mycel_proto::CallAction::Offer { .. },
+                    ..
+                }
+            );
         let (ev, env, peers) = {
             let mut st = self.st.lock().unwrap();
             let gid = st.gid(chat)?;
@@ -1104,7 +1121,7 @@ impl Node {
             st.store_env(&env)?;
             (ev, env, st.store.peers()?)
         };
-        self.post_box(&env);
+        self.post_box(&env, push);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(ev)
     }
@@ -1226,8 +1243,22 @@ impl Node {
         Ok(self.st.lock().unwrap().take(envs, me))
     }
 
+    /// Sets this phone's FCM token; it is registered with the mailbox on the next pull.
+    pub fn set_push_token(&self, token: String) {
+        *self.push_token.lock().unwrap() = Some(token);
+        self.push_registered
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Syncs with peers and pulls the mailbox now (the app came to the foreground or got a push).
+    pub async fn sync_now(&self) {
+        let _ = self.sync();
+        self.poll_box().await;
+    }
+
     /// Puts a new envelope into the mailbox in the background; peers online get it directly anyway.
-    fn post_box(&self, env: &Envelope) {
+    /// `push`: the mailbox wakes the other phones of the space.
+    fn post_box(&self, env: &Envelope, push: bool) {
         let Some(b) = &self.mailbox else { return };
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
@@ -1239,10 +1270,13 @@ impl Node {
             data_encoding::HEXLOWER.encode(&envelope_id(env))
         );
         let http = b.http.clone();
+        let from = self.push_token.lock().unwrap().clone().unwrap_or_default();
         tokio::spawn(async move {
             for wait in [2, 10, 60, 0] {
                 match http
                     .post(&url)
+                    .header("x-push", if push { "1" } else { "0" })
+                    .header("x-from", &from)
                     .body(body.clone())
                     .send()
                     .await
@@ -1257,8 +1291,8 @@ impl Node {
     }
 
     /// Pulls the envelopes posted to the mailbox since the last pull into the inbox loop.
-    async fn poll_box(&self, tx: &mpsc::Sender<Vec<Envelope>>) {
-        if let Err(e) = self.try_poll_box(tx).await {
+    async fn poll_box(&self) {
+        if let Err(e) = self.try_poll_box(&self.box_tx).await {
             eprintln!("mycel: mailbox poll failed: {e}");
         }
     }
@@ -1279,6 +1313,21 @@ impl Node {
                 .map_or(0, u64::from_le_bytes);
             (Mailbox::topic(&st.group()?[..16]), seq)
         };
+        let token = self.push_token.lock().unwrap().clone();
+        if let Some(t) = token
+            && !self
+                .push_registered
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            b.http
+                .post(format!("{}/push/{topic}", b.url))
+                .body(t)
+                .send()
+                .await?
+                .error_for_status()?;
+            self.push_registered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         loop {
             let url = format!("{}/box/{topic}?after={seq}", b.url);
             let text = b
@@ -1428,7 +1477,7 @@ impl Node {
         if let Some(r) = &req.addr.relay {
             self.learn_relays(&st, std::slice::from_ref(r))?;
         }
-        self.post_box(&env);
+        self.post_box(&env, false);
         self.broadcast(peers.clone(), SyncMsg::Envs(vec![env]));
         self.broadcast(peers, SyncMsg::Peers(vec![req.addr]));
         Ok(postcard::to_allocvec(&JoinResp {

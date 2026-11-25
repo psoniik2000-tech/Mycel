@@ -20,5 +20,11 @@ class MainActivity : TauriActivity() {
       WindowInsetsCompat.CONSUMED
     }
     ContextCompat.startForegroundService(this, Intent(this, NodeService::class.java))
+    Push.fetchToken(this)
+  }
+
+  override fun onResume() {
+    super.onResume()
+    Push.clear(this)
   }
 }

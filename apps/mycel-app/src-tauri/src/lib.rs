@@ -608,6 +608,10 @@ async fn unlock(
         std::path::absolute(dir.join("media")).map_err(|e| e.to_string())?,
         true,
     );
+    // The FCM token MainActivity/PushService wrote (Android): the mailbox wakes this phone.
+    if let Ok(t) = std::fs::read_to_string(root.join("push_token")) {
+        node.set_push_token(t.trim().to_string());
+    }
     let in_space = node.admin().is_ok();
     *st.0.lock().unwrap() = Some(Open {
         node: node.clone(),
@@ -760,6 +764,13 @@ Host: api.ipify.org
     .ok()
     .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
     .ok_or_else(|| "не удалось узнать внешний IP".into())
+}
+
+/// Pull new messages now (the window came back to the foreground).
+#[tauri::command]
+async fn sync_now(st: State<'_, App>) -> R<()> {
+    st.node()?.sync_now().await;
+    Ok(())
 }
 
 /// The relay this device is reachable through right now (waits up to 5 s for one).
@@ -1351,6 +1362,7 @@ pub fn run() {
             anchor_check,
             upnp_ok,
             home_relay,
+            sync_now,
             allow_preview,
             create_space,
             join,
