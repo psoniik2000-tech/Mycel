@@ -70,6 +70,26 @@ fn notify(app: &AppHandle, title: String, body: String) {
     }
 }
 
+/// Set at startup: `Push.wake` (JNI) has no other way to reach the app.
+#[cfg(target_os = "android")]
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// A push came (Push.kt). A space open in this process pulls now: it shows the message itself and
+/// confirms delivery. 0 → no node here, Push.kt shows its content-free notice.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+extern "C" fn Java_org_mycel_app_Push_wake(
+    _env: *mut std::ffi::c_void,
+    _cls: *mut std::ffi::c_void,
+) -> u8 {
+    let Some(n) = APP.get().and_then(|a| a.state::<App>().node().ok()) else {
+        return 0;
+    };
+    tauri::async_runtime::spawn(async move { n.sync_now().await });
+    1
+}
+
 #[derive(Serialize, Clone)]
 struct Msg {
     id: String,
@@ -1427,6 +1447,8 @@ pub fn run() {
             unsafe {
                 std::env::set_var("TMPDIR", _app.path().app_cache_dir()?)
             };
+            #[cfg(target_os = "android")]
+            let _ = APP.set(_app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

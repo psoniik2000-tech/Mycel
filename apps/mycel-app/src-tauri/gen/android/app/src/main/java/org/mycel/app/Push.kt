@@ -27,7 +27,8 @@ class MycelApp : Application() {
 
 /**
  * FCM wake-ups (DESIGN §7.5): the mailbox sends a content-free push when something new is posted;
- * the phone shows "new message" and the app pulls and decrypts it when opened.
+ * a node alive in this process pulls at once and notifies with the text; otherwise the phone shows
+ * "new message" and the app pulls and decrypts it when opened.
  * The token goes to a file the Rust side reads at unlock and registers with the mailbox.
  */
 object Push {
@@ -53,6 +54,12 @@ object Push {
 
   private const val NOTE_ID = 2
 
+  /** lib.rs: an open space pulls now and notifies with the text; false = no node in this process. */
+  @JvmStatic external fun wake(): Boolean
+
+  // A process the push started has no Rust library loaded (and no node): UnsatisfiedLinkError → false.
+  fun wakeNode() = runCatching { wake() }.getOrDefault(false)
+
   fun notifyNew(c: Context) {
     val nm = c.getSystemService(NotificationManager::class.java)
     if (Build.VERSION.SDK_INT >= 26) {
@@ -76,6 +83,6 @@ class PushService : FirebaseMessagingService() {
   override fun onMessageReceived(m: RemoteMessage) {
     // App on screen: it pulls by itself and shows the message.
     if (ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
-    Push.notifyNew(this)
+    if (!Push.wakeNode()) Push.notifyNew(this)
   }
 }

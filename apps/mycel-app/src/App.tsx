@@ -257,10 +257,10 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
         <img src={logo} class="logo" alt="" />
         <h1>{p.space?.name ?? (p.count ? "Новое пространство" : "Mycel")}</h1>
         <p class="muted">
-          {exists() ? "Введите пароль, чтобы открыть переписку" : "Придумайте пароль: им шифруются все данные на этом устройстве"}
+          {exists() ? "Введите пароль, чтобы открыть переписку" : "Придумайте пароль: им шифруются все данные на этом устройстве. Создать своё пространство или вступить в чужое по ссылке — на следующем шаге"}
         </p>
         <Show when={!exists()}>
-          <input placeholder="Название пространства" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+          <input placeholder="Название (видно только вам)" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
         </Show>
         <input type="password" placeholder="Пароль" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} autofocus />
         <Show when={!exists()}>
