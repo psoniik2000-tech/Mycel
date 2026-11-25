@@ -71,6 +71,15 @@ async fn main() -> Result<()> {
             node.admin()
                 .context("join a space first: mycel-anchor join <link>")?;
             println!("anchor up, relay {url}, keeping {keep_days} days");
+            // The anchor reaches its own relay through the public URL, like everyone else.
+            if !node.relay_connected().await {
+                eprintln!(
+                    "WARNING: cannot reach own relay at {url}. Members outside this network will not get through.\n  \
+                     Check: the TCP port is forwarded on the router to this PC; the firewall allows it;\n  \
+                     the IP is really public (the router's WAN IP equals 2ip.ru; otherwise the provider's NAT, CGNAT);\n  \
+                     the router supports NAT loopback (opening {url} from this PC should answer)."
+                );
+            }
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
             loop {
                 // Retries blobs whose authors were offline when their events came.

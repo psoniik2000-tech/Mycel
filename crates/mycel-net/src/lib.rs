@@ -152,6 +152,10 @@ impl Net {
         self.ep.close().await
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.ep.is_closed()
+    }
+
     /// Number of peers with an open sync connection.
     pub fn connected(&self) -> usize {
         let conns = self.conns.lock().unwrap();

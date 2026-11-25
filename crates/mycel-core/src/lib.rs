@@ -35,6 +35,8 @@ pub const JOIN_BAD_LINK: &str = "not a mycel invite link";
 pub const JOIN_UNREACHABLE: &str = "inviter unreachable";
 pub const JOIN_USED: &str = "invite already used or unknown";
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+/// Periodic address exchange and catch-up with every known peer.
+const RESYNC: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Network options of a node.
 #[derive(Debug, Default, Clone)]
@@ -335,14 +337,27 @@ impl Node {
         if let Err(e) = node.refresh_profile(false) {
             eprintln!("mycel: profile refresh failed: {e}");
         }
-        if !relays.is_empty() {
-            // Again once a relay is up, so peers learn our relay address.
-            let n = node.clone();
-            tokio::spawn(async move {
+        // Again once a relay is up (so peers learn our relay address), then every minute:
+        // a sync that failed at start (peer offline, relay not up yet) must not wait for a restart.
+        // shortcut: full Have list each time; Negentropy or "since" ids when histories grow.
+        let weak = Arc::downgrade(&node);
+        let wait_relay = opts.n0 || !relays.is_empty();
+        tokio::spawn(async move {
+            if wait_relay && let Some(n) = weak.upgrade() {
                 n.net.online().await;
                 let _ = n.sync();
-            });
-        }
+            }
+            loop {
+                tokio::time::sleep(RESYNC).await;
+                let Some(n) = weak.upgrade() else { break };
+                if n.net.is_closed() {
+                    break;
+                }
+                if let Err(e) = n.sync() {
+                    eprintln!("mycel: resync failed: {e}");
+                }
+            }
+        });
         Ok((node, rx))
     }
 
@@ -357,6 +372,12 @@ impl Node {
         if self.n0 || !self.relays().is_empty() {
             self.net.online().await;
         }
+    }
+
+    /// Whether a relay is connected (waits up to 5 s): without one, peers in other networks cannot reach us.
+    pub async fn relay_connected(&self) -> bool {
+        self.net.online().await;
+        self.net.addr().relay_urls().next().is_some()
     }
 
     /// Relay URLs this node uses (own and learned).

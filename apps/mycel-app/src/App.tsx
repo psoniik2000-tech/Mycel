@@ -172,7 +172,8 @@ export default function App() {
             <Spaces spaces={s().spaces} onOpen={enter} onNew={() => enter()} onRemoved={refresh} />
           </Match>
           <Match when={stage() === "lock"}>
-            <Lock space={space()} count={s().spaces.length} onDone={opened} onBack={s().spaces.length ? () => setStage("spaces") : undefined} />
+            <Lock space={space()} count={s().spaces.length} onDone={opened} onBack={s().spaces.length ? () => setStage("spaces") : undefined}
+              onRemoved={async () => ((await refresh()).spaces.length ? setStage("spaces") : enter())} />
           </Match>
           <Match when={stage() === "onboard"}>
             <Onboard onDone={() => setStage("main")} />
@@ -186,7 +187,8 @@ export default function App() {
   );
 }
 
-function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => void; onBack?: () => void }) {
+function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => void; onBack?: () => void; onRemoved: () => void }) {
+  const [forgot, setForgot] = createSignal(false);
   const [name, setName] = createSignal(p.count ? `Пространство ${p.count + 1}` : "Моё пространство");
   const [pw, setPw] = createSignal("");
   const [pw2, setPw2] = createSignal("");
@@ -230,7 +232,13 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
         <Show when={err()}><p class="error">{err()}</p></Show>
         <button class="primary" disabled={busy()}>{busy() ? "Открываем…" : exists() ? "Открыть" : "Продолжить"}</button>
         <Show when={p.onBack}><button type="button" onClick={p.onBack}><ArrowLeft size={18} /> Все пространства</button></Show>
+        <Show when={exists()}>
+          <button type="button" class="link" onClick={() => setForgot(true)}>Забыли пароль?</button>
+        </Show>
       </form>
+      <Show when={forgot() && p.space}>
+        {(s) => <RemoveSpace space={s()} forgot onClose={() => setForgot(false)} onDone={p.onRemoved} />}
+      </Show>
     </div>
   );
 }
@@ -261,12 +269,18 @@ function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: () => v
   );
 }
 
-function RemoveSpace(p: { space: Space; onClose: () => void; onDone: () => void }) {
+function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; onDone: () => void }) {
   const [err, setErr] = createSignal("");
   return (
     <div class="modal" onClick={(e) => e.target === e.currentTarget && p.onClose()}>
       <div class="card dialog">
         <h3>Удалить «{p.space.name}» с этого устройства?</h3>
+        <Show when={p.forgot}>
+          <p class="muted small">
+            Пароль восстановить нельзя: им зашифрована вся переписка на этом устройстве. Можно удалить это пространство отсюда и
+            создать новое или вступить заново по приглашению.
+          </p>
+        </Show>
         <p class="muted small">
           Вся переписка и файлы этого пространства на этом устройстве будут стёрты. У других участников всё останется. Вернуться можно
           только по новому приглашению.
