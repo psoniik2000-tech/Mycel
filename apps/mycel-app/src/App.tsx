@@ -1,5 +1,6 @@
 import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -483,6 +484,8 @@ function RelaySettings(p: { space: Space }) {
 
 function MailboxSettings(p: { space: Space }) {
   const [url, setUrl] = createSignal(mailbox() ?? "");
+  const [ver, setVer] = createSignal("");
+  getVersion().then(setVer, () => {});
   const [msg, setMsg] = createSignal("");
   const save = async (e: Event) => {
     e.preventDefault();
@@ -513,6 +516,7 @@ function MailboxSettings(p: { space: Space }) {
         <p>Нужен бесплатный аккаунт Cloudflare. Пошаговая инструкция и код лежат в папке <code>mailbox</code> проекта (файл README). Коротко: создать базу D1, создать Worker, вставить код, привязать базу под именем <code>DB</code>, скопировать адрес вида <code>https://….workers.dev</code> сюда.</p>
         <p>Пустое поле выключает ящик: тогда сообщения доходят, только когда отправитель или якорь в сети.</p>
       </details>
+      <p class="muted small">Mycel {ver()}</p>
     </>
   );
 }
