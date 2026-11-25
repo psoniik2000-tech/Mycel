@@ -1,7 +1,6 @@
 //! mycel-anchor: CLI node. Password from MYCEL_PASSWORD or the first stdin line.
 
 use anyhow::{Context, Result, bail};
-use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use mycel_core::mycel_proto::{Event, EventBody};
 use mycel_core::{Node, Opts};
 use std::path::PathBuf;
@@ -38,7 +37,7 @@ async fn main() -> Result<()> {
         ["serve", url] => {
             opts.own_relay = Some(url.to_string());
             opts.keep_blobs = true;
-            Some(spawn_relay(url).await?)
+            Some(mycel_core::spawn_relay(url).await?)
         }
         _ => None,
     };
@@ -119,19 +118,6 @@ async fn main() -> Result<()> {
     }
     node.close().await;
     Ok(())
-}
-
-/// iroh-relay over plain HTTP on the URL's port, all interfaces.
-// shortcut: no TLS (relayed QUIC is end-to-end encrypted anyway, but not disguised as HTTPS);
-// serve HTTPS (ACME) once an anchor has a domain. Needs the TCP port forwarded and NAT loopback on the router.
-async fn spawn_relay(url: &str) -> Result<Server> {
-    let u: mycel_core::RelayUrl = url.parse().context("relay url like http://1.2.3.4:3340")?;
-    let port = u
-        .port_or_known_default()
-        .context("relay url without port")?;
-    let mut cfg = ServerConfig::default();
-    cfg.relay = Some(RelayConfig::new(([0, 0, 0, 0], port)));
-    Ok(Server::spawn(cfg).await?)
 }
 
 fn short(id: &[u8; 32]) -> String {

@@ -25,6 +25,16 @@ struct Open {
     id: String,
     /// Kept to turn "remember" on later and to check the old one on change.
     password: String,
+    /// This device is an anchor: its relay's public URL.
+    anchor: Option<String>,
+    n0: bool,
+    relays: Vec<String>,
+    mailbox: Option<String>,
+    /// The router opened the anchor's port (UPnP).
+    mapped: bool,
+    /// The anchor's relay, stopped when dropped.
+    #[cfg(not(target_os = "android"))]
+    _relay: Option<mycel_core::RelayServer>,
 }
 
 impl App {
@@ -500,7 +510,15 @@ async fn unlock(
     password: Option<String>,
     remember: bool,
     n0: bool,
+    anchor: Option<String>,
+    relays: Option<Vec<String>>,
+    mailbox: Option<String>,
 ) -> R<bool> {
+    let relays = relays.unwrap_or_default();
+    for r in &relays {
+        r.parse::<mycel_core::RelayUrl>()
+            .map_err(|_| format!("неверный адрес сервера: {r}"))?;
+    }
     let root = data_dir(&app)?;
     let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
     let id = match id {
@@ -514,24 +532,65 @@ async fn unlock(
             id
         }
     };
-    if st.is_open(&id) {
+    // Open already: reopened only to apply changed connection settings (anchor, n0).
+    let open =
+        st.0.lock()
+            .unwrap()
+            .as_ref()
+            .filter(|o| o.id == id)
+            .map(|o| {
+                (
+                    o.password.clone(),
+                    o.anchor == anchor && o.n0 == n0 && o.relays == relays && o.mailbox == mailbox,
+                    o.anchor.clone(),
+                )
+            });
+    if let Some((_, true, _)) = open {
         return Ok(st.node()?.admin().is_ok());
     }
-    let pw = match &password {
-        Some(p) => p.clone(),
-        None => vault::load(&root, &id).ok_or("no saved password")?,
+    let was_anchor = open.as_ref().and_then(|o| o.2.clone());
+    let pw = match (&password, open) {
+        (Some(p), _) => p.clone(),
+        (None, Some((p, ..))) => p,
+        (None, None) => vault::load(&root, &id).ok_or("no saved password")?,
     };
     // Listed before the node creates its folder, so List::load never takes it for an orphan.
     list.last = Some(id.clone());
     list.save(&root).map_err(|e| e.to_string())?;
     st.close().await;
+    #[cfg(not(target_os = "android"))]
+    let (relay, mapped) = match &anchor {
+        Some(u) => (
+            Some(mycel_core::spawn_relay(u).await.map_err(err)?),
+            upnp(port_of(u), true).await.is_ok(),
+        ),
+        None => {
+            if let Some(u) = was_anchor {
+                let _ = upnp(port_of(&u), false).await;
+            }
+            (None, false)
+        }
+    };
+    #[cfg(target_os = "android")]
+    let mapped = {
+        let _ = was_anchor;
+        if anchor.is_some() {
+            return Err("якорь работает только на ПК".into());
+        }
+        false
+    };
     // Anchors' relays come via invite/peer exchange; n0 (Settings, on by default) is the public fallback.
+    // An anchor also keeps every blob for members who were offline when it was sent.
     let dir = spaces::dir(&root, &id);
     let (node, mut rx) = Node::open(
         &dir,
         &pw,
         &Opts {
             n0,
+            own_relay: anchor.clone(),
+            keep_blobs: anchor.is_some(),
+            extra_relays: relays.clone(),
+            mailbox: mailbox.clone(),
             ..Default::default()
         },
     )
@@ -554,6 +613,13 @@ async fn unlock(
         node: node.clone(),
         id,
         password: pw,
+        anchor,
+        n0,
+        relays,
+        mailbox,
+        mapped,
+        #[cfg(not(target_os = "android"))]
+        _relay: relay,
     });
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -609,6 +675,123 @@ async fn unlock(
         }
     });
     Ok(in_space)
+}
+
+fn port_of(url: &str) -> u16 {
+    url.parse::<mycel_core::RelayUrl>()
+        .ok()
+        .and_then(|u| u.port())
+        .unwrap_or(3340)
+}
+
+/// UPnP on the router: opens (or closes) the anchor's TCP `port` to this PC.
+// shortcut: a 7-day lease where a permanent one is refused, renewed on each app start.
+#[cfg(not(target_os = "android"))]
+async fn upnp(port: u16, open: bool) -> anyhow::Result<()> {
+    use igd_next::PortMappingProtocol::TCP;
+    let gw = gateway().await?;
+    if open {
+        // The address this PC uses towards the router.
+        let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        s.connect(gw.addr)?;
+        let local = std::net::SocketAddr::new(s.local_addr()?.ip(), port);
+        if gw.add_port(TCP, port, local, 0, "Mycel").await.is_err() {
+            gw.add_port(TCP, port, local, 7 * 86400, "Mycel").await?;
+        }
+    } else {
+        gw.remove_port(TCP, port).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+async fn gateway() -> anyhow::Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>> {
+    let mut o = igd_next::SearchOptions::default();
+    o.timeout = Some(std::time::Duration::from_secs(3));
+    Ok(igd_next::aio::tokio::search_gateway(o).await?)
+}
+
+/// Lets the "send" window show picked photos through the asset protocol.
+#[tauri::command]
+fn allow_preview(app: AppHandle, paths: Vec<String>) {
+    for p in paths {
+        let _ = app.asset_protocol_scope().allow_file(p);
+    }
+}
+
+/// External IPv4 of this network, for the anchor's relay URL: from the router (UPnP), else from ipify.
+#[tauri::command]
+async fn public_ip() -> R<String> {
+    use std::io::{Read, Write};
+    #[cfg(not(target_os = "android"))]
+    if let Ok(gw) = gateway().await
+        && let Ok(std::net::IpAddr::V4(ip)) = gw.get_external_ip().await
+        && public_v4(ip)
+    {
+        return Ok(ip.to_string());
+    }
+    tauri::async_runtime::spawn_blocking(|| -> std::io::Result<String> {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&("api.ipify.org", 80))?
+            .find(|a| a.is_ipv4())
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        let t = std::time::Duration::from_secs(10);
+        let mut s = std::net::TcpStream::connect_timeout(&addr, t)?;
+        s.set_read_timeout(Some(t))?;
+        s.write_all(
+            b"GET / HTTP/1.0
+Host: api.ipify.org
+
+",
+        )?;
+        let mut r = String::new();
+        s.read_to_string(&mut r)?;
+        Ok(r.rsplit(
+            "
+
+",
+        )
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok()
+    .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+    .ok_or_else(|| "не удалось узнать внешний IP".into())
+}
+
+/// The relay this device is reachable through right now (waits up to 5 s for one).
+#[tauri::command]
+async fn home_relay(st: State<'_, App>) -> R<Option<String>> {
+    let n = st.node()?;
+    n.relay_connected().await;
+    Ok(n.home_relay())
+}
+
+/// The router can open ports (UPnP) and has a public address: this PC can be an anchor on its own.
+#[tauri::command]
+async fn upnp_ok() -> bool {
+    #[cfg(not(target_os = "android"))]
+    if let Ok(gw) = gateway().await
+        && let Ok(std::net::IpAddr::V4(ip)) = gw.get_external_ip().await
+    {
+        return public_v4(ip);
+    }
+    false
+}
+
+/// Not private and not CGNAT (100.64/10): reachable from outside.
+fn public_v4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_private() && !ip.is_loopback() && !(ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
+}
+
+/// [reaches its own relay through the public URL (waits up to 5 s), the router opened the port].
+#[tauri::command]
+async fn anchor_check(st: State<'_, App>) -> R<(bool, bool)> {
+    let mapped = st.0.lock().unwrap().as_ref().is_some_and(|o| o.mapped);
+    Ok((st.node()?.relay_connected().await, mapped))
 }
 
 #[tauri::command]
@@ -1072,16 +1255,103 @@ fn change_password(app: AppHandle, st: State<App>, old: String, new: String) -> 
     Ok(())
 }
 
+/// Brings the window back from the tray.
+#[cfg(desktop)]
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    app.state::<Visible>().0.store(true, Ordering::Relaxed);
+}
+
+/// Like other messengers: lives in the tray, closing the window only hides it.
+#[cfg(desktop)]
+fn tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let show = MenuItem::with_id(app, "show", "Открыть Mycel", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
+    let mut t = TrayIconBuilder::new();
+    if let Some(i) = app.default_window_icon() {
+        t = t.icon(i.clone());
+    }
+    t.tooltip("Mycel")
+        .menu(&Menu::with_items(app, &[&show, &quit])?)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, e| match e.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|t, e| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = e
+            {
+                show_main(t.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// Start with Windows: `on` None only reads.
+#[tauri::command]
+fn autostart(app: AppHandle, on: Option<bool>) -> R<bool> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        let m = app.autolaunch();
+        match on {
+            Some(true) => m.enable().map_err(|e| e.to_string())?,
+            Some(false) => m.disable().map_err(|e| e.to_string())?,
+            None => {}
+        }
+        m.is_enabled().map_err(|e| e.to_string())
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (app, on);
+        Ok(false)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let b = tauri::Builder::default();
+    // A second launch (shortcut, autostart) shows the running app instead of opening the database twice.
+    #[cfg(desktop)]
+    let b = b
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            show_main(app)
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
+        .on_window_event(|w, e| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = e {
+                api.prevent_close();
+                let _ = w.hide();
+                w.state::<Visible>().0.store(false, Ordering::Relaxed);
+            }
+        });
+    b.plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(App::default())
         .manage(Visible(AtomicBool::new(true)))
         .invoke_handler(tauri::generate_handler![
             status,
             unlock,
+            public_ip,
+            anchor_check,
+            upnp_ok,
+            home_relay,
+            allow_preview,
             create_space,
             join,
             invite,
@@ -1114,9 +1384,29 @@ pub fn run() {
             close_space,
             remove_space,
             set_remember,
-            change_password
+            change_password,
+            autostart
         ])
         .setup(|_app| {
+            #[cfg(desktop)]
+            {
+                tray(_app)?;
+                // Started with Windows: straight to the tray.
+                if std::env::args().any(|a| a == "--hidden")
+                    && let Some(w) = _app.get_webview_window("main")
+                {
+                    let _ = w.hide();
+                    _app.state::<Visible>().0.store(false, Ordering::Relaxed);
+                }
+                // On by default, once: like other messengers (Settings turns it off).
+                let mark = _app.path().app_data_dir()?.join("autostart-default");
+                if !mark.exists() {
+                    use tauri_plugin_autostart::ManagerExt;
+                    let _ = _app.autolaunch().enable();
+                    let _ = std::fs::create_dir_all(mark.parent().unwrap_or(&mark));
+                    let _ = std::fs::write(&mark, b"");
+                }
+            }
             #[cfg(mobile)]
             _app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
             // Android has no writable temp dir by default; core and send_* use temp_dir().

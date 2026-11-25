@@ -83,3 +83,28 @@ jobs:
         with:
           name: mycel-android-apk
           path: apps/mycel-app/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+
+  # Ready-to-run anchor for a VPS or a PC without a screen: Actions → this run → Artifacts.
+  anchor:
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: mycel-anchor-linux-x64
+            file: target/release/mycel-anchor
+          - os: windows-latest
+            name: mycel-anchor-windows-x64
+            file: target/release/mycel-anchor.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: anchor
+      - run: cargo build --release -p mycel-anchor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.file }}

@@ -9,20 +9,46 @@
 
 Статус: работает на ПК (текст, медиа, звонки); Android в разработке. Текущее состояние и задачи — [docs/STATUS.md](docs/STATUS.md), описание — [docs/DESIGN.md](docs/DESIGN.md).
 
-## Якорь (ПК, включённый 24/7)
+## Якорь (ПК или сервер, включённый 24/7)
 
-Якорь — обычный участник, который хранит сообщения для тех, кто офлайн (30 дней), и держит relay для тех, кто за NAT. Публичные relay n0 не используются (включить на крайний случай: `--n0-relay`).
+Якорь — обычный участник, который хранит сообщения для тех, кто офлайн (30 дней), и держит relay для тех, кто за NAT.
 
-1. Собрать: `cargo build --release -p mycel-anchor` → `target\release\mycel-anchor.exe`.
-2. На роутере пробросить TCP-порт (например 3340) на этот ПК. Узнать свой внешний IP (например, на 2ip.ru).
-3. Вступить в пространство по инвайту из приложения: `mycel-anchor.exe --dir C:\MycelAnchor join mycel://join/...` (спросит пароль; затем Ctrl+C).
-4. Проверить запуск: `mycel-anchor.exe --dir C:\MycelAnchor serve http://ВНЕШНИЙ-IP:3340`.
-5. Автозапуск в фоне (Планировщик заданий, при включении ПК, без входа в систему), в PowerShell от администратора:
+**Проще всего — в приложении:** на ПК «Настройки» → «Якорь» → «Сделать этот ПК якорем». Порт на роутере откроется сам (UPnP), отдельная программа не нужна. Работает, пока Mycel запущен (можно свернуть в трей).
+
+**Без экрана (VPS, сервер, ПК без входа в систему)** — программа `mycel-anchor`:
+
+1. Скачать: GitHub → Actions → последний успешный запуск CI на `main` → Artifacts → `mycel-anchor-linux-x64` или `mycel-anchor-windows-x64`. Или собрать: `cargo build --release -p mycel-anchor`.
+2. Открыть TCP-порт (например 3340): на VPS — в файрволе хостера; дома — проброс на роутере. Узнать внешний IP (например, на 2ip.ru).
+3. Вступить в пространство по инвайту из приложения (пока своего relay нет, через публичные n0):
+   `mycel-anchor --n0-relay --dir ./mycel-data join mycel://join/...` (спросит пароль якоря; после «joined» — Ctrl+C).
+4. Запустить: `mycel-anchor --dir ./mycel-data serve http://ВНЕШНИЙ-IP:3340`. Если пишет `WARNING: cannot reach own relay` — порт снаружи закрыт.
+5. Адрес `http://ВНЕШНИЙ-IP:3340` можно добавить участникам в «Настройки» → «Связь» → «Резервные серверы»; новые приглашения получат его сами.
+
+Автозапуск на Linux (systemd), от root:
+
+```sh
+install -m 755 mycel-anchor /usr/local/bin/
+mkdir -p /var/lib/mycel && cd /var/lib/mycel
+MYCEL_PASSWORD=ПАРОЛЬ mycel-anchor --n0-relay --dir . join 'mycel://join/...'
+cat > /etc/systemd/system/mycel-anchor.service <<EOF
+[Unit]
+After=network-online.target
+[Service]
+Environment=MYCEL_PASSWORD=ПАРОЛЬ
+ExecStart=/usr/local/bin/mycel-anchor --dir /var/lib/mycel serve http://ВНЕШНИЙ-IP:3340
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now mycel-anchor
+```
+
+Автозапуск на Windows (Планировщик заданий, при включении ПК, без входа в систему), в PowerShell от администратора:
 
 ```powershell
-$a = New-ScheduledTaskAction -Execute "cmd.exe" -Argument '/c set MYCEL_PASSWORD=ПАРОЛЬ&& C:\Mycel\target\release\mycel-anchor.exe --dir C:\MycelAnchor serve http://ВНЕШНИЙ-IP:3340'
+$a = New-ScheduledTaskAction -Execute "cmd.exe" -Argument '/c set MYCEL_PASSWORD=ПАРОЛЬ&& C:\MycelAnchor\mycel-anchor.exe --dir C:\MycelAnchor serve http://ВНЕШНИЙ-IP:3340'
 Register-ScheduledTask MycelAnchor -Action $a -Trigger (New-ScheduledTaskTrigger -AtStartup) -User SYSTEM -RunLevel Highest
 New-NetFirewallRule -DisplayName MycelAnchor -Direction Inbound -Protocol TCP -LocalPort 3340 -Action Allow
 ```
 
-Пароль хранится в задании открытым текстом — используйте отдельный пароль только для якоря. Остановить: `Stop-ScheduledTask MycelAnchor`, удалить: `Unregister-ScheduledTask MycelAnchor`.
+Пароль хранится открытым текстом (в задании или в unit-файле) — используйте отдельный пароль только для якоря. Остановить: `Stop-ScheduledTask MycelAnchor` / `systemctl stop mycel-anchor`.

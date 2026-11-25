@@ -1,7 +1,7 @@
 # Keeps build junk (cargo/gradle outputs) under a limit: deletes the least recently used dirs first.
 # Kept: target\release (installer), top-level files in target\ (APK). Skips while a build runs.
 # Run by the "MycelClean" scheduled task (scripts\install-clean-task.ps1); safe to run by hand.
-param([double]$LimitGB = 5, [string]$Root = (Split-Path $PSScriptRoot -Parent))
+param([double]$LimitGB = 15, [string]$Root = (Split-Path $PSScriptRoot -Parent))
 
 if (Get-Process cargo, rustc -ErrorAction SilentlyContinue) { exit }
 

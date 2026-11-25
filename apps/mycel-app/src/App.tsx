@@ -1,5 +1,5 @@
 import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -48,6 +48,45 @@ const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : typeof (e as any)?.message === "string" ? (e as any).message : JSON.stringify(e);
 const android = /Android/.test(navigator.userAgent);
 const n0 = () => localStorage.getItem("n0") !== "0";
+// This PC is an anchor: its relay URL (Settings → Якорь).
+const anchor = () => localStorage.getItem("anchor") || null;
+// Backup public relays (n0's test servers): used besides the main n0 ones; editable in Settings → Связь.
+const DEFAULT_RELAYS = ["https://euc1-1.staging-relay.n0.iroh.link", "https://use1-1.staging-relay.n0.iroh.link"];
+const relays = (): string[] => {
+  try {
+    const v = JSON.parse(localStorage.getItem("relays") ?? "null");
+    return Array.isArray(v) ? v : DEFAULT_RELAYS;
+  } catch {
+    return DEFAULT_RELAYS;
+  }
+};
+// Mailbox (Cloudflare Worker, mailbox/README.md) that keeps messages for members who are offline.
+// shortcut: one shared default baked into the build; per space if spaces need different ones.
+const DEFAULT_MAILBOX = "https://mycel-box.psoniik2000.workers.dev";
+const mailbox = () => (localStorage.getItem("mailbox") ?? DEFAULT_MAILBOX) || null;
+/** Applies changed connection settings to the open space at once (it reopens). */
+const reopen = (id: string) =>
+  invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() });
+const autoAnchor = () => !android && localStorage.getItem("anchor_auto") !== "0";
+/** Turns this PC's anchor on (relay at the external IP, port 3340) or off; reopens the space. Returns the URL. */
+async function setAnchor(id: string, on: boolean): Promise<string> {
+  // shortcut: fixed port 3340; a port field when someone needs another one.
+  const u = on ? `http://${await invoke<string>("public_ip")}:3340` : "";
+  await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(), anchor: u || null, relays: relays(), mailbox: mailbox() });
+  u ? localStorage.setItem("anchor", u) : localStorage.removeItem("anchor");
+  return u;
+}
+/** The router lets us open the port: become an anchor without asking (Settings → Якорь turns it off). */
+async function tryAutoAnchor(id: string) {
+  if (!autoAnchor() || anchor() || !(await invoke<boolean>("upnp_ok").catch(() => false))) return;
+  try {
+    await setAnchor(id, true);
+    const [, mapped] = await invoke<[boolean, boolean]>("anchor_check");
+    if (!mapped) await setAnchor(id, false);
+  } catch {
+    // stays a plain member
+  }
+}
 // The open space: per-space keys in localStorage (the first space keeps the old ones).
 let spaceId = "";
 const readKey = () => (spaceId === "main" ? "read" : `read:${spaceId}`);
@@ -137,13 +176,14 @@ export default function App() {
   const opened = async (inSpace: boolean) => {
     await refresh();
     setStage(inSpace ? "main" : "onboard");
+    if (inSpace) tryAutoAnchor(spaceId);
   };
   // A remembered space opens at once; otherwise (or if the saved password no longer fits) the password screen.
   const enter = async (sp?: Space) => {
     setSpace(sp);
     if (sp?.remembered) {
       try {
-        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0() }));
+        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
       } catch {
         // falls through to the password screen
       }
@@ -204,7 +244,7 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name(), password: pw(), remember: remember(), n0: n0() }));
+      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name(), password: pw(), remember: remember(), n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
     } catch (e) {
       setErr(exists() ? "Неверный пароль" : errText(e));
     }
@@ -298,6 +338,200 @@ function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; o
 }
 
 // Settings → Вход: password at start, password change.
+function AnchorSettings(p: { space: Space }) {
+  const [url, setUrl] = createSignal(anchor() ?? "");
+  const [state, setState] = createSignal<[boolean, boolean]>();
+  const [msg, setMsg] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [auto, setAuto] = createSignal(autoAnchor());
+  const check = async () => {
+    setState(undefined);
+    setState(await invoke<[boolean, boolean]>("anchor_check"));
+  };
+  const apply = async (on: boolean) => {
+    setBusy(true);
+    setMsg(on ? "Запускаю…" : "");
+    try {
+      setUrl(await setAnchor(p.space.id, on));
+      setMsg("");
+      if (on) await check();
+    } catch (e) {
+      setMsg(errText(e));
+    }
+    setBusy(false);
+  };
+  if (url()) check().catch(() => {});
+  return (
+    <>
+      <h3>Якорь</h3>
+      <p class="muted">Якорь — это ваш ПК в роли «почтового отделения» для пространства. Он:</p>
+      <ul class="muted">
+        <li>хранит сообщения и файлы для тех, кто сейчас не в сети, и отдаёт их, когда человек появится — даже если отправитель уже вышел;</li>
+        <li>помогает соединиться устройствам из разных сетей (телефон в мобильном интернете ↔ ПК дома) без чужих серверов.</li>
+      </ul>
+      <p class="muted">Переписка остаётся зашифрованной: якорь не может её прочитать. Работает, пока ПК включён и Mycel запущен (можно свернуть в трей).</p>
+      <label class="check">
+        <input type="checkbox" checked={auto()} onChange={(e) => {
+          localStorage.setItem("anchor_auto", e.currentTarget.checked ? "1" : "0");
+          setAuto(e.currentTarget.checked);
+        }} />
+        Включать автоматически, если роутер позволяет
+      </label>
+      <p class="muted small">Mycel сам откроет порт на роутере (UPnP), если роутер это разрешает и у вас «белый» IP.</p>
+      <Show when={url()}>
+        <div class="anchor-status">
+          <div>Адрес: <code>{url()}</code></div>
+          <Show when={state()} fallback={<div class="muted">Проверяю доступность…</div>}>
+            {(st) => (
+              <>
+                <div>Порт на роутере: {st()[1] ? "открыт автоматически" : "не открыт автоматически"}</div>
+                <div>Доступ из интернета: {st()[0] ? "есть ✓" : "не подтверждён"}</div>
+                <Show when={!st()[0]}>
+                  <p class="muted small">
+                    {st()[1]
+                      ? "Порт открыт, но проверка изнутри сети не прошла. Часто это нормально: многие роутеры не умеют «заходить сами на себя». Проверьте с телефона через мобильный интернет. Если не работает — у провайдера, возможно, нет «белого» IP (CGNAT)."
+                      : "Роутер не дал открыть порт. Включите UPnP в настройках роутера (обычно адрес 192.168.0.1 или 192.168.1.1, раздел «UPnP» или «NAT») либо пробросьте TCP-порт 3340 на этот ПК вручную."}
+                  </p>
+                </Show>
+              </>
+            )}
+          </Show>
+        </div>
+      </Show>
+      <div class="actions">
+        <Show when={url()} fallback={<button disabled={busy()} onClick={() => apply(true)}>Сделать этот ПК якорем</button>}>
+          <button disabled={busy()} onClick={() => apply(false)}>Выключить якорь</button>
+          <button disabled={busy() || !state()} onClick={() => check().catch(() => {})}>Проверить ещё раз</button>
+        </Show>
+      </div>
+      <Show when={msg()}>
+        <p class="muted">{msg()}</p>
+      </Show>
+    </>
+  );
+}
+
+function RelaySettings(p: { space: Space }) {
+  const [list, setList] = createSignal(relays());
+  const [url, setUrl] = createSignal("");
+  const [msg, setMsg] = createSignal("");
+  const [now, setNow] = createSignal<string | null>();
+  const refreshNow = () => invoke<string | null>("home_relay").then(setNow, () => setNow(null));
+  refreshNow();
+  const save = async (next: string[]) => {
+    const prev = list();
+    localStorage.setItem("relays", JSON.stringify(next));
+    setList(next);
+    try {
+      await reopen(p.space.id);
+      setMsg("");
+      setNow(undefined);
+      refreshNow();
+    } catch (e) {
+      localStorage.setItem("relays", JSON.stringify(prev));
+      setList(prev);
+      setMsg(errText(e));
+    }
+  };
+  const add = (e: Event) => {
+    e.preventDefault();
+    let u = url().trim().replace(/\/+$/, "");
+    if (!u) return;
+    if (!/^https?:\/\//.test(u)) u = `https://${u}`;
+    if (list().includes(u)) return setMsg("Такой сервер уже есть");
+    setUrl("");
+    save([...list(), u]);
+  };
+  return (
+    <>
+      <h3>Резервные серверы</h3>
+      <p class="muted">Запасные серверы связи (iroh-relay) на случай, если основные недоступны: например, их блокирует провайдер. Mycel сам выбирает самый быстрый из доступных. Серверы видят только зашифрованный трафик, прочитать переписку не могут. Адреса из списка попадают в приглашения, так что новые участники тоже смогут ими пользоваться.</p>
+      <div class="anchor-status">
+        <div>Сейчас связь идёт через: <Show when={now() !== undefined} fallback={<span class="muted">проверяю…</span>}>
+          <code>{now() ?? "только напрямую (сервер недоступен)"}</code>
+        </Show></div>
+      </div>
+      <For each={list()} fallback={<p class="muted small">Список пуст.</p>}>
+        {(r) => (
+          <div class="relay-row">
+            <code class="grow ellipsis">{r}</code>
+            <button class="icon" title="Удалить" onClick={() => save(list().filter((x) => x !== r))}><Trash2 size={16} /></button>
+          </div>
+        )}
+      </For>
+      <form class="relay-row" onSubmit={add}>
+        <input class="grow" placeholder="https://relay.example.com или http://1.2.3.4:3340" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} />
+        <button type="submit">Добавить</button>
+      </form>
+      <Show when={msg()}><p class="error">{msg()}</p></Show>
+      <details class="muted">
+        <summary>Где взять адрес сервера</summary>
+        <ul>
+          <li><b>Якорь друга.</b> Если у кого-то из участников включён якорь, его адрес виден у него в «Настройки» → «Якорь» (вида <code>http://1.2.3.4:3340</code>). Попросите прислать и добавьте сюда.</li>
+          <li><b>Ещё один свой ПК.</b> Установите на нём Mycel, войдите в пространство и нажмите «Настройки» → «Якорь» → «Сделать этот ПК якорем». Отдельная программа не нужна, адрес появится там же.</li>
+          <li><b>VPS или сервер без экрана.</b> Нужна программа <code>mycel-anchor</code> (Linux или Windows): где её взять и как запустить — в разделе «Якорь» файла README проекта.</li>
+          <li><b>Публичные iroh-relay.</b> Подойдёт любой сервер iroh-relay, например <code>https://euc1-1.staging-relay.n0.iroh.link</code>.</li>
+        </ul>
+        <p>Удалить сервер можно корзиной справа. Изменения применяются сразу, без перезапуска.</p>
+      </details>
+      <div class="actions">
+        <button onClick={() => save(DEFAULT_RELAYS)}>Вернуть список по умолчанию</button>
+      </div>
+    </>
+  );
+}
+
+function MailboxSettings(p: { space: Space }) {
+  const [url, setUrl] = createSignal(mailbox() ?? "");
+  const [msg, setMsg] = createSignal("");
+  const save = async (e: Event) => {
+    e.preventDefault();
+    let u = url().trim().replace(/\/+$/, "");
+    if (u && !/^https?:\/\//.test(u)) u = `https://${u}`;
+    const prev = localStorage.getItem("mailbox");
+    localStorage.setItem("mailbox", u);
+    setUrl(u);
+    try {
+      await reopen(p.space.id);
+      setMsg(u ? "Сохранено. Сообщения для тех, кто не в сети, теперь ждут их в ящике." : "Ящик выключен.");
+    } catch (err) {
+      prev === null ? localStorage.removeItem("mailbox") : localStorage.setItem("mailbox", prev);
+      setMsg(errText(err));
+    }
+  };
+  return (
+    <>
+      <h3>Почтовый ящик</h3>
+      <p class="muted">Хранит сообщения для тех, кто сейчас не в сети, до 30 дней. Получатель заберёт их, когда откроет Mycel, даже если вас самих уже нет онлайн. Ящик видит только зашифрованные данные. Адрес должен быть одинаковым у всех участников.</p>
+      <form class="relay-row" onSubmit={save}>
+        <input class="grow" placeholder="https://mycel-box.имя.workers.dev" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} />
+        <button type="submit">Сохранить</button>
+      </form>
+      <Show when={msg()}><p class="muted small">{msg()}</p></Show>
+      <details class="muted">
+        <summary>Как завести свой ящик (бесплатно, 5 минут)</summary>
+        <p>Нужен бесплатный аккаунт Cloudflare. Пошаговая инструкция и код лежат в папке <code>mailbox</code> проекта (файл README). Коротко: создать базу D1, создать Worker, вставить код, привязать базу под именем <code>DB</code>, скопировать адрес вида <code>https://….workers.dev</code> сюда.</p>
+        <p>Пустое поле выключает ящик: тогда сообщения доходят, только когда отправитель или якорь в сети.</p>
+      </details>
+    </>
+  );
+}
+
+function AppSettings() {
+  const [on, setOn] = createSignal(false);
+  invoke<boolean>("autostart", { on: null }).then(setOn, () => {});
+  return (
+    <>
+      <h3>Приложение</h3>
+      <label class="check">
+        <input type="checkbox" checked={on()} onChange={(e) => invoke<boolean>("autostart", { on: e.currentTarget.checked }).then(setOn, (err) => alert(errText(err)))} />
+        Запускать вместе с Windows
+      </label>
+      <p class="muted">Закрытие окна сворачивает Mycel в трей (значок у часов): сообщения и звонки продолжают приходить, уведомления показываются. Выйти полностью: правой кнопкой по значку → «Выйти». Когда Mycel полностью закрыт, новые сообщения придут при следующем запуске — от отправителя или от якоря.</p>
+    </>
+  );
+}
+
 function LoginSettings(p: { space: Space; refresh: () => void }) {
   const [old, setOld] = createSignal("");
   const [pw, setPw] = createSignal("");
@@ -664,10 +898,19 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
               <VoiceSettings />
               <h3>Связь</h3>
               <label class="check">
-                <input type="checkbox" checked={localStorage.getItem("n0") !== "0"} onChange={(e) => localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0")} />
-                Резервный публичный сервер связи (n0)
+                <input type="checkbox" checked={n0()} onChange={(e) => {
+                  localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0");
+                  reopen(p.space.id).catch((e) => alert(errText(e)));
+                }} />
+                Публичные серверы связи n0 (Европа, США, Азия)
               </label>
-              <p class="muted">Помогает соединиться, когда нет своего якоря. Можно выключить, если якорь настроен. Применяется после перезапуска.</p>
+              <p class="muted">Помогают устройствам из разных сетей найти друг друга. Сами сообщения после этого идут напрямую, а через сервер — только если напрямую не получилось. Можно выключить, если настроен свой якорь.</p>
+              <RelaySettings space={p.space} />
+              <MailboxSettings space={p.space} />
+              <Show when={!android}>
+                <AnchorSettings space={p.space} />
+                <AppSettings />
+              </Show>
               <LoginSettings space={p.space} refresh={p.refresh} />
               <h3>Пространство «{p.space.name}»</h3>
               <p class="muted">Зашифрованная база хранится здесь:</p>
@@ -784,6 +1027,8 @@ const same = (a?: Msg, b?: Msg) =>
   && dayKey(a.ts) === dayKey(b.ts) && Math.abs(b.ts - a.ts) < 600_000;
 const plain = (m: Msg) => m.text || (m.media ? label(m.media) : "");
 type Dialog = { kind: "delete" | "forward"; ids: string[] };
+const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+const isPhoto = (path: string) => /\.(jpe?g|png|webp)$/i.test(path);
 
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
@@ -878,7 +1123,9 @@ function Chat(p: {
   };
   const [err, setErr] = createSignal("");
   const [view, setView] = createSignal("");
-  const [original, setOriginal] = createSignal(false);
+  // Files waiting in the "send" window (like Telegram's): photos compressed unless unticked.
+  const [toSend, setToSend] = createSignal<string[]>([]);
+  const [compress, setCompress] = createSignal(localStorage.getItem("compress") !== "0");
   const [drag, setDrag] = createSignal(false);
   const [video, setVideo] = createSignal(false);
   const [rec, setRec] = createSignal<Recording>();
@@ -896,8 +1143,15 @@ function Chat(p: {
   };
 
   const sendFiles = async (paths: string[]) => {
+    if (!paths.length) return;
+    await invoke("allow_preview", { paths }).catch(() => {});
+    setToSend(paths);
+  };
+  const confirmSend = async () => {
+    const paths = toSend(), original = !compress();
+    setToSend([]);
     for (const path of paths)
-      await queue({ text: `📎 ${path.split(/[\\/]/).pop()}` }, () => invoke<string>("send_file", { chat: p.chat, path, original: original() }));
+      await queue({ text: `📎 ${baseName(path)}` }, () => invoke<string>("send_file", { chat: p.chat, path, original }));
   };
   const attach = async () => {
     if (android) return picker.click();
@@ -921,6 +1175,7 @@ function Chat(p: {
     });
     const esc = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (toSend().length) return setToSend([]);
       if (view() || menu() || dlg()) return (setView(""), setMenu(undefined), setDlg(undefined));
       if (rec()) return stopRec(false);
       if (sel().length) return setSel([]);
@@ -1173,6 +1428,34 @@ function Chat(p: {
         )}
       </Show>
       <Show when={err() || p.callErr}><p class="error pad-x">{err() || p.callErr}</p></Show>
+      <Show when={toSend().length}>
+        <div class="modal" onClick={() => setToSend([])}>
+          <div class="card dialog" onClick={(e) => e.stopPropagation()}>
+            <h3>{toSend().length > 1 ? `Отправить файлы: ${toSend().length}` : "Отправить файл"}</h3>
+            <div class="send-previews">
+              <For each={toSend()}>
+                {(f) => isPhoto(f)
+                  ? <img src={convertFileSrc(f)} alt="" />
+                  : <div class="file-chip"><Paperclip size={16} /> <span class="ellipsis">{baseName(f)}</span></div>}
+              </For>
+            </div>
+            <Show when={toSend().some(isPhoto)}>
+              <label class="check">
+                <input type="checkbox" checked={compress()} onChange={(e) => {
+                  setCompress(e.currentTarget.checked);
+                  localStorage.setItem("compress", e.currentTarget.checked ? "1" : "0");
+                }} />
+                Сжать фото
+              </label>
+              <p class="muted small">{compress()
+                ? "Отправится быстрее и займёт меньше места. Место съёмки и данные камеры будут удалены."
+                : "Фото уйдёт файлом в исходном качестве, вместе с метаданными (место и время съёмки, камера)."}</p>
+            </Show>
+            <button class="primary" onClick={confirmSend}><Send size={16} /> Отправить</button>
+            <button onClick={() => setToSend([])}>Отмена</button>
+          </div>
+        </div>
+      </Show>
       <Show when={drag()}><div class="drop">Отпустите, чтобы отправить</div></Show>
       <Show when={view()}><div class="viewer" onClick={() => setView("")}><img src={view()} alt="" /></div></Show>
       <Show when={rec() && video()}><video ref={preview} class="circle live" autoplay muted playsinline /></Show>
@@ -1189,9 +1472,6 @@ function Chat(p: {
       <input ref={picker} type="file" multiple hidden onChange={pick} />
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
-        <label class="orig muted small" title="Фото уйдёт файлом как есть, с метаданными">
-          <input type="checkbox" checked={original()} onChange={(e) => setOriginal(e.currentTarget.checked)} /> оригинал
-        </label>
         <Show when={rec()}>
           <div class="recording grow" classList={{ cancel: cancelling() }}>
             <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")}
@@ -1199,7 +1479,7 @@ function Chat(p: {
             <X size={18} />
           </div>
         </Show>
-        <textarea ref={input} rows={1} placeholder="Сообщение" value={text()} style={{ display: rec() ? "none" : undefined }}
+        <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()} style={{ display: rec() ? "none" : undefined }}
           onInput={(e) => { setText(e.currentTarget.value); grow(); }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {

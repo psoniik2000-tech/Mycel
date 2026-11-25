@@ -12,4 +12,4 @@
 ## Код
 - Cargo workspace, крейты в `crates/`, приложение в `apps/mycel-app` (структура — §13).
 - Перед коммитом: `cargo fmt`, `cargo clippy`, `cargo test` для затронутых крейтов.
-- Мусор сборки держит под 5 ГБ задача Windows `MycelClean` (`scripts\clean.ps1`, каждые 15 мин; поставить заново: `scripts\install-clean-task.ps1`). Сессия в worktree после push в main удаляет свой worktree (`git worktree remove --force`).
+- Мусор сборки держит под 15 ГБ (debug-кэш с OpenSSL переживает очистку) задача Windows `MycelClean` (`scripts\clean.ps1`, каждые 15 мин; поставить заново: `scripts\install-clean-task.ps1`). Сессия в worktree после push в main удаляет свой worktree (`git worktree remove --force`).

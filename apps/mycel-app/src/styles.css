@@ -270,7 +270,6 @@ button.del { color: var(--danger); }
   .row { padding: 14px 16px; }
   .nav { min-height: 56px; }
   .composer { gap: 2px; padding: 8px; }
-  .composer .orig { display: none; }
   .msgs { padding: 12px; }
   .bubble { max-width: 85%; }
 }
@@ -307,7 +306,6 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / 88%); display: grid; place-items: center; z-index: 50; cursor: zoom-out; }
 .viewer img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
-.orig { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
 .recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
 .recording.cancel { color: var(--danger); }
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
@@ -378,3 +376,13 @@ label.check input { width: auto; }
 .person button.icon { padding: 8px; }
 .person .grow { min-width: 0; }
 .dialog-list { max-height: 50vh; overflow-y: auto; }
+
+.anchor-status { display: grid; gap: 4px; padding: 10px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.anchor-status code { word-break: break-all; }
+.send-previews { display: flex; flex-wrap: wrap; gap: 6px; max-height: 50vh; overflow: auto; }
+.send-previews img { max-width: 100%; max-height: 240px; border-radius: 8px; object-fit: cover; }
+.send-previews:has(img + img) img { width: 110px; height: 110px; }
+.file-chip { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; max-width: 100%; }
+.relay-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; min-width: 0; }
+.relay-row input { min-width: 0; }
+details.muted summary { cursor: pointer; margin: 8px 0; }

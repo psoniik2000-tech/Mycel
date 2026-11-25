@@ -6,6 +6,5 @@ license.workspace = true
 
 [dependencies]
 mycel-core.workspace = true
-iroh-relay.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

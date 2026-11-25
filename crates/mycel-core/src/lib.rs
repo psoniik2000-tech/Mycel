@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 
 mod call;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
+#[cfg(not(target_os = "android"))]
+pub use iroh_relay::server::Server as RelayServer;
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 
@@ -47,10 +49,14 @@ pub struct Opts {
     pub own_relay: Option<String>,
     /// Also use the public n0 relays and address lookup (off by default, last resort).
     pub n0: bool,
+    /// More relays to use and advertise in invites (backup public ones the user added).
+    pub extra_relays: Vec<String>,
     /// Download every media blob as soon as its event arrives (anchors, §8.4).
     pub keep_blobs: bool,
     /// Largest media file to send or download, bytes; 0 = 4 GiB (§8.1).
     pub max_blob: u64,
+    /// HTTP mailbox (`mailbox/worker.js`) that keeps envelopes for members who are offline.
+    pub mailbox: Option<String>,
 }
 
 /// A chat: `None` is the space chat, `Some(device)` the 1:1 chat with that member (§17).
@@ -166,6 +172,19 @@ impl State {
         )
     }
 
+    /// Decrypts and stores envelopes (commits and 1:1 Welcomes, epoch 0, first); bad ones are skipped.
+    fn take(&mut self, mut envs: Vec<Envelope>, me: [u8; 32]) -> Vec<(Chat, Event)> {
+        envs.sort_by_key(|e| e.epoch);
+        let mut out = vec![];
+        for env in envs {
+            match self.receive(&env, me) {
+                Ok(evs) => out.extend(evs),
+                Err(e) => eprintln!("mycel: bad envelope: {e}"),
+            }
+        }
+        out
+    }
+
     /// Decrypts and stores one envelope; returns the new events (several when it is the
     /// Welcome of a 1:1 chat whose messages came first).
     fn receive(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
@@ -235,6 +254,7 @@ pub struct Node {
     net: Net,
     own_relay: Option<String>,
     n0: bool,
+    extra_relays: Vec<String>,
     /// Encrypted media blobs (ciphertext, by BLAKE3 hash); a tag per hash keeps it from GC.
     blobs: FsStore,
     dir: PathBuf,
@@ -242,6 +262,46 @@ pub struct Node {
     max_blob: u64,
     call: Mutex<Option<call::Call>>,
     frames: Mutex<Option<mpsc::Sender<call::Frame>>>,
+    mailbox: Option<Mailbox>,
+}
+
+/// Store-and-forward when no member is online: every new envelope is also posted to an HTTP
+/// mailbox (a Cloudflare Worker); members pull what is new at start and every minute.
+/// It sees only ciphertext; the topic is derived from the space id, which only members know.
+// shortcut: envelopes only; media blobs still come from a member who is online.
+struct Mailbox {
+    http: reqwest::Client,
+    url: String,
+}
+
+/// Envelopes per mailbox page (the worker returns at most this many).
+const BOX_PAGE: usize = 200;
+
+impl Mailbox {
+    fn new(url: &str) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let http = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        Ok(Self {
+            http,
+            url: url.trim_end_matches('/').to_string(),
+        })
+    }
+
+    fn topic(space_id: &[u8]) -> String {
+        Hash::new([b"mycel-mailbox".as_slice(), space_id].concat())
+            .to_hex()
+            .to_string()
+    }
 }
 
 impl Node {
@@ -271,6 +331,8 @@ impl Node {
         let st = State { mls, ..st };
         let mut relays = st.relays()?;
         relays.extend(opts.own_relay.clone());
+        relays.extend(opts.extra_relays.iter().cloned());
+        let mailbox = opts.mailbox.as_deref().map(Mailbox::new).transpose()?;
         let (net, mut inbox, joins, conns) = Net::bind(key, opts.port, &relays, opts.n0).await?;
         let mut bopts = Options::new(&dir.join("blobs"));
         bopts.gc = Some(GcConfig {
@@ -283,6 +345,7 @@ impl Node {
             net,
             own_relay: opts.own_relay.clone(),
             n0: opts.n0,
+            extra_relays: opts.extra_relays.clone(),
             blobs,
             dir: std::path::absolute(dir)?,
             keep_blobs: opts.keep_blobs,
@@ -293,13 +356,19 @@ impl Node {
             },
             call: Mutex::new(None),
             frames: Mutex::new(None),
+            mailbox,
         });
         let (tx, rx) = mpsc::channel(256);
+        let (box_tx, mut box_rx) = mpsc::channel::<Vec<Envelope>>(16);
         let n = node.clone();
         tokio::spawn(async move {
-            while let Some((from, msg)) = inbox.recv().await {
+            loop {
                 let before = n.members().len();
-                let res = n.handle(from, msg);
+                let (from, res) = tokio::select! {
+                    Some((from, msg)) = inbox.recv() => (Some(from), n.handle(from, msg)),
+                    Some(envs) = box_rx.recv() => (None, n.take_envs(envs)),
+                    else => break,
+                };
                 // Someone joined: they cannot read our older profile, so send it again.
                 if n.members().len() > before
                     && let Err(e) = n.refresh_profile(true)
@@ -324,7 +393,7 @@ impl Node {
                             let _ = tx.send(ev).await;
                         }
                     }
-                    Err(e) => eprintln!("mycel: dropped message from {}: {e}", from.fmt_short()),
+                    Err(e) => eprintln!("mycel: dropped message from {from:?}: {e}"),
                 }
             }
         });
@@ -343,9 +412,12 @@ impl Node {
         let weak = Arc::downgrade(&node);
         let wait_relay = opts.n0 || !relays.is_empty();
         tokio::spawn(async move {
-            if wait_relay && let Some(n) = weak.upgrade() {
-                n.net.online().await;
-                let _ = n.sync();
+            if let Some(n) = weak.upgrade() {
+                if wait_relay {
+                    n.net.online().await;
+                    let _ = n.sync();
+                }
+                n.poll_box(&box_tx).await;
             }
             loop {
                 tokio::time::sleep(RESYNC).await;
@@ -356,6 +428,7 @@ impl Node {
                 if let Err(e) = n.sync() {
                     eprintln!("mycel: resync failed: {e}");
                 }
+                n.poll_box(&box_tx).await;
             }
         });
         Ok((node, rx))
@@ -380,11 +453,17 @@ impl Node {
         self.net.addr().relay_urls().next().is_some()
     }
 
-    /// Relay URLs this node uses (own and learned).
+    /// Relay URLs this node uses (own, learned and added; not the n0 ones).
     pub fn relays(&self) -> Vec<String> {
         let mut r = self.st.lock().unwrap().relays().unwrap_or_default();
         r.extend(self.own_relay.clone());
+        r.extend(self.extra_relays.iter().cloned());
         r
+    }
+
+    /// The relay peers in other networks reach us through right now, if any.
+    pub fn home_relay(&self) -> Option<String> {
+        self.net.addr().relay_urls().next().map(|u| u.to_string())
     }
 
     pub fn device_id(&self) -> [u8; 32] {
@@ -596,6 +675,7 @@ impl Node {
             st.store_env(&env)?;
             (env, st.store.peers()?)
         };
+        self.post_box(&env);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(())
     }
@@ -1024,6 +1104,7 @@ impl Node {
             st.store_env(&env)?;
             (ev, env, st.store.peers()?)
         };
+        self.post_box(&env);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(ev)
     }
@@ -1139,6 +1220,103 @@ impl Node {
         Ok(())
     }
 
+    /// Envelopes pulled from the mailbox (MLS authenticates them; no peer to check).
+    fn take_envs(&self, envs: Vec<Envelope>) -> Result<Vec<(Chat, Event)>> {
+        let me = self.device_id();
+        Ok(self.st.lock().unwrap().take(envs, me))
+    }
+
+    /// Puts a new envelope into the mailbox in the background; peers online get it directly anyway.
+    fn post_box(&self, env: &Envelope) {
+        let Some(b) = &self.mailbox else { return };
+        let Ok(body) = postcard::to_allocvec(env) else {
+            return;
+        };
+        let url = format!(
+            "{}/box/{}/{}",
+            b.url,
+            Mailbox::topic(&env.space_id),
+            data_encoding::HEXLOWER.encode(&envelope_id(env))
+        );
+        let http = b.http.clone();
+        tokio::spawn(async move {
+            for wait in [2, 10, 60, 0] {
+                match http
+                    .post(&url)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                {
+                    Ok(_) => break,
+                    Err(e) if wait == 0 => eprintln!("mycel: mailbox post failed: {e}"),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_secs(wait)).await,
+                }
+            }
+        });
+    }
+
+    /// Pulls the envelopes posted to the mailbox since the last pull into the inbox loop.
+    async fn poll_box(&self, tx: &mpsc::Sender<Vec<Envelope>>) {
+        if let Err(e) = self.try_poll_box(tx).await {
+            eprintln!("mycel: mailbox poll failed: {e}");
+        }
+    }
+
+    async fn try_poll_box(&self, tx: &mpsc::Sender<Vec<Envelope>>) -> Result<()> {
+        let Some(b) = &self.mailbox else {
+            return Ok(());
+        };
+        let (topic, mut seq) = {
+            let st = self.st.lock().unwrap();
+            if !st.in_space()? {
+                return Ok(());
+            }
+            let seq = st
+                .store
+                .meta("box_seq")?
+                .and_then(|v| v.try_into().ok())
+                .map_or(0, u64::from_le_bytes);
+            (Mailbox::topic(&st.group()?[..16]), seq)
+        };
+        loop {
+            let url = format!("{}/box/{topic}?after={seq}", b.url);
+            let text = b
+                .http
+                .get(url)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            // One envelope per line: "<seq> <base64 postcard>".
+            let mut envs = vec![];
+            let mut n = 0;
+            for line in text.lines() {
+                let Some((s, body)) = line.split_once(' ') else {
+                    continue;
+                };
+                n += 1;
+                seq = seq.max(s.parse()?);
+                match data_encoding::BASE64.decode(body.as_bytes()) {
+                    Ok(b) => envs.extend(postcard::from_bytes::<Envelope>(&b).ok()),
+                    Err(e) => eprintln!("mycel: bad mailbox entry: {e}"),
+                }
+            }
+            if !envs.is_empty() {
+                tx.send(envs).await?;
+            }
+            self.st
+                .lock()
+                .unwrap()
+                .store
+                .set_meta("box_seq", &seq.to_le_bytes())?;
+            if n < BOX_PAGE {
+                return Ok(());
+            }
+        }
+    }
+
     /// Send to each peer in the background, retrying a few times: sync runs only at start,
     /// so a message dropped by a flaky link (VPN, relay, network switch) would stay lost.
     fn broadcast(&self, peers: Vec<Vec<u8>>, msg: SyncMsg) {
@@ -1179,16 +1357,7 @@ impl Node {
         }
         let mut out = vec![];
         match msg {
-            SyncMsg::Envs(mut envs) => {
-                // Commits (and 1:1 Welcomes, epoch 0) must apply before later-epoch messages.
-                envs.sort_by_key(|e| e.epoch);
-                for env in envs {
-                    match st.receive(&env, me) {
-                        Ok(evs) => out.extend(evs),
-                        Err(e) => eprintln!("mycel: bad envelope: {e}"),
-                    }
-                }
-            }
+            SyncMsg::Envs(envs) => out = st.take(envs, me),
             SyncMsg::Have { ids, reply } => {
                 let theirs: HashSet<_> = ids.into_iter().collect();
                 let mut missing = vec![];
@@ -1259,6 +1428,7 @@ impl Node {
         if let Some(r) = &req.addr.relay {
             self.learn_relays(&st, std::slice::from_ref(r))?;
         }
+        self.post_box(&env);
         self.broadcast(peers.clone(), SyncMsg::Envs(vec![env]));
         self.broadcast(peers, SyncMsg::Peers(vec![req.addr]));
         Ok(postcard::to_allocvec(&JoinResp {
@@ -1334,4 +1504,20 @@ fn now_ms() -> Result<u64> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// iroh-relay over plain HTTP on the port of `url` (like `http://1.2.3.4:3340`), all interfaces.
+/// Pass the same URL as [`Opts::own_relay`]. Kept running until the returned server is dropped or shut down.
+// shortcut: no TLS (relayed QUIC is end-to-end encrypted anyway, but not disguised as HTTPS);
+// serve HTTPS (ACME) once an anchor has a domain. Needs the TCP port forwarded and NAT loopback on the router.
+#[cfg(not(target_os = "android"))]
+pub async fn spawn_relay(url: &str) -> Result<iroh_relay::server::Server> {
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    let u: RelayUrl = url.parse().context("relay url like http://1.2.3.4:3340")?;
+    let port = u
+        .port_or_known_default()
+        .context("relay url without port")?;
+    let mut cfg = ServerConfig::default();
+    cfg.relay = Some(RelayConfig::new(([0, 0, 0, 0], port)));
+    Ok(Server::spawn(cfg).await?)
 }
