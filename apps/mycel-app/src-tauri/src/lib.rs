@@ -865,6 +865,13 @@ async fn history(st: State<'_, App>, chat: String) -> R<Vec<Msg>> {
     chat_msgs(n, &chat_of(n, &chat)?)
 }
 
+/// The chat is open and the window visible: Read receipt up to its newest message (§7.4).
+#[tauri::command]
+async fn mark_read(st: State<'_, App>, chat: String) -> R<()> {
+    let n = &st.node()?;
+    n.mark_read(&chat_of(n, &chat)?).map_err(err)
+}
+
 /// The space chat and every 1:1 chat with its last message; `read`: chat → ts read up to.
 #[tauri::command]
 async fn chats(st: State<'_, App>, read: HashMap<String, u64>) -> R<Vec<ChatRow>> {
@@ -1412,6 +1419,7 @@ pub fn run() {
             members,
             peers,
             set_visible,
+            mark_read,
             stash,
             close_space,
             remove_space,

@@ -675,6 +675,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const markRead = () => {
     const ts = Math.max(Date.now(), ...msgs().map((m) => m.ts));
     localStorage.setItem(readKey(), JSON.stringify({ ...readMap(), [chat()]: ts }));
+    invoke("mark_read", { chat: chat() }).catch(() => {});
     loadChats();
   };
   createEffect(() => chatVisible() && msgs() && untrack(markRead));
@@ -1358,8 +1359,8 @@ function Chat(p: {
                           <Show when={m.mine}>
                             <Switch>
                               <Match when={m.status === 0}><span title="Отправляется"><Clock size={14} /></span></Match>
-                              <Match when={m.status === 1}><span title="Ушло в сеть"><Check size={14} /></span></Match>
-                              <Match when={m.status === 2}><span title="Доставлено всем"><CheckCheck size={14} /></span></Match>
+                              <Match when={m.status === 1}><span title="Доставлено"><Check size={14} /></span></Match>
+                              <Match when={m.status === 2}><span title="Прочитано"><CheckCheck size={14} /></span></Match>
                             </Switch>
                           </Show>
                         </span>
