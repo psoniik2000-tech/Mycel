@@ -15,6 +15,7 @@ import { label, Media, MediaView } from "./media";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
+import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
@@ -243,7 +244,10 @@ export default function App() {
     // Android may hand the launch link over again later: a used one is skipped.
     if (!url || url === localStorage.getItem("joined")) return;
     if (stage() === "main") {
-      if (!(await ask("Вступить в другое пространство по этой ссылке? Нынешнее закроется, вернуться в него можно из списка пространств", { title: "Приглашение", okLabel: "Вступить", cancelLabel: "Отмена" }))) return;
+      const q = simple()
+        ? "Это приглашение в другой круг контактов. Принять? Нынешние чаты закроются, вернуться к ним можно через режим пространств в Настройках"
+        : "Вступить в другое пространство по этой ссылке? Нынешнее закроется, вернуться в него можно из списка пространств";
+      if (!(await ask(q, { title: "Приглашение", okLabel: "Принять", cancelLabel: "Отмена" }))) return;
       await leave();
     }
     setInvite(url);
@@ -259,11 +263,15 @@ export default function App() {
     <Show when={status()}>
       {(s) => (
         <Switch>
+          <Match when={stage() === "spaces" && !s().spaces.length && !mode()}>
+            <ModeChoice onSimple={() => enter()} onSpaces={() => setStage("spaces")} />
+          </Match>
           <Match when={stage() === "spaces"}>
             <Spaces spaces={s().spaces} onOpen={enter} onNew={(h) => enter(undefined, h)} onRemoved={refresh} />
           </Match>
           <Match when={stage() === "lock"}>
-            <Lock space={space()} how={how()} count={s().spaces.length} onDone={opened} onBack={() => setStage("spaces")}
+            <Lock space={space()} how={how()} count={s().spaces.length} onDone={opened}
+              onBack={() => (s().spaces.length || setMode(null), setStage("spaces"))}
               onRemoved={async () => (await refresh(), setStage("spaces"))} />
           </Match>
           <Match when={stage() === "onboard"}>
@@ -280,7 +288,7 @@ export default function App() {
 
 function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: boolean) => void; onBack: () => void; onRemoved: () => void }) {
   const [forgot, setForgot] = createSignal(false);
-  const defaultName = p.count ? `Пространство ${p.count + 1}` : "Моё пространство";
+  const defaultName = simple() ? SIMPLE_NAME : p.count ? `Пространство ${p.count + 1}` : "Моё пространство";
   const [name, setName] = createSignal(defaultName);
   const [pw, setPw] = createSignal("");
   const [pw2, setPw2] = createSignal("");
@@ -307,12 +315,12 @@ function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: bo
     <div class="center">
       <form class="card intro" onSubmit={submit}>
         <img src={logo} class="logo" alt="" />
-        <h1>{p.space?.name ?? (joining() ? "Вступить по ссылке" : "Новое пространство")}</h1>
+        <h1>{simple() ? "Mycel" : p.space?.name ?? (joining() ? "Вступить по ссылке" : "Новое пространство")}</h1>
         <p class="muted">
           {exists() ? "Введите пароль, чтобы открыть переписку"
             : `Придумайте пароль: им шифруются все данные на этом устройстве${joining() ? ". Ссылку-приглашение вставите на следующем шаге" : ""}`}
         </p>
-        <Show when={!exists() && !joining()}>
+        <Show when={!exists() && !joining() && !simple()}>
           <input placeholder="Название (видно только вам)" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
         </Show>
         <input type="password" placeholder="Пароль" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} autofocus />
@@ -325,7 +333,9 @@ function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: bo
         </label>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <button class="primary" disabled={busy()}>{busy() ? "Открываем…" : exists() ? "Открыть" : "Продолжить"}</button>
-        <button type="button" onClick={p.onBack}><ArrowLeft size={18} /> {p.count ? "Все пространства" : "Назад"}</button>
+        <Show when={!(simple() && exists())}>
+          <button type="button" onClick={p.onBack}><ArrowLeft size={18} /> {p.count && !simple() ? "Все пространства" : "Назад"}</button>
+        </Show>
         <Show when={exists()}>
           <button type="button" class="link" onClick={() => setForgot(true)}>Забыли пароль?</button>
         </Show>
@@ -681,15 +691,16 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
-        <h1>{p.how === "join" ? "Вступить по ссылке" : p.how === "create" ? "Новое пространство" : "Добро пожаловать"}</h1>
+        <h1>{p.how === "join" ? (simple() ? "Принять приглашение" : "Вступить по ссылке") : p.how === "create" && !simple() ? "Новое пространство" : "Добро пожаловать"}</h1>
         <p class="muted">
-          {p.how === "join" ? "Представьтесь и вставьте ссылку-приглашение" : p.how === "create" ? "Остался один шаг" : "Создайте своё пространство или вступите в существующее по ссылке-приглашению"}
+          {simple() ? (p.how === "join" ? "Представьтесь и вставьте ссылку, которую вам прислали" : "Начните сами и добавляйте контакты своей ссылкой — или вставьте ссылку, которую вам прислали")
+            : p.how === "join" ? "Представьтесь и вставьте ссылку-приглашение" : p.how === "create" ? "Остался один шаг" : "Создайте своё пространство или вступите в существующее по ссылке-приглашению"}
         </p>
         <input placeholder="Как вас зовут?" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
         <Show when={!name().trim()}><p class="muted small">Имя увидят другие участники</p></Show>
         <Show when={p.how !== "join"}>
           <button class="primary" disabled={!!busy() || !name().trim()} onClick={() => run("create", "create_space")}>
-            <Plus size={18} /> {busy() === "create" ? "Создаём…" : "Создать пространство"}
+            <Plus size={18} /> {busy() === "create" ? "Создаём…" : simple() ? "Начать" : "Создать пространство"}
           </button>
         </Show>
         <Show when={!p.how}><div class="or"><span>или</span></div></Show>
@@ -705,14 +716,14 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
             }}><Camera size={18} /> Сканировать QR</button>
           </Show>
           <button classList={{ primary: p.how === "join" }} disabled={!!busy() || !p.link.trim() || !name().trim()} onClick={() => run("join", "join", { link: p.link })}>
-            <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
+            <Link size={18} /> {busy() === "join" ? (simple() ? "Подключаемся…" : "Вступаем…") : simple() ? "Принять приглашение" : "Вступить по ссылке"}
           </button>
           <Show when={busy() === "join"}><p class="muted small">{stage()}</p></Show>
         </Show>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <Show when={p.how}>
           <button type="button" class="link" disabled={!!busy()} onClick={() => (setErr(""), p.setHow(p.how === "join" ? "create" : "join"))}>
-            {p.how === "join" ? "Лучше создать своё пространство" : "Есть ссылка-приглашение?"}
+            {p.how === "join" ? (simple() ? "Начать самому" : "Лучше создать своё пространство") : "Есть ссылка-приглашение?"}
           </button>
         </Show>
       </div>
@@ -735,7 +746,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const wideQuery = matchMedia("(min-width: 900px)");
   const [wide, setWide] = createSignal(wideQuery.matches);
   const chatVisible = () => (wide() || chatOpen()) && focused();
-  const loadChats = () => invoke<ChatRow[]>("chats").then(setRows);
+  // Simple mode has no space chat ("").
+  const loadChats = () => invoke<ChatRow[]>("chats").then((r) => setRows(simple() ? r.filter((x) => x.id) : r));
+  createEffect(() => (simple(), untrack(loadChats)));
   // Unread counts follow our Read receipts: reload them once the receipt is stored.
   const markRead = () => invoke("mark_read", { chat: chat() }).catch(() => {}).then(loadChats);
   const toggleMute = (on: boolean) =>
@@ -900,7 +913,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   });
 
   const sortedRows = () => [...rows()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
-  const titles = { chats: "Чаты", calls: "Звонки", people: "Люди", settings: "Настройки" };
+  const titles = () => ({ chats: "Чаты", calls: "Звонки", people: simple() ? "Контакты" : "Люди", settings: "Настройки" });
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
     <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); }} title={label}>
       <Icon size={22} />
@@ -915,13 +928,13 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         <img src={logo} class="rail-logo" alt="Mycel" />
         {navItem("chats", "Чаты", MessageCircle)}
         {navItem("calls", "Звонки", Phone)}
-        {navItem("people", "Люди", Users)}
+        {navItem("people", titles().people, Users)}
         {navItem("settings", "Настройки", Settings)}
       </nav>
 
       <section class="panel">
         <header class="bar">
-          <h2>{titles[tab()]}</h2>
+          <h2>{titles()[tab()]}</h2>
           <NetDot n={peers()} />
         </header>
         <Switch>
@@ -945,14 +958,14 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   );
                 }}
               </For>
-              <p class="muted small pad">Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате</p>
+              <p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p>
             </div>
           </Match>
           <Match when={tab() === "calls"}>
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
           </Match>
           <Match when={tab() === "people"}>
-            <People members={members()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
+            <People members={members()} simple={simple()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
             <div class="scroll pad">
@@ -983,11 +996,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 <AppSettings />
               </Show>
               <LoginSettings space={p.space} refresh={p.refresh} />
-              <h3>Пространство «{p.space.name}»</h3>
+              <ModeSettings />
+              <h3>{simple() ? "Данные" : `Пространство «${p.space.name}»`}</h3>
               <p class="muted">Зашифрованная база хранится здесь:</p>
               <code class="path">{p.dir}</code>
               <div class="actions">
-                <button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button>
+                <Show when={!simple()}><button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button></Show>
                 <button class="danger" onClick={() => setDel(true)}><Trash2 size={18} /> Удалить с этого устройства</button>
               </div>
               <Show when={del()}>
@@ -998,7 +1012,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         </Switch>
       </section>
 
-      <Show when={{ c: chat() }} keyed>
+      <Show when={!(simple() && !chat()) && { c: chat() }} keyed
+        fallback={<section class="chat"><div class="msgs"><p class="empty muted">Выберите чат или контакт</p></div></section>}>
         {(k) => (
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
             peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
@@ -1025,7 +1040,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   );
 }
 
-function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (id: string, video: boolean) => void; inCall: boolean }) {
+function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) => void; onCall: (id: string, video: boolean) => void; inCall: boolean }) {
   const [inv, setInv] = createSignal<{ link: string; svg: string }>();
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
@@ -1106,14 +1121,19 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
     <div class="scroll">
       <div class="pad">
         <button class="primary" disabled={!amAdmin() || busy()} onClick={invite}>
-          <UserPlus size={18} /> {busy() ? "Готовим ссылку…" : "Пригласить"}
+          <UserPlus size={18} /> {busy() ? "Готовим ссылку…" : p.simple ? "Добавить контакт" : "Пригласить"}
         </button>
-        <Show when={!amAdmin()}><p class="muted small">Приглашать может только администратор</p></Show>
+        <Show when={!amAdmin()}>
+          <p class="muted small">{p.simple ? `Новых людей добавляет ${nameOf(p.members.find((m) => m.admin)?.id ?? "")} — ссылку можно попросить у этого контакта` : "Приглашать может только администратор"}</p>
+        </Show>
+        <Show when={p.simple && amAdmin() && !inv()}>
+          <p class="muted small">Покажите QR или отправьте ссылку человеку — когда он её примет, вы появитесь друг у друга в контактах</p>
+        </Show>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <Show when={inv()}>
           <div class="card invite">
             <div class="qr" innerHTML={inv()!.svg} />
-            <p class="muted small">Ссылка одноразовая: по ней сможет вступить один человек</p>
+            <p class="muted small">{p.simple ? "Ссылка одноразовая: для одного человека. Он увидит и других ваших контактов из этого списка" : "Ссылка одноразовая: по ней сможет вступить один человек"}</p>
             <code class="path">{inv()!.link}</code>
             <button onClick={copy}>{copied() ? <Check size={18} /> : <Copy size={18} />} {copied() ? "Скопировано" : "Копировать"}</button>
           </div>
@@ -1134,14 +1154,14 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
           )}
         </Show>
       </div>
-      <p class="section muted">Участники · {p.members.length}</p>
+      <p class="section muted">{p.simple ? `Контакты · ${p.members.length - 1}` : `Участники · ${p.members.length}`}</p>
       <For each={p.members}>
         {(m) => (
           <div class="row person">
             <Avatar id={m.id} onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
               <b>{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small mono">{m.id}<Show when={m.admin}> · админ</Show>
+              <div class="muted small mono">{m.id}<Show when={m.admin && !p.simple}> · админ</Show>
                 <Show when={status(m) === "ok"}> · проверен</Show></div>
               <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
