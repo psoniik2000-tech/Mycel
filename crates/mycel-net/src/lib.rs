@@ -34,6 +34,8 @@ pub type ConnInbox = mpsc::Receiver<Connection>;
 pub struct Net {
     ep: Endpoint,
     conns: Arc<Mutex<HashMap<EndpointId, Connection>>>,
+    /// Unix ms of the last message received from each peer.
+    seen: Arc<Mutex<HashMap<EndpointId, u64>>>,
     tx: mpsc::Sender<(EndpointId, SyncMsg)>,
 }
 
@@ -69,6 +71,7 @@ impl Net {
         let net = Self {
             ep,
             conns: Default::default(),
+            seen: Default::default(),
             tx,
         };
         let n = net.clone();
@@ -165,16 +168,33 @@ impl Net {
             .count()
     }
 
+    /// Link to `peer`: `Some(true)` via a relay, `Some(false)` direct, `None` no open connection;
+    /// and when (unix ms) we last received a message from it.
+    pub fn link(&self, peer: EndpointId) -> (Option<bool>, Option<u64>) {
+        let conn = self.conns.lock().unwrap().get(&peer).cloned();
+        let link = conn.filter(|c| c.close_reason().is_none()).map(|c| {
+            c.paths()
+                .iter()
+                .find(|p| p.is_selected())
+                .is_some_and(|p| p.is_relay())
+        });
+        (link, self.seen.lock().unwrap().get(&peer).copied())
+    }
+
     /// Caches the connection for replies and reads envelopes from it until it closes.
     fn track(&self, conn: Connection) {
         let peer = conn.remote_id();
         self.conns.lock().unwrap().insert(peer, conn.clone());
-        let tx = self.tx.clone();
+        let (tx, seen) = (self.tx.clone(), self.seen.clone());
         tokio::spawn(async move {
             while let Ok(mut rs) = conn.accept_uni().await {
                 let Ok(bytes) = rs.read_to_end(MAX_MSG).await else {
                     continue;
                 };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                seen.lock().unwrap().insert(peer, now);
                 if let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes)
                     && tx.send((peer, msg)).await.is_err()
                 {
