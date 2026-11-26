@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Camera, Check, CheckCheck, ChevronDown, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Send,
-  Settings, Trash2, UserPlus, Users, Video, VideoOff, X,
+  Settings, ShieldAlert, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -603,6 +603,27 @@ function LoginSettings(p: { space: Space; refresh: () => void }) {
   );
 }
 
+// Android camera scan of one QR code; throws "cancelled" on back.
+async function scanQr(): Promise<string> {
+  const bs = await import("@tauri-apps/plugin-barcode-scanner");
+  // The plugin's scan() fails unless the camera permission was asked for first.
+  if ((await bs.checkPermissions()) !== "granted" && (await bs.requestPermissions()) !== "granted")
+    throw "Нет доступа к камере: разрешите его Mycel в настройках телефона";
+  // Android back cancels the scan (otherwise it closes the app): give it a history entry to pop.
+  history.pushState(null, "");
+  let back = false;
+  const onBack = () => ((back = true), bs.cancel());
+  addEventListener("popstate", onBack, { once: true });
+  localStorage.setItem("scanning", "1");
+  try {
+    return (await bs.scan({ formats: [bs.Format.QRCode] })).content;
+  } finally {
+    localStorage.removeItem("scanning");
+    removeEventListener("popstate", onBack);
+    if (!back) history.back();
+  }
+}
+
 function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink: (v: string) => void; onDone: () => void }) {
   const [name, setName] = createSignal("");
   // Set while the camera scanner is open: if it is still set on the next start, the scanner crashed the app.
@@ -650,23 +671,7 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
           <Show when={android}>
             <button disabled={!!busy()} onClick={async () => {
               try {
-                const bs = await import("@tauri-apps/plugin-barcode-scanner");
-                // The plugin's scan() fails unless the camera permission was asked for first.
-                if ((await bs.checkPermissions()) !== "granted" && (await bs.requestPermissions()) !== "granted")
-                  return setErr("Нет доступа к камере: разрешите его Mycel в настройках телефона");
-                // Android back cancels the scan (otherwise it closes the app): give it a history entry to pop.
-                history.pushState(null, "");
-                let back = false;
-                const onBack = () => ((back = true), bs.cancel());
-                addEventListener("popstate", onBack, { once: true });
-                localStorage.setItem("scanning", "1");
-                try {
-                  p.setLink((await bs.scan({ formats: [bs.Format.QRCode] })).content);
-                } finally {
-                  localStorage.removeItem("scanning");
-                  removeEventListener("popstate", onBack);
-                  if (!back) history.back();
-                }
+                p.setLink(await scanQr());
               } catch (e) {
                 if (errText(e) !== "cancelled") setErr(errText(e));
               }
@@ -1008,6 +1013,62 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
   const [err, setErr] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const amAdmin = () => p.members.some((m) => m.me && m.admin);
+  // Verified members on this device: name (or short id) -> safety code; "!" = the key changed since.
+  const vKey = `verified:${spaceId}`;
+  const readVer = (): Record<string, string> => {
+    try {
+      return JSON.parse(localStorage.getItem(vKey) ?? "{}");
+    } catch {
+      return {};
+    }
+  };
+  const [ver, setVer] = createSignal(readVer());
+  const saveVer = (v: Record<string, string>) => (localStorage.setItem(vKey, JSON.stringify(v)), setVer(v));
+  const vName = (m: Member) => m.name ?? m.id;
+  const [codes, setCodes] = createSignal<Record<string, string>>({});
+  const codeOf = async (id: string) => {
+    const c = codes()[id] ?? (await invoke<{ link: string; svg: string }>("safety_code", { id })).link;
+    setCodes({ ...codes(), [id]: c });
+    return c;
+  };
+  // A verified name whose device now gives another code (new device or key): drop the mark, warn.
+  createEffect(() => {
+    for (const m of p.members) {
+      const v = untrack(ver)[vName(m)];
+      if (!m.me && v && v !== "!")
+        codeOf(m.id).then((c) => c !== v && saveVer({ ...readVer(), [vName(m)]: "!" })).catch(() => {});
+    }
+  });
+  const status = (m: Member) => {
+    const v = ver()[vName(m)];
+    return v === "!" ? "changed" : v && v === codes()[m.id] ? "ok" : "";
+  };
+  const [safe, setSafe] = createSignal<{ m: Member; link: string; svg: string; err?: string }>();
+  const openSafe = async (m: Member) => {
+    if (safe()?.m.id === m.id) return setSafe();
+    try {
+      const s = await invoke<{ link: string; svg: string }>("safety_code", { id: m.id });
+      setCodes({ ...codes(), [m.id]: s.link });
+      setSafe({ m, ...s });
+    } catch (e) {
+      setErr(errText(e));
+    }
+  };
+  const markSafe = (on: boolean) => {
+    const s = safe()!, v = readVer();
+    if (on) v[vName(s.m)] = s.link;
+    else delete v[vName(s.m)];
+    saveVer(v);
+  };
+  const scanSafe = async () => {
+    try {
+      const got = (await scanQr()).trim();
+      if (got === safe()!.link) markSafe(true), setSafe({ ...safe()!, err: undefined });
+      else setSafe({ ...safe()!, err: "Коды не совпадают: возможна подмена собеседника" });
+    } catch (e) {
+      if (errText(e) !== "cancelled") setSafe({ ...safe()!, err: errText(e) });
+    }
+  };
   const invite = async () => {
     setBusy(true);
     setErr("");
@@ -1039,6 +1100,21 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
             <button onClick={copy}>{copied() ? <Check size={18} /> : <Copy size={18} />} {copied() ? "Скопировано" : "Копировать"}</button>
           </div>
         </Show>
+        <Show when={safe()}>
+          {(s) => (
+            <div class="card invite">
+              <b>Код безопасности · {nameOf(s().m.id)}</b>
+              <div class="qr" innerHTML={s().svg} />
+              <code class="path">{s().link}</code>
+              <p class="muted small">Сверьте код с собеседником лично или отсканируйте его QR: совпадает — значит, на связи именно его устройство</p>
+              <Show when={android}><button onClick={scanSafe}><Camera size={18} /> Сканировать QR собеседника</button></Show>
+              <Show when={status(s().m) === "ok"} fallback={<button class="primary" onClick={() => markSafe(true)}><ShieldCheck size={18} /> Отметить проверенным</button>}>
+                <button onClick={() => markSafe(false)}>Снять отметку «Проверен»</button>
+              </Show>
+              <Show when={s().err}><p class="error">{s().err}</p></Show>
+            </div>
+          )}
+        </Show>
       </div>
       <p class="section muted">Участники · {p.members.length}</p>
       <For each={p.members}>
@@ -1047,9 +1123,14 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
             <Avatar id={m.id} onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
               <b>{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small mono">{m.id}<Show when={m.admin}> · админ</Show></div>
+              <div class="muted small mono">{m.id}<Show when={m.admin}> · админ</Show>
+                <Show when={status(m) === "ok"}> · проверен</Show></div>
+              <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
             <Show when={!m.me}>
+              <button class="icon" onClick={(e) => (openSafe(m), e.currentTarget.closest(".scroll")?.scrollTo({ top: 0, behavior: "smooth" }))} title="Код безопасности">
+                {status(m) === "changed" ? <ShieldAlert size={20} /> : <ShieldCheck size={20} />}
+              </button>
               <button class="icon" onClick={() => p.onWrite(m.id)} title="Написать"><MessageCircle size={20} /></button>
               <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, false)} title="Позвонить"><Phone size={20} /></button>
               <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, true)} title="Видеозвонок"><Video size={20} /></button>
