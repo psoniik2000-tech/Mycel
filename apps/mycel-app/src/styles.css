@@ -135,6 +135,10 @@ input, textarea {
   flex: none; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center;
   color: #fff; font-weight: 600; font-size: 15px;
 }
+.avatar { position: relative; }
+.link-dot { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--panel); background: var(--muted); }
+.link-dot.direct { background: var(--online); }
+.link-dot.relay { background: var(--accent); }
 .avatar.group { background: var(--accent); color: var(--accent-ink); }
 .avatar.small-av { width: 38px; height: 38px; }
 .badge {

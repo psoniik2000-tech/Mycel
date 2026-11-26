@@ -1182,6 +1182,11 @@ impl Node {
         self.net.connected()
     }
 
+    /// Link to device `dev`: `Some(true)` relay, `Some(false)` direct, `None` none; and last-seen unix ms.
+    pub fn link(&self, dev: &[u8; 32]) -> (Option<bool>, Option<u64>) {
+        EndpointId::from_bytes(dev).map_or((None, None), |id| self.net.link(id))
+    }
+
     /// Signs, encrypts (MLS), stores and sends an event to every known peer; 1:1 chats too,
     /// so any member (an anchor) can keep and forward the ciphertext while the partner is away.
     fn send_event(&self, chat: &Chat, body: EventBody) -> Result<Event> {

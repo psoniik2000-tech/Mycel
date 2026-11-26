@@ -348,6 +348,10 @@ struct Member {
     name: Option<String>,
     avatar: String,
     color: Option<u8>,
+    /// "direct" / "relay" / None (no connection right now).
+    link: Option<&'static str>,
+    /// Unix ms of the last message received from this device.
+    seen: Option<u64>,
 }
 
 /// A row of the chat list.
@@ -1384,7 +1388,10 @@ async fn members(st: State<'_, App>) -> R<Vec<Member>> {
         .iter()
         .map(|m| {
             let p = prof.remove(m);
+            let (link, seen) = n.link(m);
             Member {
+                link: link.map(|r| if r { "relay" } else { "direct" }),
+                seen,
                 id: short(m),
                 me: *m == me,
                 admin: *m == admin,

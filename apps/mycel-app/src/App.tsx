@@ -24,7 +24,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
-type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null };
+type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
@@ -127,11 +127,22 @@ const callLabel = (c: CallView) =>
   : c.active ? "Идёт звонок"
   : `${c.video ? "Видеозвонок" : "Звонок"}, ${clock(c.duration_ms ?? 0)}`;
 
-function Avatar(p: { id: string; onClick?: () => void }) {
+/** The connection to a member in words, for the 1:1 chat header. */
+const linkText = (m?: Member) => {
+  if (!m || m.me) return "личный чат";
+  if (m.link) return m.link === "direct" ? "на связи напрямую" : "на связи через сервер-ретранслятор";
+  if (!m.seen) return "не в сети, сообщения дойдут через почтовый ящик";
+  const min = Math.round((Date.now() - m.seen) / 60_000);
+  return `был(а) в сети ${min < 1 ? "только что" : min < 60 ? `${min} мин назад` : new Date(m.seen).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
+};
+
+function Avatar(p: { id: string; onClick?: () => void; dot?: boolean }) {
+  const m = () => memberOf(p.id);
   return (
     <div class="avatar" classList={{ link: !!p.onClick }} style={{ background: `hsl(${colorOf(p.id)} 45% 55%)` }}
       onClick={(e) => p.onClick && (e.stopPropagation(), p.onClick())}>
       {initials(p.id)}
+      <Show when={p.dot && !m()?.me}><i class={`link-dot ${m()?.link ?? "off"}`} title={linkText(m())} /></Show>
     </div>
   );
 }
@@ -933,7 +944,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   const draft = () => getDraft(draftKey(r.id));
                   return (
                     <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => openChat(r.id)}>
-                      {r.id ? <Avatar id={r.id} /> : <div class="avatar group"><Hash size={20} /></div>}
+                      {r.id ? <Avatar id={r.id} dot /> : <div class="avatar group"><Hash size={20} /></div>}
                       <div class="grow">
                         <div class="row-top"><b class="ellipsis">{r.id ? nameOf(r.id) : "Общий чат"}</b><small class="muted">{l() ? time(l()!.ts) : ""}</small></div>
                         <div class="row-bottom">
@@ -1138,7 +1149,7 @@ function People(p: { members: Member[]; onWrite: (id: string) => void; onCall: (
       <For each={p.members}>
         {(m) => (
           <div class="row person">
-            <Avatar id={m.id} onClick={m.me ? undefined : () => p.onWrite(m.id)} />
+            <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
               <b>{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
               <div class="muted small mono">{m.id}<Show when={m.admin}> · админ</Show>
@@ -1452,10 +1463,10 @@ function Chat(p: {
     <section class="chat">
       <Show when={sel().length} fallback={<header class="bar">
         <button class="icon back" onClick={p.back} title="Назад"><ArrowLeft size={20} /></button>
-        {p.chat ? <Avatar id={p.chat} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
+        {p.chat ? <Avatar id={p.chat} dot /> : <div class="avatar group small-av"><Hash size={18} /></div>}
         <div class="grow ellipsis">
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
-          <div class="muted small">{p.chat ? "личный чат" : `${p.members} участн.`}</div>
+          <div class="muted small">{p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`}</div>
         </div>
         <NetDot n={p.peers} />
         <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
