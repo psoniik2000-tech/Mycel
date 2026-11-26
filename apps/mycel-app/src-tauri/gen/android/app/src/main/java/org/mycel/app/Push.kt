@@ -27,8 +27,8 @@ class MycelApp : Application() {
 
 /**
  * FCM wake-ups (DESIGN §7.5): the mailbox sends a content-free push when something new is posted;
- * a node alive in this process pulls at once and notifies with the text; otherwise the phone shows
- * "new message" and the app pulls and decrypts it when opened.
+ * a node alive in this process pulls at once and notifies with the text; otherwise a remembered space
+ * is opened without UI for a few seconds to do the same; without one the phone shows "new message".
  * The token goes to a file the Rust side reads at unlock and registers with the mailbox.
  */
 object Push {
@@ -50,7 +50,8 @@ object Push {
 
   fun save(c: Context, token: String) = File(c.dataDir, "push_token").writeText(token)
 
-  fun clear(c: Context) = c.getSystemService(NotificationManager::class.java).cancel(NOTE_ID)
+  // Also the per-message ones from `pullNode`; the foreground service's notice stays.
+  fun clear(c: Context) = c.getSystemService(NotificationManager::class.java).cancelAll()
 
   private const val NOTE_ID = 2
 
@@ -60,17 +61,30 @@ object Push {
   // A process the push started has no Rust library loaded (and no node): UnsatisfiedLinkError → false.
   fun wakeNode() = runCatching { wake() }.getOrDefault(false)
 
-  fun notifyNew(c: Context) {
+  /** lib.rs: opens the last space with its remembered password, pulls, confirms delivery, closes.
+   *  Title, body pairs of the new messages; null = no remembered password (or it failed). */
+  @JvmStatic external fun pull(root: String, cache: String): Array<String>?
+
+  // false → show the content-free notice.
+  fun pullNode(c: Context): Boolean = runCatching {
+    System.loadLibrary("mycel_app_lib")
+    val m = pull(c.dataDir.path, c.cacheDir.path) ?: return false
+    val id = (System.currentTimeMillis() % 100_000).toInt() * 100 + 1000  // clear of NOTE_ID and the service's 1
+    for (i in m.indices step 2) notifyNew(c, m[i], m[i + 1], id + i / 2)
+    true
+  }.getOrDefault(false)
+
+  fun notifyNew(c: Context, title: String = "Mycel", text: String = "Новое сообщение", id: Int = NOTE_ID) {
     val nm = c.getSystemService(NotificationManager::class.java)
     if (Build.VERSION.SDK_INT >= 26) {
       nm.createNotificationChannel(NotificationChannel("msg", "Сообщения", NotificationManager.IMPORTANCE_HIGH))
     }
     val open = PendingIntent.getActivity(
       c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-    nm.notify(NOTE_ID, NotificationCompat.Builder(c, "msg")
+    nm.notify(id, NotificationCompat.Builder(c, "msg")
       .setSmallIcon(R.mipmap.ic_launcher)
-      .setContentTitle("Mycel")
-      .setContentText("Новое сообщение")
+      .setContentTitle(title)
+      .setContentText(text)
       .setAutoCancel(true)
       .setContentIntent(open)
       .build())
@@ -83,6 +97,6 @@ class PushService : FirebaseMessagingService() {
   override fun onMessageReceived(m: RemoteMessage) {
     // App on screen: it pulls by itself and shows the message.
     if (ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
-    if (!Push.wakeNode()) Push.notifyNew(this)
+    if (!Push.wakeNode() && !Push.pullNode(this)) Push.notifyNew(this)
   }
 }

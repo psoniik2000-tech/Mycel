@@ -16,6 +16,13 @@ pub struct List {
     pub spaces: Vec<Space>,
     /// Opened last: the app opens it at start.
     pub last: Option<String>,
+    /// Connection settings of the last unlock: a push opens that space without the UI (lib.rs `pull`).
+    #[serde(default)]
+    pub n0: bool,
+    #[serde(default)]
+    pub relays: Vec<String>,
+    #[serde(default)]
+    pub mailbox: Option<String>,
 }
 
 /// What a node keeps in its folder; `salt` goes last, so an interrupted move is redone next start.
