@@ -53,6 +53,11 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
+/* No page zoom and no sideways pan (Android WebView): nothing may be wider than the screen,
+   and pinch/horizontal gestures are not claimed by the page (mic button sets its own touch-action). */
+html, body, #root { max-width: 100%; overflow-x: hidden; }
+html, body { touch-action: pan-y; overscroll-behavior: none; }
+input, textarea, select { min-width: 0; max-width: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
@@ -102,7 +107,7 @@ input, textarea {
 .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 
 /* Layout: ≥900px three columns, narrower a stack of screens */
-.app { height: 100%; display: grid; grid-template-columns: 76px 340px 1fr; }
+.app { height: 100%; display: grid; grid-template-columns: 76px 340px minmax(0, 1fr); }
 .rail {
   background: var(--rail); display: flex; flex-direction: column; align-items: center;
   gap: 4px; padding: 14px 0; border-right: 1px solid var(--line);
@@ -114,7 +119,7 @@ input, textarea {
 }
 .nav.active { color: var(--accent); background: var(--hover); }
 .nav .badge { position: absolute; top: 2px; right: 8px; }
-.panel { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.panel { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .bar {
   display: flex; align-items: center; gap: 10px; min-height: 60px; padding: 8px 16px;
   border-bottom: 1px solid var(--line); background: var(--panel);
@@ -275,7 +280,7 @@ button.del { color: var(--danger); }
 .composer .send:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
 
 @media (max-width: 899px) {
-  .app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
   .rail {
     grid-row: 2; flex-direction: row; justify-content: space-around; padding: 4px 0;
     border-right: 0; border-top: 1px solid var(--line);
@@ -298,6 +303,8 @@ button.del { color: var(--danger); }
   .row { padding: 14px 16px; }
   .nav { min-height: 56px; }
   .composer { gap: 2px; padding: 8px; }
+  /* iOS zooms the page on focus when a field is under 16px; keep it that way off the phone too. */
+  input, textarea, select { font-size: 16px; }
 }
 /* A long press opens the menu (it has Copy), not the text selection. */
 @media (pointer: coarse) {
@@ -336,16 +343,18 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / 88%); display: grid; place-items: center; z-index: 50; cursor: zoom-out; }
 .viewer img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
-.recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
+.recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-variant-numeric: tabular-nums; }
 .recording.cancel { color: var(--danger); }
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
-.icon.mic { touch-action: none; }
-.icon.mic { transition: transform .15s; }
-.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transform: scale(1.5); animation: pulse 1.2s infinite; }
-@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgb(196 69 47 / 55%); } 100% { box-shadow: 0 0 0 16px rgb(196 69 47 / 0%); } }
-.recording { font-variant-numeric: tabular-nums; }
 .recording .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Hold-to-record mic: 2x while live (inline transform carries the slide), halo follows loudness */
+.icon.mic { position: relative; touch-action: none; transition: transform .2s; }
+.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transition: none; }
+.icon.mic .halo { display: none; position: absolute; inset: 0; border-radius: 50%; background: rgb(196 69 47 / 35%); z-index: -1; pointer-events: none; }
+.icon.mic.live .halo { display: block; }
+.lock-tip { position: absolute; right: 12px; bottom: 92px; width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--panel); border: 1px solid var(--line); color: var(--muted); pointer-events: none; }
 
 /* Calls (§9) */
 .call-line { align-self: center; display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted);

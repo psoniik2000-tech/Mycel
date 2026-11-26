@@ -11,5 +11,7 @@ addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && ["+", "=", "-", "_", "0"].includes(e.key)) e.preventDefault();
 });
 for (const t of ["gesturestart", "gesturechange"]) addEventListener(t, (e) => e.preventDefault());
+// Two-finger pinch on Android WebView: touch-action alone is not always honoured, so cancel it here too.
+addEventListener("touchmove", (e) => e.touches.length > 1 && e.preventDefault(), { passive: false });
 
 render(() => <App />, document.getElementById("root")!);
