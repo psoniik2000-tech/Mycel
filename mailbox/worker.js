@@ -1,9 +1,10 @@
 // Mycel mailbox: keeps encrypted envelopes for members who are offline (30 days).
 // Cloudflare Worker with a D1 database bound as `DB`. Setup: mailbox/README.md.
 //   POST /box/<topic>/<id>   body = envelope bytes (deduplicated by id);
-//                            header x-push: 1 wakes the topic's phones (FCM), x-from: sender's token is skipped
+//                            header x-push: 1 wakes the topic's phones (FCM), x-from: sender's token is skipped,
+//                            x-to: device tag of a 1:1 partner → only that phone (and untagged old ones)
 //   GET  /box/<topic>?after=N  -> lines "<seq> <base64>", oldest first, at most 200
-//   POST /push/<topic>       body = FCM token of a phone in that space
+//   POST /push/<topic>       body = FCM token of a phone in that space, header x-device: its tag
 // Pushes need the secret FCM_KEY = the Firebase service account JSON (optional).
 const DAYS = 30;
 const MAX_BODY = 1 << 20;
@@ -19,13 +20,16 @@ export default {
     await env.DB.batch([
       env.DB.prepare("CREATE TABLE IF NOT EXISTS box (seq INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, body BLOB NOT NULL, UNIQUE (topic, id))"),
       env.DB.prepare("CREATE INDEX IF NOT EXISTS box_ts ON box (ts)"),
-      env.DB.prepare("CREATE TABLE IF NOT EXISTS push (topic TEXT NOT NULL, token TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (topic, token))"),
+      env.DB.prepare("CREATE TABLE IF NOT EXISTS push (topic TEXT NOT NULL, token TEXT NOT NULL, ts INTEGER NOT NULL, device TEXT, PRIMARY KEY (topic, token))"),
     ]);
     const now = Date.now();
     if (kind === "push" && req.method === "POST" && !id) {
       const token = (await req.text()).trim();
       if (!token || token.length > 4096) return new Response("bad token", { status: 400 });
-      await env.DB.prepare("INSERT OR REPLACE INTO push (topic, token, ts) VALUES (?, ?, ?)").bind(topic, token, now).run();
+      const device = req.headers.get("x-device") ?? "";
+      // Tables made before x-device existed: add the column once (fails harmlessly afterwards).
+      await env.DB.prepare("ALTER TABLE push ADD COLUMN device TEXT").run().catch(() => {});
+      await env.DB.prepare("INSERT OR REPLACE INTO push (topic, token, ts, device) VALUES (?, ?, ?, ?)").bind(topic, token, now, HEX.test(device) ? device : null).run();
       return new Response("ok");
     }
     if (kind === "box" && req.method === "POST" && HEX.test(id ?? "")) {
@@ -33,7 +37,7 @@ export default {
       if (body.byteLength > MAX_BODY) return new Response("too big", { status: 413 });
       const r = await env.DB.prepare("INSERT OR IGNORE INTO box (topic, id, ts, body) VALUES (?, ?, ?, ?)").bind(topic, id, now, body).run();
       if (r.meta.changes && req.headers.get("x-push") === "1" && env.FCM_KEY)
-        ctx.waitUntil(wake(env, topic, req.headers.get("x-from") ?? "").catch((e) => console.log("push failed", e)));
+        ctx.waitUntil(wake(env, topic, req.headers.get("x-from") ?? "", req.headers.get("x-to") ?? "").catch((e) => console.log("push failed", e)));
       if (Math.random() < 0.02)
         await env.DB.batch([
           env.DB.prepare("DELETE FROM box WHERE ts < ?").bind(now - DAYS * 86400000),
@@ -51,9 +55,12 @@ export default {
   },
 };
 
-/** Sends a data-only FCM message ("something new", no content) to every phone of the topic but the sender. */
-async function wake(env, topic, from) {
-  const { results } = await env.DB.prepare("SELECT token FROM push WHERE topic = ? AND token != ?").bind(topic, from).all();
+/** Sends a data-only FCM message ("something new", no content) to every phone of the topic but the sender,
+ *  or only to the `to` device (1:1 chat); phones registered without a tag still get every push. */
+async function wake(env, topic, from, to) {
+  const { results } = HEX.test(to)
+    ? await env.DB.prepare("SELECT token FROM push WHERE topic = ? AND token != ? AND (device IS NULL OR device = ?)").bind(topic, from, to).all()
+    : await env.DB.prepare("SELECT token FROM push WHERE topic = ? AND token != ?").bind(topic, from).all();
   if (!results.length) return;
   const key = JSON.parse(env.FCM_KEY);
   const auth = await accessToken(key);

@@ -315,6 +315,13 @@ impl Mailbox {
             .to_hex()
             .to_string()
     }
+
+    /// A device's tag in the push list: opaque to the mailbox, other spaces' tags differ.
+    fn device_tag(space_id: &[u8], device: &[u8; 32]) -> String {
+        Hash::new([b"mycel-push".as_slice(), space_id, device].concat())
+            .to_hex()
+            .to_string()
+    }
 }
 
 impl Node {
@@ -700,7 +707,7 @@ impl Node {
             st.store_env(&env)?;
             (env, st.store.peers()?)
         };
-        self.post_box(&env, false);
+        self.post_box(&env, false, None);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(())
     }
@@ -1200,7 +1207,7 @@ impl Node {
                 .unwrap()
                 .insert(*chat, (ev.lamport, Instant::now()));
         }
-        self.post_box(&env, push);
+        self.post_box(&env, push, *chat);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(ev)
     }
@@ -1361,8 +1368,8 @@ impl Node {
     }
 
     /// Puts a new envelope into the mailbox in the background; peers online get it directly anyway.
-    /// `push`: the mailbox wakes the other phones of the space.
-    fn post_box(&self, env: &Envelope, push: bool) {
+    /// `push`: the mailbox wakes the other phones of the space, only the partner's for a 1:1 chat.
+    fn post_box(&self, env: &Envelope, push: bool, chat: Chat) {
         let Some(b) = &self.mailbox else { return };
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
@@ -1375,12 +1382,14 @@ impl Node {
         );
         let http = b.http.clone();
         let from = self.push_token.lock().unwrap().clone().unwrap_or_default();
+        let to = chat.map_or_else(String::new, |p| Mailbox::device_tag(&env.space_id, &p));
         tokio::spawn(async move {
             for wait in [2, 10, 60, 0] {
                 match http
                     .post(&url)
                     .header("x-push", if push { "1" } else { "0" })
                     .header("x-from", &from)
+                    .header("x-to", &to)
                     .body(body.clone())
                     .send()
                     .await
@@ -1405,7 +1414,7 @@ impl Node {
         let Some(b) = &self.mailbox else {
             return Ok(());
         };
-        let (topic, mut seq) = {
+        let (topic, mut seq, tag) = {
             let st = self.st.lock().unwrap();
             if !st.in_space()? {
                 return Ok(());
@@ -1415,7 +1424,12 @@ impl Node {
                 .meta("box_seq")?
                 .and_then(|v| v.try_into().ok())
                 .map_or(0, u64::from_le_bytes);
-            (Mailbox::topic(&st.group()?[..16]), seq)
+            let space = &st.group()?[..16];
+            (
+                Mailbox::topic(space),
+                seq,
+                Mailbox::device_tag(space, &self.device_id()),
+            )
         };
         let token = self.push_token.lock().unwrap().clone();
         if let Some(t) = token
@@ -1425,6 +1439,7 @@ impl Node {
         {
             b.http
                 .post(format!("{}/push/{topic}", b.url))
+                .header("x-device", tag)
                 .body(t)
                 .send()
                 .await?
@@ -1581,7 +1596,7 @@ impl Node {
         if let Some(r) = &req.addr.relay {
             self.learn_relays(&st, std::slice::from_ref(r))?;
         }
-        self.post_box(&env, false);
+        self.post_box(&env, false, None);
         self.broadcast(peers.clone(), SyncMsg::Envs(vec![env]));
         self.broadcast(peers, SyncMsg::Peers(vec![req.addr]));
         Ok(postcard::to_allocvec(&JoinResp {
