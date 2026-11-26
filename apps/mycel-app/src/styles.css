@@ -53,6 +53,11 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
+/* No page zoom and no sideways pan (Android WebView): nothing may be wider than the screen,
+   and pinch/horizontal gestures are not claimed by the page (mic button sets its own touch-action). */
+html, body, #root { max-width: 100%; overflow-x: hidden; }
+html, body { touch-action: pan-y; overscroll-behavior: none; }
+input, textarea, select { min-width: 0; max-width: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
@@ -67,6 +72,7 @@ h2 { font-size: 18px; margin: 0; font-weight: 600; }
 h3 { font-size: 13px; margin: 20px 0 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
+.muted.typing { color: var(--accent); }
 .mono, code { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
 .error { color: var(--danger); font-size: 14px; margin: 4px 0; white-space: pre-line; }
 .ok { color: #2e9d57; white-space: nowrap; }
@@ -101,7 +107,7 @@ input, textarea {
 .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 
 /* Layout: ≥900px three columns, narrower a stack of screens */
-.app { height: 100%; display: grid; grid-template-columns: 76px 340px 1fr; }
+.app { height: 100%; display: grid; grid-template-columns: 76px 340px minmax(0, 1fr); }
 .rail {
   background: var(--rail); display: flex; flex-direction: column; align-items: center;
   gap: 4px; padding: 14px 0; border-right: 1px solid var(--line);
@@ -113,7 +119,7 @@ input, textarea {
 }
 .nav.active { color: var(--accent); background: var(--hover); }
 .nav .badge { position: absolute; top: 2px; right: 8px; }
-.panel { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.panel { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .bar {
   display: flex; align-items: center; gap: 10px; min-height: 60px; padding: 8px 16px;
   border-bottom: 1px solid var(--line); background: var(--panel);
@@ -160,33 +166,42 @@ input, textarea {
 .chat { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--chat-bg); }
 .chat .back { display: none; }
 .msgs-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
-.msgs { flex: 1; overflow-y: auto; padding: 8px 0 12px; display: flex; flex-direction: column; gap: 2px; }
+.msgs { flex: 1; overflow: hidden auto; padding: 8px 0 12px; display: flex; flex-direction: column; gap: 2px; }
 .msgs .empty { margin: auto; }
 .day { position: sticky; top: 6px; z-index: 2; align-self: center; margin: 10px 0 6px; pointer-events: none; }
 .day span { display: inline-block; font-size: 13px; padding: 3px 10px; border-radius: 12px; background: rgb(0 0 0 / 28%); color: #fff; }
-.msg { display: flex; align-items: flex-end; gap: 8px; padding: 0 20px 0 10px; transition: background .15s; }
+.msg {
+  position: relative; display: flex; align-items: flex-end; gap: 8px; padding: 0 12px;
+  transition: background .15s, transform .15s; touch-action: pan-y;
+}
+/* Sits left of the row, so it slides into view with the swipe. */
+.swipe-reply { position: absolute; right: 100%; align-self: center; display: flex; color: var(--accent); }
 .msg:not(.cont) { margin-top: 6px; }
 .msg.mine { justify-content: flex-end; }
 .msg.sel { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 .msg .avatar { width: 34px; height: 34px; font-size: 13px; }
 .av-gap { flex: none; width: 34px; }
+/* Out of the flow, on the side the bubble leaves free: no gutter while nothing is selected. */
 .pick {
-  flex: none; align-self: center; width: 22px; height: 22px; padding: 0; border-radius: 50%;
-  border: 2px solid var(--muted); background: var(--panel); color: var(--accent-ink); opacity: 0;
+  position: absolute; right: 12px; top: calc(50% - 11px); width: 22px; height: 22px; padding: 0; border-radius: 50%;
+  border: 2px solid var(--muted); background: var(--panel); color: var(--accent-ink); opacity: 0; pointer-events: none;
 }
-.msg:hover .pick, .selecting .pick { opacity: 1; }
+.selecting .pick, .pick:focus-visible { opacity: 1; pointer-events: auto; }
+@media (hover: hover) { .msg:hover .pick { opacity: 1; pointer-events: auto; } }
 .msg.sel .pick { background: var(--accent); border-color: var(--accent); }
-.msg.mine .pick { margin-right: auto; }
+.msg.mine .pick { right: auto; left: 12px; }
 .selecting .msg { cursor: pointer; user-select: none; }
 .bubble {
-  position: relative; max-width: min(560px, 78%); padding: 6px 10px 5px; border-radius: 14px;
+  position: relative; max-width: min(560px, 80%); padding: 6px 10px 5px 12px; border-radius: 18px;
   background: var(--theirs); box-shadow: var(--shadow); animation: pop .18s ease-out;
+  /* flow-root keeps the floated time inside the bubble when it wraps to its own line. */
+  display: flow-root; min-width: 0; overflow-wrap: anywhere;
 }
 .msg.mine .bubble { background: var(--mine); }
-.msg.cont:not(.mine) .bubble { border-top-left-radius: 5px; }
-.msg:not(.tail):not(.mine) .bubble { border-bottom-left-radius: 5px; }
-.msg.mine.cont .bubble { border-top-right-radius: 5px; }
-.msg.mine:not(.tail) .bubble { border-bottom-right-radius: 5px; }
+.msg.cont:not(.mine) .bubble { border-top-left-radius: 6px; }
+.msg:not(.tail):not(.mine) .bubble { border-bottom-left-radius: 6px; }
+.msg.mine.cont .bubble { border-top-right-radius: 6px; }
+.msg.mine:not(.tail) .bubble { border-bottom-right-radius: 6px; }
 /* Tail: a concave corner hanging off the last bubble of a group. */
 .msg.tail .bubble::after {
   content: ""; position: absolute; bottom: 0; width: 10px; height: 16px; background: inherit;
@@ -204,12 +219,15 @@ input, textarea {
 }
 .quote b { display: block; color: var(--accent); }
 .quote span { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-width: 420px; }
-.text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.text { white-space: pre-wrap; }
 .meta {
   float: right; display: inline-flex; align-items: center; gap: 3px; margin: 6px 0 -2px 10px;
   font-size: 11px; color: var(--muted); user-select: none;
 }
 .msg.mine .meta { color: color-mix(in srgb, var(--text) 55%, transparent); }
+.media + .meta { margin-top: 0; }
+/* The voice row is taller than its time and rate: the message time tucks in under them. */
+.media:has(.voice) + .meta { margin-top: -8px; }
 .down {
   position: absolute; right: 18px; bottom: 14px; width: 44px; height: 44px; padding: 0; border-radius: 50%;
   background: var(--panel); box-shadow: 0 2px 10px rgb(0 0 0 / 18%); z-index: 4; color: var(--muted);
@@ -262,7 +280,7 @@ button.del { color: var(--danger); }
 .composer .send:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
 
 @media (max-width: 899px) {
-  .app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
   .rail {
     grid-row: 2; flex-direction: row; justify-content: space-around; padding: 4px 0;
     border-right: 0; border-top: 1px solid var(--line);
@@ -285,8 +303,12 @@ button.del { color: var(--danger); }
   .row { padding: 14px 16px; }
   .nav { min-height: 56px; }
   .composer { gap: 2px; padding: 8px; }
-  .msgs { padding: 12px; }
-  .bubble { max-width: 85%; }
+  /* iOS zooms the page on focus when a field is under 16px; keep it that way off the phone too. */
+  input, textarea, select { font-size: 16px; }
+}
+/* A long press opens the menu (it has Copy), not the text selection. */
+@media (pointer: coarse) {
+  .msg { user-select: none; -webkit-touch-callout: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -294,7 +316,7 @@ button.del { color: var(--danger); }
 }
 
 /* Media (§8.2) */
-.media { margin: 2px 0 4px; max-width: 360px; }
+.media { margin: 2px 0; max-width: 360px; }
 .photo { position: relative; width: 320px; max-width: 100%; border-radius: 10px; overflow: hidden; background: var(--hover); }
 .photo img { display: block; width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
 .photo img.blur { filter: blur(6px); transform: scale(1.1); cursor: default; }
@@ -308,9 +330,9 @@ button.del { color: var(--danger); }
 .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 button.link { border: 0; background: none; padding: 0; color: var(--accent); gap: 4px; font-size: 13px; }
 button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
-.voice { display: flex; align-items: center; gap: 8px; min-width: 260px; }
-.voice .play { background: var(--accent); color: var(--accent-ink); border-radius: 50%; width: 36px; height: 36px; padding: 0; }
-.wave { flex: 1; height: 28px; display: flex; align-items: center; gap: 1px; cursor: pointer; }
+.voice { display: flex; align-items: center; gap: 8px; width: 280px; max-width: 100%; }
+.voice .play { flex: none; background: var(--accent); color: var(--accent-ink); border-radius: 50%; width: 36px; height: 36px; padding: 0; }
+.wave { flex: 1; min-width: 0; height: 28px; display: flex; align-items: center; gap: 1px; cursor: pointer; }
 .wave i { flex: 1; background: var(--muted); opacity: .45; border-radius: 1px; min-height: 2px; }
 .wave i.done { background: var(--accent); opacity: 1; }
 .rate { min-width: 28px; }
@@ -321,16 +343,18 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / 88%); display: grid; place-items: center; z-index: 50; cursor: zoom-out; }
 .viewer img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
-.recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
+.recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-variant-numeric: tabular-nums; }
 .recording.cancel { color: var(--danger); }
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
-.icon.mic { touch-action: none; }
-.icon.mic { transition: transform .15s; }
-.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transform: scale(1.5); animation: pulse 1.2s infinite; }
-@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgb(196 69 47 / 55%); } 100% { box-shadow: 0 0 0 16px rgb(196 69 47 / 0%); } }
-.recording { font-variant-numeric: tabular-nums; }
 .recording .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Hold-to-record mic: 2x while live (inline transform carries the slide), halo follows loudness */
+.icon.mic { position: relative; touch-action: none; transition: transform .2s; }
+.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transition: none; }
+.icon.mic .halo { display: none; position: absolute; inset: 0; border-radius: 50%; background: rgb(196 69 47 / 35%); z-index: -1; pointer-events: none; }
+.icon.mic.live .halo { display: block; }
+.lock-tip { position: absolute; right: 12px; bottom: 92px; width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--panel); border: 1px solid var(--line); color: var(--muted); pointer-events: none; }
 
 /* Calls (§9) */
 .call-line { align-self: center; display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted);

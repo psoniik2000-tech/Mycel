@@ -402,6 +402,16 @@ struct CallSignal {
     ts: u64,
 }
 
+/// `typing` event for the UI: someone is typing (`voice`: recording) in `chat`.
+#[derive(Serialize, Clone)]
+struct TypingSignal {
+    chat: String,
+    author: String,
+    voice: bool,
+    /// Their message arrived: the indicator goes out at once.
+    done: bool,
+}
+
 #[derive(Serialize, Clone)]
 struct Media {
     /// file | photo | video | voice | videonote
@@ -891,6 +901,20 @@ async fn unlock(
         #[cfg(not(target_os = "android"))]
         _relay: relay,
     });
+    let (mut typing, app2) = (node.typing_events(), app.clone());
+    tauri::async_runtime::spawn(async move {
+        while let Some(t) = typing.recv().await {
+            let _ = app2.emit(
+                "typing",
+                TypingSignal {
+                    chat: chat_id(&t.chat),
+                    author: short(&t.from),
+                    voice: t.voice,
+                    done: false,
+                },
+            );
+        }
+    });
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
             // Another space was opened since: its own loop reports.
@@ -923,6 +947,17 @@ async fn unlock(
                     },
                 );
                 continue;
+            }
+            if matches!(ev.body, EventBody::Text { .. } | EventBody::Media { .. }) {
+                let _ = app.emit(
+                    "typing",
+                    TypingSignal {
+                        chat: chat_id(&chat),
+                        author: short(&ev.author_device),
+                        voice: false,
+                        done: true,
+                    },
+                );
             }
             // The UI reloads on `message` / `changed` (payload: the chat); receipts only move the ticks.
             let _ = match &ev.body {
@@ -1455,6 +1490,13 @@ async fn call_reject(st: State<'_, App>, id: String) -> R<()> {
         .map_err(err)
 }
 
+/// The user is typing (`voice`: recording) in `chat`; the core throttles to once per 3 s.
+#[tauri::command]
+async fn typing(st: State<'_, App>, chat: String, voice: bool) -> R<()> {
+    let n = &st.node()?;
+    n.typing(&chat_of(n, &chat)?, voice).map_err(err)
+}
+
 #[tauri::command]
 async fn call_end(st: State<'_, App>) -> R<()> {
     st.node()?.call_end().map(|_| ()).map_err(err)
@@ -1733,6 +1775,7 @@ pub fn run() {
             call_end,
             call_send,
             call_listen,
+            typing,
             call_stats,
             members,
             peers,

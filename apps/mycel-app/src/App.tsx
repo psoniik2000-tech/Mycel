@@ -7,7 +7,7 @@ import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
+  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -97,6 +97,27 @@ async function tryAutoAnchor(id: string) {
 // The open space.
 let spaceId = "";
 // Unsent text per space and chat, kept on this device (storage may be unavailable).
+// Who is typing, per chat: an entry lives 5 s after the last signal, or until their message.
+type TypingSignal = { chat: string; author: string; voice: boolean; done: boolean };
+type Typer = { author: string; voice: boolean; at: number };
+const [typers, setTypers] = createSignal<Record<string, Typer[]>>({});
+const dropTyper = (chat: string, keep: (t: Typer) => boolean) =>
+  setTypers((all) => ({ ...all, [chat]: (all[chat] ?? []).filter(keep) }));
+const onTyping = (s: TypingSignal) => {
+  const at = Date.now();
+  dropTyper(s.chat, (t) => t.author !== s.author);
+  if (s.done) return;
+  setTypers((all) => ({ ...all, [s.chat]: [...(all[s.chat] ?? []), { author: s.author, voice: s.voice, at }] }));
+  setTimeout(() => dropTyper(s.chat, (t) => t.at !== at), 5000);
+};
+const typingText = (chat: string) => {
+  const t = typers()[chat] ?? [];
+  if (!t.length) return "";
+  const verb = (v: boolean, many = false) => (v ? (many ? "записывают голосовое…" : "записывает голосовое…") : many ? "печатают…" : "печатает…");
+  if (chat) return verb(t[0].voice);
+  return `${t.map((x) => nameOf(x.author)).join(", ")} ${verb(t.every((x) => x.voice), t.length > 1)}`;
+};
+
 const [draftsChanged, touchDrafts] = createSignal<void>(undefined, { equals: false });
 const draftKey = (chat: string) => `draft:${spaceId}:${chat}`;
 const getDraft = (key: string) => {
@@ -942,6 +963,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     const un = await listen<string>("message", (e) => onMsg(e.payload));
     const unChanged = await listen<string>("changed", (e) => (onMsg(e.payload), loadMembers()));
     const unCall = await listen<CallSignal>("call", (e) => onCall(e.payload));
+    const unTyping = await listen<TypingSignal>("typing", (e) => onTyping(e.payload));
     const unStatus = await listen<[string, number][]>("status", (e) => {
       const st = new Map(e.payload);
       setMsgs((all) => all.map((m) => (st.has(m.id) && st.get(m.id) !== m.status ? { ...m, status: st.get(m.id)! } : m)));
@@ -969,6 +991,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       un();
       unChanged();
       unCall();
+      unTyping();
       unStatus();
       media && endCall();
       wideQuery.removeEventListener("change", onWide);
@@ -1374,22 +1397,46 @@ function Chat(p: {
     setReply(undefined);
     queueMicrotask(grow);
   };
-  let pressTimer = 0;
+  // Touch: holding opens the menu, sliding right replies.
+  let pressTimer = 0, held = false, touch: { x: number; y: number } | undefined;
+  const [swipe, setSwipe] = createSignal<{ id: string; dx: number }>();
   const press = (e: PointerEvent, m: Msg) => {
-    if (e.pointerType !== "touch") return;
+    if (e.pointerType !== "touch" || sel().length || m.id.startsWith("tmp-")) return;
     const { clientX: x, clientY: y } = e;
-    pressTimer = window.setTimeout(() => setMenu({ m, x, y }), 500);
+    touch = { x, y };
+    held = false;
+    pressTimer = window.setTimeout(() => ((held = true), (touch = undefined), setMenu({ m, x, y })), 500);
   };
-  const unpress = () => clearTimeout(pressTimer);
+  const swipeMove = (e: PointerEvent, m: Msg) => {
+    if (!touch) return;
+    const dx = e.clientX - touch.x;
+    // A resting finger jitters: only a real move cancels the hold.
+    if (!swipe() && Math.hypot(dx, e.clientY - touch.y) < 10) return;
+    clearTimeout(pressTimer);
+    setSwipe({ id: m.id, dx: Math.max(0, Math.min(dx, 80)) });
+  };
+  // pointercancel means the list took the gesture to scroll: no reply then.
+  const unpress = (e: PointerEvent, m: Msg) => {
+    clearTimeout(pressTimer);
+    if (e.type === "pointerup" && (swipe()?.dx ?? 0) >= 60) startReply(m);
+    touch = undefined;
+    setSwipe(undefined);
+  };
   const openMenu = (e: MouseEvent, m: Msg) => {
     e.preventDefault();
     if (!sel().length && !m.id.startsWith("tmp-")) setMenu({ m, x: e.clientX, y: e.clientY });
   };
+  // Double click / double tap = ❤️. Counted by hand: not every WebView sends dblclick for taps.
+  let tap = { id: "", at: 0 };
   const clickMsg = (e: MouseEvent, m: Msg) => {
     if (sel().length || e.shiftKey) {
       e.preventDefault();
-      toggle(m.id);
+      return toggle(m.id);
     }
+    if (m.id.startsWith("tmp-") || (e.target as Element).closest("button, a, img, video, .wave")) return;
+    const double = tap.id === m.id && e.timeStamp - tap.at < 350;
+    tap = { id: double ? "" : m.id, at: e.timeStamp };
+    if (double) act(invoke("react", { id: m.id, emoji: "❤️" }));
   };
   const [err, setErr] = createSignal("");
   const [view, setView] = createSignal("");
@@ -1400,7 +1447,9 @@ function Chat(p: {
   const [video, setVideo] = createSignal(false);
   const [rec, setRec] = createSignal<Recording>();
   const [elapsed, setElapsed] = createSignal(0);
-  const [cancelling, setCancelling] = createSignal(false);
+  const [slide, setSlide] = createSignal(0); // finger moved left while holding, px (≤ 0)
+  const [lift, setLift] = createSignal(0); // finger moved up while holding, px (≥ 0)
+  const [locked, setLocked] = createSignal(false); // recording locked: hands-free, send/cancel by buttons
   const [emo, setEmo] = createSignal<number>(); // open emoji panel: tab index, -1 = recent
   const insertEmoji = (e: string) => {
     const a = input.selectionStart, b = input.selectionEnd, t = text();
@@ -1474,14 +1523,44 @@ function Chat(p: {
   });
 
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
-  let holdTimer = 0, tick = 0, startX = 0, holding = false;
+  // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
+  let holdTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, raf = 0, halo!: HTMLElement;
+  let ctx: AudioContext | undefined;
+  const vib = (ms: number) => navigator.vibrate?.(ms);
+  // The halo behind the mic scales 1.0–1.4 with the microphone's loudness (smoothed).
+  const meter = (stream: MediaStream) => {
+    ctx = new AudioContext();
+    const an = ctx.createAnalyser();
+    an.fftSize = 512;
+    ctx.createMediaStreamSource(stream).connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    let lvl = 0;
+    const frame = () => {
+      an.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (const v of buf) sum += (v - 128) ** 2;
+      lvl += (Math.min(1, Math.sqrt(sum / buf.length) / 128 * 4) - lvl) * 0.25;
+      if (halo) halo.style.transform = `scale(${1 + 0.4 * lvl})`;
+      raf = requestAnimationFrame(frame);
+    };
+    frame();
+  };
   const stopRec = async (send: boolean) => {
     const r = rec();
     clearInterval(tick);
+    cancelAnimationFrame(raf);
+    void ctx?.close();
+    ctx = undefined;
     setRec(undefined);
-    setCancelling(false);
+    setSlide(0);
+    setLift(0);
+    setLocked(false);
     if (!r) return;
-    if (!send || Date.now() - r.started < 500) return r.cancel();
+    if (!send || Date.now() - r.started < 500) {
+      if (!send) vib(40); // a deliberate cancel buzzes; a too-short press is silently dropped
+      return r.cancel();
+    }
+    vib(15);
     const blob = await r.stop();
     const kind = video() ? "videonote" : "voice";
     const wave = kind === "voice" ? await waveform(blob) : [];
@@ -1490,8 +1569,14 @@ function Chat(p: {
     await queue({ text: kind === "voice" ? "🎤 Голосовое" : "📹 Видеосообщение" }, () => invoke<string>("send_rec", body, { headers }));
   };
   const down = (e: PointerEvent) => {
+    if (locked()) {
+      // Locked: the big button is Send.
+      void stopRec(true);
+      return;
+    }
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     startX = e.clientX;
+    startY = e.clientY;
     holding = true;
     holdTimer = window.setTimeout(async () => {
       try {
@@ -1499,23 +1584,48 @@ function Chat(p: {
         if (!holding) return r.cancel();
         setRec(r);
         setElapsed(0);
+        vib(15);
         if (video()) preview.srcObject = r.stream;
+        meter(r.stream);
         tick = window.setInterval(() => {
           setElapsed(Date.now() - r.started);
+          if (!video()) invoke("typing", { chat: p.chat, voice: true }).catch(() => {});
           if (video() && Date.now() - r.started >= 60_000) stopRec(true);
-        }, 200);
+        }, 100);
       } catch (e) {
         setErr("Нет доступа к микрофону или камере: " + errText(e));
       }
     }, 300);
   };
   const up = () => {
+    if (!holding) return; // already cancelled or locked while sliding
     holding = false;
     clearTimeout(holdTimer);
-    if (rec()) stopRec(!cancelling());
+    if (rec()) stopRec(true);
     else setVideo(!video());
   };
-  const move = (e: PointerEvent) => rec() && setCancelling(Math.abs(startX - e.clientX) > 80);
+  const abort = () => {
+    holding = false;
+    clearTimeout(holdTimer);
+    if (rec() && !locked()) stopRec(false);
+  };
+  const move = (e: PointerEvent) => {
+    if (!holding || !rec()) return;
+    const dx = Math.min(0, e.clientX - startX), dy = Math.max(0, startY - e.clientY);
+    if (dy > 80) {
+      holding = false; // from now on the release is ignored
+      setLocked(true);
+      setSlide(0);
+      setLift(0);
+      vib(15);
+    } else if (dx < -120) {
+      holding = false;
+      stopRec(false);
+    } else {
+      setSlide(dx);
+      setLift(Math.min(dy, 80));
+    }
+  };
   let list!: HTMLDivElement;
   let input!: HTMLTextAreaElement;
   // Stay at the bottom if already there (or on own send); otherwise count what came for the ↓ button.
@@ -1531,6 +1641,10 @@ function Chat(p: {
     queueMicrotask(() => (stick ? toBottom(false) : setFresh((n) => n + added)));
   });
   const onScroll = () => {
+    // Date pills all stick to the same spot: hide each one the next has reached.
+    const days = list.querySelectorAll<HTMLElement>(".day");
+    days.forEach((d, i) =>
+      (d.style.visibility = i + 1 < days.length && days[i + 1].offsetTop - d.offsetTop < d.offsetHeight ? "hidden" : ""));
     setAtBottom(near());
     if (near()) setFresh(0);
   };
@@ -1565,7 +1679,9 @@ function Chat(p: {
         {p.chat ? <Avatar id={p.chat} dot /> : <div class="avatar group small-av"><Hash size={18} /></div>}
         <div class="grow ellipsis">
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
-          <div class="muted small">{p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`}</div>
+          <div class="muted small" classList={{ typing: !!typingText(p.chat) }}>
+            {typingText(p.chat) || (p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`)}
+          </div>
         </div>
         <NetDot n={p.peers} />
         <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
@@ -1628,14 +1744,20 @@ function Chat(p: {
                   ) : (
                     <div class="msg" data-id={m.id}
                       classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id }}
-                      onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => e.shiftKey && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
-                      onPointerDown={(e) => press(e, m)} onPointerUp={unpress} onPointerCancel={unpress} onPointerMove={unpress}>
+                      onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
+                      onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
+                      // Lifting the finger after a hold must not click the menu's backdrop and close it.
+                      onTouchEnd={(e) => held && e.preventDefault()}
+                      style={swipe()?.id === m.id ? { transform: `translateX(${swipe()!.dx}px)`, transition: "none" } : {}}>
+                      <Show when={swipe()?.id === m.id}>
+                        <span class="swipe-reply" style={{ opacity: Math.min(1, swipe()!.dx / 60) }}><Reply size={18} /></span>
+                      </Show>
                       <button class="pick" title="Выделить" onClick={(e) => (e.stopPropagation(), toggle(m.id))}>
                         <Show when={sel().includes(m.id)}><Check size={14} /></Show>
                       </button>
-                      <Show when={!m.mine}>
+                      <Show when={!m.mine && !p.chat}>
                         <Show when={!same(m, next())} fallback={<div class="av-gap" />}>
-                          <Avatar id={m.author} onClick={p.chat ? undefined : () => p.openChat(m.author)} />
+                          <Avatar id={m.author} onClick={() => p.openChat(m.author)} />
                         </Show>
                       </Show>
                       <div class="bubble">
@@ -1801,14 +1923,26 @@ function Chat(p: {
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
         <Show when={rec()}>
-          <div class="recording grow" classList={{ cancel: cancelling() }}>
-            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")}
-            <span class="muted small grow">{cancelling() ? "Отпустите — отмена" : "Отпустите, чтобы отправить · уведите в сторону — отмена"}</span>
-            <X size={18} />
+          <div class="recording grow" classList={{ cancel: slide() < -60 }}>
+            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")},{Math.floor(elapsed() / 100) % 10}
+            <Show when={locked()} fallback={
+              <span class="muted small grow" style={{ opacity: 1 - Math.min(1, -slide() / 120) }}>‹ Влево — отмена</span>
+            }>
+              <span class="grow" />
+              <button class="link" onClick={() => stopRec(false)}>Отмена</button>
+            </Show>
           </div>
         </Show>
+        <Show when={rec() && !locked()}>
+          <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)`, opacity: 0.3 + 0.7 * (lift() / 80) }}><LockIcon size={18} /></div>
+        </Show>
         <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()} style={{ display: rec() ? "none" : undefined }}
-          onInput={(e) => { setText(e.currentTarget.value); grow(); }}
+          onInput={(e) => {
+            setText(e.currentTarget.value);
+            grow();
+            // The core sends at most once per 3 s.
+            if (text().trim() && !editing()) invoke("typing", { chat: p.chat, voice: false }).catch(() => {});
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
               e.preventDefault();
@@ -1836,9 +1970,12 @@ function Chat(p: {
           </div>
         </Show>
         <Show when={text().trim() || editing()} fallback={
-          <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
+          <button class="icon mic" classList={{ live: !!rec() }}
+            style={rec() ? { transform: `translateX(${slide()}px) scale(2)` } : undefined}
+            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
-            {video() ? <Video size={20} /> : <Mic size={20} />}
+            <i class="halo" ref={halo} />
+            {locked() ? <Send size={20} /> : video() ? <Video size={20} /> : <Mic size={20} />}
           </button>
         }>
           <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>

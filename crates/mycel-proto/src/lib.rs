@@ -31,6 +31,11 @@ pub enum SyncMsg {
     },
     /// Member addresses, each signed by its owner (§6.2 peer exchange).
     Peers(Vec<SignedAddr>),
+    /// "Typing…" / "recording a voice message…" in a group's chat: ephemeral, never stored.
+    Typing {
+        group_id: [u8; 32],
+        voice: bool,
+    },
 }
 
 /// A node's address (EndpointTicket string), signed by the node key over (ticket, relay, ts_ms).

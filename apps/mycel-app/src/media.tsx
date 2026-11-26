@@ -139,7 +139,7 @@ function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean }) {
       <button class="icon play" disabled={!p.ready} onClick={toggle}>{playing() ? <Pause size={18} /> : <Play size={18} />}</button>
       <div class="wave" onClick={seek}>
         <For each={bars()}>
-          {(v, i) => <i style={{ height: `${10 + (v / 255) * 90}%` }} classList={{ done: (i() + 0.5) / 64 <= pos() / Math.max(1, p.ms) }} />}
+          {(v, i) => <i style={{ height: `${10 + (v / 255) * 90}%` }} classList={{ done: (i() + 0.5) / bars().length <= pos() / Math.max(1, p.ms) }} />}
         </For>
       </div>
       <span class="muted small">{clock(playing() || pos() ? pos() : p.ms)}</span>
