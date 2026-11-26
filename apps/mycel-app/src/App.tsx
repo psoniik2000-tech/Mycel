@@ -97,6 +97,27 @@ async function tryAutoAnchor(id: string) {
 // The open space.
 let spaceId = "";
 // Unsent text per space and chat, kept on this device (storage may be unavailable).
+// Who is typing, per chat: an entry lives 5 s after the last signal, or until their message.
+type TypingSignal = { chat: string; author: string; voice: boolean; done: boolean };
+type Typer = { author: string; voice: boolean; at: number };
+const [typers, setTypers] = createSignal<Record<string, Typer[]>>({});
+const dropTyper = (chat: string, keep: (t: Typer) => boolean) =>
+  setTypers((all) => ({ ...all, [chat]: (all[chat] ?? []).filter(keep) }));
+const onTyping = (s: TypingSignal) => {
+  const at = Date.now();
+  dropTyper(s.chat, (t) => t.author !== s.author);
+  if (s.done) return;
+  setTypers((all) => ({ ...all, [s.chat]: [...(all[s.chat] ?? []), { author: s.author, voice: s.voice, at }] }));
+  setTimeout(() => dropTyper(s.chat, (t) => t.at !== at), 5000);
+};
+const typingText = (chat: string) => {
+  const t = typers()[chat] ?? [];
+  if (!t.length) return "";
+  const verb = (v: boolean, many = false) => (v ? (many ? "записывают голосовое…" : "записывает голосовое…") : many ? "печатают…" : "печатает…");
+  if (chat) return verb(t[0].voice);
+  return `${t.map((x) => nameOf(x.author)).join(", ")} ${verb(t.every((x) => x.voice), t.length > 1)}`;
+};
+
 const [draftsChanged, touchDrafts] = createSignal<void>(undefined, { equals: false });
 const draftKey = (chat: string) => `draft:${spaceId}:${chat}`;
 const getDraft = (key: string) => {
@@ -942,6 +963,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     const un = await listen<string>("message", (e) => onMsg(e.payload));
     const unChanged = await listen<string>("changed", (e) => (onMsg(e.payload), loadMembers()));
     const unCall = await listen<CallSignal>("call", (e) => onCall(e.payload));
+    const unTyping = await listen<TypingSignal>("typing", (e) => onTyping(e.payload));
     const unStatus = await listen<[string, number][]>("status", (e) => {
       const st = new Map(e.payload);
       setMsgs((all) => all.map((m) => (st.has(m.id) && st.get(m.id) !== m.status ? { ...m, status: st.get(m.id)! } : m)));
@@ -969,6 +991,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       un();
       unChanged();
       unCall();
+      unTyping();
       unStatus();
       media && endCall();
       wideQuery.removeEventListener("change", onWide);
@@ -1502,6 +1525,7 @@ function Chat(p: {
         if (video()) preview.srcObject = r.stream;
         tick = window.setInterval(() => {
           setElapsed(Date.now() - r.started);
+          if (!video()) invoke("typing", { chat: p.chat, voice: true }).catch(() => {});
           if (video() && Date.now() - r.started >= 60_000) stopRec(true);
         }, 200);
       } catch (e) {
@@ -1565,7 +1589,9 @@ function Chat(p: {
         {p.chat ? <Avatar id={p.chat} dot /> : <div class="avatar group small-av"><Hash size={18} /></div>}
         <div class="grow ellipsis">
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
-          <div class="muted small">{p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`}</div>
+          <div class="muted small" classList={{ typing: !!typingText(p.chat) }}>
+            {typingText(p.chat) || (p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`)}
+          </div>
         </div>
         <NetDot n={p.peers} />
         <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
@@ -1808,7 +1834,12 @@ function Chat(p: {
           </div>
         </Show>
         <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()} style={{ display: rec() ? "none" : undefined }}
-          onInput={(e) => { setText(e.currentTarget.value); grow(); }}
+          onInput={(e) => {
+            setText(e.currentTarget.value);
+            grow();
+            // The core sends at most once per 3 s.
+            if (text().trim() && !editing()) invoke("typing", { chat: p.chat, voice: false }).catch(() => {});
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
               e.preventDefault();

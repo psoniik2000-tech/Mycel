@@ -349,6 +349,18 @@ pub struct Node {
     push_registered: std::sync::atomic::AtomicBool,
     /// Per chat: (lamport, send time) of the newest own message nobody has confirmed yet.
     unacked: Mutex<HashMap<Chat, (u64, Instant)>>,
+    /// Where incoming typing signals go (`typing_events`).
+    typing_tx: Mutex<Option<mpsc::Sender<Typing>>>,
+    /// Per chat: when we last sent a typing signal and whether it was voice.
+    typing_sent: Mutex<HashMap<Chat, (Instant, bool)>>,
+}
+
+/// A member is typing (or recording a voice message, `voice`) in a chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Typing {
+    pub chat: Chat,
+    pub from: [u8; 32],
+    pub voice: bool,
 }
 
 /// Store-and-forward when no member is online: every new envelope is also posted to an HTTP
@@ -456,6 +468,8 @@ impl Node {
             push_token: Mutex::new(None),
             push_registered: Default::default(),
             unacked: Default::default(),
+            typing_tx: Default::default(),
+            typing_sent: Default::default(),
         });
         let (tx, rx) = mpsc::channel(256);
         let n = node.clone();
@@ -1689,6 +1703,43 @@ impl Node {
         Ok(())
     }
 
+    /// Tells the chat's online peers we are typing (`voice`: recording); at most once per 3 s.
+    /// Ephemeral (§7.4): over the peer connections only, not stored, not mailed, no push.
+    pub fn typing(&self, chat: &Chat, voice: bool) -> Result<()> {
+        {
+            let mut sent = self.typing_sent.lock().unwrap();
+            if sent
+                .get(chat)
+                .is_some_and(|(t, v)| *v == voice && t.elapsed().as_secs() < 3)
+            {
+                return Ok(());
+            }
+            sent.insert(*chat, (Instant::now(), voice));
+        }
+        let (group_id, peers) = {
+            let st = self.st.lock().unwrap();
+            let g = st.gid(chat)?;
+            (g, st.peers_of(&g)?)
+        };
+        let msg = SyncMsg::Typing { group_id, voice };
+        for addr in peers.iter().filter_map(|p| peer_addr(p)) {
+            if addr.id == self.net.id() {
+                continue;
+            }
+            let (net, msg) = (self.net.clone(), msg.clone());
+            // One try, no retries: a late "typing" is worse than none.
+            tokio::spawn(async move { net.send(addr, &msg).await });
+        }
+        Ok(())
+    }
+
+    /// Incoming typing signals go to the returned receiver (replacing an older one).
+    pub fn typing_events(&self) -> mpsc::Receiver<Typing> {
+        let (tx, rx) = mpsc::channel(64);
+        *self.typing_tx.lock().unwrap() = Some(tx);
+        rx
+    }
+
     /// Send to each peer in the background, retrying a few times: sync runs only at start,
     /// so a message dropped by a flaky link (VPN, relay, network switch) would stay lost.
     fn broadcast(&self, peers: Vec<Vec<u8>>, msg: SyncMsg) {
@@ -1755,6 +1806,17 @@ impl Node {
                 }
             }
             SyncMsg::Peers(list) => self.add_peers(&st, &list)?,
+            SyncMsg::Typing { group_id, voice } => {
+                ensure!(st.audience()?(&group_id, &who), "not in this chat");
+                let chat = st.chat_of(&group_id)?.context("unknown chat")?;
+                if let Some(tx) = &*self.typing_tx.lock().unwrap() {
+                    let _ = tx.try_send(Typing {
+                        chat,
+                        from: who,
+                        voice,
+                    });
+                }
+            }
         }
         Ok(out)
     }
