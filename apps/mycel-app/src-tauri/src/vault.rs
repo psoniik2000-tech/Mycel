@@ -56,6 +56,16 @@ mod imp {
     }
 
     fn vault(method: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+        with_class("org.mycel.app.Vault", |env, class, _| {
+            call(env, class, method, data)
+        })
+    }
+
+    /// Runs `f` with an app class and the app's context on any native thread (also `Push`, lib.rs).
+    pub fn with_class<T>(
+        name: &str,
+        f: impl FnOnce(&mut JNIEnv, &JClass, &JObject) -> jni::errors::Result<T>,
+    ) -> Result<T, String> {
         let cx = ndk_context::android_context();
         // SAFETY: tauri initialises ndk_context with the live VM and activity before any command runs.
         let vm = unsafe { jni::JavaVM::from_raw(cx.vm().cast()) }.map_err(|e| e.to_string())?;
@@ -67,7 +77,7 @@ mod imp {
             let loader = env
                 .call_method(&ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
                 .l()?;
-            let name = env.new_string("org.mycel.app.Vault")?;
+            let name = env.new_string(name)?;
             let class: JClass = env
                 .call_method(
                     &loader,
@@ -77,7 +87,7 @@ mod imp {
                 )?
                 .l()?
                 .into();
-            call(&mut env, &class, method, data)
+            f(&mut env, &class, &ctx)
         })();
         // A pending Java exception would crash the next JNI call.
         if res.is_err() {
@@ -115,6 +125,6 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "android")]
-pub use imp::load_in;
 pub use imp::{forget, load, save};
+#[cfg(target_os = "android")]
+pub use imp::{load_in, with_class};

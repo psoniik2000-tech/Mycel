@@ -95,10 +95,37 @@ fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
     Some((who, text))
 }
 
-fn notify(app: &AppHandle, title: String, body: String) {
-    if !app.state::<Visible>().0.load(Ordering::Relaxed) {
+/// `space`, `chat`: Android groups a chat's messages and adds Reply / Read buttons (Push.kt).
+fn notify(app: &AppHandle, space: &str, chat: &str, title: String, body: String) {
+    if app.state::<Visible>().0.load(Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (space, chat);
         let _ = app.notification().builder().title(title).body(body).show();
     }
+    #[cfg(target_os = "android")]
+    let _ = vault::with_class("org.mycel.app.Push", |env, class, ctx| {
+        use jni::objects::{JObject, JValue};
+        let s = [space, chat, &title, &body]
+            .map(|t| env.new_string(t).map(JObject::from))
+            .into_iter()
+            .collect::<jni::errors::Result<Vec<_>>>()?;
+        env.call_static_method(
+            class,
+            "show",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(ctx),
+                JValue::Object(&s[0]),
+                JValue::Object(&s[1]),
+                JValue::Object(&s[2]),
+                JValue::Object(&s[3]),
+            ],
+        )?;
+        Ok(())
+    });
 }
 
 /// Set at startup: `Push.wake` (JNI) has no other way to reach the app.
@@ -122,8 +149,8 @@ extern "C" fn Java_org_mycel_app_Push_wake(
 }
 
 /// A push came and no node lives in this process (Push.kt): opens the last space with its remembered
-/// password, pulls the mailbox (which sends the Delivered receipts) and closes. Returns title, body
-/// pairs of the new messages for Push.kt to show; null → no remembered password or it failed.
+/// password, pulls the mailbox (which sends the Delivered receipts) and closes. Returns space, chat,
+/// title, body of each new message for Push.kt to show; null → no remembered password or it failed.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 extern "system" fn Java_org_mycel_app_Push_pull<'l>(
@@ -135,19 +162,16 @@ extern "system" fn Java_org_mycel_app_Push_pull<'l>(
     let res = (|| {
         let root = PathBuf::from(String::from(env.get_string(&root).ok()?));
         let cache = String::from(env.get_string(&cache).ok()?);
-        if std::env::var_os("TMPDIR").is_none() {
-            // SAFETY: as in `run`: core reads it only once a node is open.
-            unsafe { std::env::set_var("TMPDIR", cache) };
-        }
+        tmpdir(cache);
         let list = spaces::List::load(&root).ok()?;
         let id = list.last.clone()?;
         let pw = vault::load_in(&mut env, &root, &id)?;
         let notes = tauri::async_runtime::block_on(pull(&root, &id, &pw, &list))?;
         let s = env.find_class("java/lang/String").ok()?;
         let arr = env
-            .new_object_array(2 * notes.len() as i32, s, jni::objects::JObject::null())
+            .new_object_array(4 * notes.len() as i32, s, jni::objects::JObject::null())
             .ok()?;
-        for (i, t) in notes.into_iter().flat_map(|(a, b)| [a, b]).enumerate() {
+        for (i, t) in notes.into_iter().flatten().enumerate() {
             let t = env.new_string(t).ok()?;
             env.set_object_array_element(&arr, i as i32, t).ok()?;
         }
@@ -159,30 +183,46 @@ extern "system" fn Java_org_mycel_app_Push_pull<'l>(
     res.unwrap_or(std::ptr::null_mut())
 }
 
-/// `Push_pull`'s node: everything new within ~8 s (FCM gives onMessageReceived about 10);
-/// None if it did not open or ran out of time with nothing.
 #[cfg(target_os = "android")]
-async fn pull(
+fn tmpdir(cache: String) {
+    if std::env::var_os("TMPDIR").is_none() {
+        // SAFETY: as in `run`: core reads it only once a node is open.
+        unsafe { std::env::set_var("TMPDIR", cache) };
+    }
+}
+
+/// A space opened without UI (a push or a notification button with no node in this process).
+#[cfg(target_os = "android")]
+async fn open_bg(
     root: &Path,
     id: &str,
     pw: &str,
     list: &spaces::List,
-) -> Option<Vec<(String, String)>> {
-    use tokio::time::{Duration, Instant, sleep, timeout_at};
-    let end = Instant::now() + Duration::from_secs(8);
+    end: tokio::time::Instant,
+) -> Option<(Arc<Node>, tokio::sync::mpsc::Receiver<Event>)> {
     let opts = Opts {
         n0: list.n0,
         extra_relays: list.relays.clone(),
         mailbox: list.mailbox.clone(),
         ..Default::default()
     };
-    let (node, mut rx) = timeout_at(end, Node::open(&spaces::dir(root, id), pw, &opts))
+    let (node, rx) = tokio::time::timeout_at(end, Node::open(&spaces::dir(root, id), pw, &opts))
         .await
         .ok()?
         .ok()?;
     if let Ok(t) = std::fs::read_to_string(root.join("push_token")) {
         node.set_push_token(t.trim().to_string());
     }
+    Some((node, rx))
+}
+
+/// `Push_pull`'s node: everything new within ~8 s (FCM gives onMessageReceived about 10);
+/// None if it did not open or ran out of time with nothing.
+#[cfg(target_os = "android")]
+async fn pull(root: &Path, id: &str, pw: &str, list: &spaces::List) -> Option<Vec<[String; 4]>> {
+    use tokio::time::{Duration, Instant, sleep, timeout_at};
+    let end = Instant::now() + Duration::from_secs(8);
+    let (node, mut rx) = open_bg(root, id, pw, list, end).await?;
     let mut notes = vec![];
     // Something of a muted chat came: no content-free notice for it either.
     let mut muted = false;
@@ -195,11 +235,11 @@ async fn pull(
             tokio::select! {
                 Some(ev) = rx.recv() => {
                     let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
-                    if let Some(t) = note(&node, &ev, &chat) {
+                    if let Some((title, body)) = note(&node, &ev, &chat) {
                         if list.muted(id, &chat_id(&chat)) {
                             muted = true;
                         } else {
-                            notes.push(t);
+                            notes.push([id.to_string(), chat_id(&chat), title, body]);
                         }
                     }
                 }
@@ -211,6 +251,64 @@ async fn pull(
     .is_ok();
     node.close().await;
     (done || muted || !notes.is_empty()).then_some(notes)
+}
+
+/// A notification's Reply (`text`) or Read (`text` null) button (Push.kt): through the node open in
+/// this process, else the space is opened without UI as in `Push_pull`, given a moment to post, closed.
+/// 0 → it failed.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_mycel_app_Push_act<'l>(
+    mut env: jni::JNIEnv<'l>,
+    _cls: jni::objects::JClass<'l>,
+    root: jni::objects::JString<'l>,
+    cache: jni::objects::JString<'l>,
+    space: jni::objects::JString<'l>,
+    chat: jni::objects::JString<'l>,
+    text: jni::objects::JString<'l>,
+) -> u8 {
+    use tokio::time::{Duration, Instant, sleep, timeout_at};
+    let res = (|| {
+        let mut get = |s: &jni::objects::JString| env.get_string(s).ok().map(String::from);
+        let (root, cache, space, chat) = (get(&root)?, get(&cache)?, get(&space)?, get(&chat)?);
+        let text = if text.is_null() {
+            None
+        } else {
+            Some(get(&text)?)
+        };
+        let act = |n: &Node| {
+            let c = chat_of(n, &chat).ok()?;
+            match &text {
+                Some(t) => n.send_text(&c, t, None).map(|_| ()),
+                None => n.mark_read(&c),
+            }
+            .ok()
+        };
+        // Sending posts to the mailbox with tokio::spawn: run inside the runtime.
+        let live = APP.get().and_then(|a| a.state::<App>().open().ok());
+        if let Some((n, _)) = live.filter(|(_, id)| *id == space) {
+            return tauri::async_runtime::block_on(async { act(&n) });
+        }
+        tmpdir(cache);
+        let root = PathBuf::from(root);
+        let list = spaces::List::load(&root).ok()?;
+        let pw = vault::load_in(&mut env, &root, &space)?;
+        tauri::async_runtime::block_on(async {
+            let end = Instant::now() + Duration::from_secs(15);
+            let (node, _rx) = open_bg(&root, &space, &pw, &list, end).await?;
+            // The newest messages first, so Read covers them.
+            let _ = timeout_at(end, node.sync_now()).await;
+            let r = act(&node);
+            // Peers online get it at once; the mailbox post runs in the background.
+            sleep(Duration::from_secs(3)).await;
+            node.close().await;
+            r
+        })
+    })();
+    if res.is_none() {
+        let _ = env.exception_clear();
+    }
+    res.is_some() as u8
 }
 
 #[derive(Serialize, Clone)]
@@ -388,7 +486,12 @@ fn chat_of(n: &Node, s: &str) -> R<Chat> {
     if s.is_empty() {
         return Ok(None);
     }
-    let m = n.members().into_iter().find(|m| short(m) == s);
+    // Contacts added by link are not space members (§4.2).
+    let mut all = n
+        .members()
+        .into_iter()
+        .chain(n.contacts().unwrap_or_default());
+    let m = all.find(|m| short(m) == s);
     m.map(Some).ok_or_else(|| "no such member".into())
 }
 
@@ -799,7 +902,7 @@ async fn unlock(
             if let Some((who, text)) = note(&node, &ev, &chat)
                 && !spaces::List::load(&root).is_ok_and(|l| l.muted(&space, &chat_id(&chat)))
             {
-                notify(&app, who, text);
+                notify(&app, &space, &chat_id(&chat), who, text);
             }
             if let EventBody::Call { call_id, action } = &ev.body {
                 let (action, video) = match action {

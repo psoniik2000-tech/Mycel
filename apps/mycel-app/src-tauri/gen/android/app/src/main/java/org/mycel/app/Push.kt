@@ -4,10 +4,13 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
+import androidx.core.app.RemoteInput
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.google.firebase.FirebaseApp
@@ -16,6 +19,7 @@ import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import java.io.File
+import kotlin.concurrent.thread
 
 /** Initializes Firebase in every process start (also when a push starts the app). */
 class MycelApp : Application() {
@@ -62,32 +66,93 @@ object Push {
   fun wakeNode() = runCatching { wake() }.getOrDefault(false)
 
   /** lib.rs: opens the last space with its remembered password, pulls, confirms delivery, closes.
-   *  Title, body pairs of the new messages; null = no remembered password (or it failed). */
+   *  Space, chat, title, body of each new message; null = no remembered password (or it failed). */
   @JvmStatic external fun pull(root: String, cache: String): Array<String>?
 
   // false → show the content-free notice.
   fun pullNode(c: Context): Boolean = runCatching {
     System.loadLibrary("mycel_app_lib")
     val m = pull(c.dataDir.path, c.cacheDir.path) ?: return false
-    val id = (System.currentTimeMillis() % 100_000).toInt() * 100 + 1000  // clear of NOTE_ID and the service's 1
-    for (i in m.indices step 2) notifyNew(c, m[i], m[i + 1], id + i / 2)
+    for (i in m.indices step 4) show(c, m[i], m[i + 1], m[i + 2], m[i + 3])
     true
   }.getOrDefault(false)
 
-  fun notifyNew(c: Context, title: String = "Mycel", text: String = "Новое сообщение", id: Int = NOTE_ID) {
+  /** lib.rs: Reply (`text`) or Read (null) in a chat, through the node in this process or a space opened
+   *  without UI; false = failed. */
+  @JvmStatic external fun act(root: String, cache: String, space: String, chat: String, text: String?): Boolean
+
+  private fun channel(c: Context): NotificationManager {
     val nm = c.getSystemService(NotificationManager::class.java)
     if (Build.VERSION.SDK_INT >= 26) {
       nm.createNotificationChannel(NotificationChannel("msg", "Сообщения", NotificationManager.IMPORTANCE_HIGH))
     }
-    val open = PendingIntent.getActivity(
-      c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+    return nm
+  }
+
+  private fun open(c: Context) = PendingIntent.getActivity(
+    c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+
+  fun notifyNew(c: Context) {
+    channel(c).notify(NOTE_ID, NotificationCompat.Builder(c, "msg")
+      .setSmallIcon(R.mipmap.ic_launcher)
+      .setContentTitle("Mycel")
+      .setContentText("Новое сообщение")
+      .setAutoCancel(true)
+      .setContentIntent(open(c))
+      .build())
+  }
+
+  /** One notification per chat (its messages pile up) with Reply and Read; also from lib.rs `notify`. */
+  @JvmStatic fun show(c: Context, space: String, chat: String, title: String, text: String) {
+    val nm = channel(c)
+    val id = ("$space/$chat".hashCode() and 0xFFFFFFF) + 1000  // clear of NOTE_ID and the service's 1
+    val style = nm.activeNotifications.find { it.id == id }
+      ?.let { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(it.notification) }
+      ?: NotificationCompat.MessagingStyle(Person.Builder().setName("Вы").build())
+    style.addMessage(text, System.currentTimeMillis(), Person.Builder().setName(title).build())
+    // The action makes the two intents distinct; the reply one must be mutable to carry the typed text.
+    fun intent(action: String, flag: Int) = PendingIntent.getBroadcast(c, id,
+      Intent(c, ActionReceiver::class.java).setAction(action)
+        .putExtra("space", space).putExtra("chat", chat).putExtra("id", id),
+      PendingIntent.FLAG_UPDATE_CURRENT or flag)
+    val reply = NotificationCompat.Action.Builder(0, "Ответить", intent("reply", PendingIntent.FLAG_MUTABLE))
+      .addRemoteInput(RemoteInput.Builder("text").setLabel("Сообщение").build())
+      .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+      .setShowsUserInterface(false)
+      .build()
+    val read = NotificationCompat.Action.Builder(0, "Прочитано", intent("read", PendingIntent.FLAG_IMMUTABLE))
+      .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
+      .setShowsUserInterface(false)
+      .build()
     nm.notify(id, NotificationCompat.Builder(c, "msg")
       .setSmallIcon(R.mipmap.ic_launcher)
-      .setContentTitle(title)
-      .setContentText(text)
+      .setStyle(style)
       .setAutoCancel(true)
-      .setContentIntent(open)
+      .setContentIntent(open(c))
+      .addAction(reply)
+      .addAction(read)
       .build())
+  }
+}
+
+/** Reply / Read on a message notification (`Push.show`): done without opening the app. */
+class ActionReceiver : BroadcastReceiver() {
+  override fun onReceive(c: Context, i: Intent) {
+    val space = i.getStringExtra("space") ?: return
+    val chat = i.getStringExtra("chat") ?: return
+    val text = if (i.action == "reply") {
+      RemoteInput.getResultsFromIntent(i)?.getCharSequence("text")?.toString()?.takeIf { it.isNotBlank() } ?: return
+    } else null
+    val done = goAsync()
+    thread {
+      val ok = runCatching {
+        System.loadLibrary("mycel_app_lib")
+        Push.act(c.dataDir.path, c.cacheDir.path, space, chat, text)
+      }.getOrDefault(false)
+      c.getSystemService(NotificationManager::class.java).cancel(i.getIntExtra("id", 0))
+      if (!ok && text != null) Push.show(c, space, chat, "Mycel", "Не отправлено: $text")
+      done.finish()
+    }
   }
 }
 
