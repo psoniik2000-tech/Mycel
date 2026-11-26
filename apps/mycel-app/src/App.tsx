@@ -7,7 +7,7 @@ import { ask, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
+  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -24,7 +24,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null };
-type ChatRow = { id: string; last: Msg | null; unread: number };
+type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
 type Tab = "chats" | "calls" | "people" | "settings";
@@ -91,9 +91,8 @@ async function tryAutoAnchor(id: string) {
     // stays a plain member
   }
 }
-// The open space: per-space keys in localStorage (the first space keeps the old ones).
+// The open space.
 let spaceId = "";
-const readKey = () => (spaceId === "main" ? "read" : `read:${spaceId}`);
 // Unsent text per space and chat, kept on this device (storage may be unavailable).
 const [draftsChanged, touchDrafts] = createSignal<void>(undefined, { equals: false });
 const draftKey = (chat: string) => `draft:${spaceId}:${chat}`;
@@ -730,21 +729,11 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const wideQuery = matchMedia("(min-width: 900px)");
   const [wide, setWide] = createSignal(wideQuery.matches);
   const chatVisible = () => (wide() || chatOpen()) && focused();
-  // Read marks per chat (newest message ts seen), kept on this device.
-  const readMap = (): Record<string, number> => {
-    try {
-      return JSON.parse(localStorage.getItem(readKey()) ?? "{}");
-    } catch {
-      return {};
-    }
-  };
-  const loadChats = () => invoke<ChatRow[]>("chats", { read: readMap() }).then(setRows);
-  const markRead = () => {
-    const ts = Math.max(Date.now(), ...msgs().map((m) => m.ts));
-    localStorage.setItem(readKey(), JSON.stringify({ ...readMap(), [chat()]: ts }));
-    invoke("mark_read", { chat: chat() }).catch(() => {});
-    loadChats();
-  };
+  const loadChats = () => invoke<ChatRow[]>("chats").then(setRows);
+  // Unread counts follow our Read receipts: reload them once the receipt is stored.
+  const markRead = () => invoke("mark_read", { chat: chat() }).catch(() => {}).then(loadChats);
+  const toggleMute = (on: boolean) =>
+    invoke("set_muted", { chat: chat(), on }).then(loadChats, (e) => setCallErr("Не удалось изменить уведомления: " + errText(e)));
   createEffect(() => chatVisible() && msgs() && untrack(markRead));
   const unread = () => rows().reduce((n, r) => n + r.unread, 0);
 
@@ -1007,7 +996,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         {(k) => (
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
             peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
-            openChat={openChat} />
+            openChat={openChat} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute} />
         )}
       </Show>
       <Show when={people().some((m) => m.me && !m.name)}>
@@ -1109,6 +1098,7 @@ const isPhoto = (path: string) => /\.(jpe?g|png|webp)$/i.test(path);
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
   inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void;
+  muted: boolean; onMute: (on: boolean) => void;
 }) {
   const key = draftKey(p.chat);
   const [text, setText] = createSignal(getDraft(key));
@@ -1387,6 +1377,10 @@ function Chat(p: {
         </div>
         <NetDot n={p.peers} />
         <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
+        <button class="icon" aria-pressed={p.muted} onClick={() => p.onMute(!p.muted)}
+          title={p.muted ? "Без звука: включить уведомления" : "Отключить уведомления"}>
+          {p.muted ? <BellOff size={20} /> : <Bell size={20} />}
+        </button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
           title={p.chat ? "Звонок" : "Групповой звонок"}><Phone size={20} /></button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}

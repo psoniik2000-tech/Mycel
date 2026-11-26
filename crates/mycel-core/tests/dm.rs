@@ -89,9 +89,11 @@ async fn names_and_private_chat_closed_to_third() {
             })
             .count()
     };
+    assert_eq!(b.unread(&ka).unwrap(), [hi.id]);
     b.mark_read(&ka).unwrap();
     b.mark_read(&ka).unwrap();
     assert_eq!(reads(b), 1);
+    assert!(b.unread(&ka).unwrap().is_empty());
     until(|| st(a) == 2).await;
     assert_eq!(b.dms().unwrap(), vec![a.device_id()]);
     b.send_text(&ka, "ответ Ане", Some(hi.id)).unwrap();

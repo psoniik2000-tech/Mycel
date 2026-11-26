@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 pub struct Space {
     pub id: String,
     pub name: String,
+    /// Chats without notifications on this device (the UI's chat ids).
+    #[serde(default)]
+    pub muted: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -73,6 +76,7 @@ impl List {
                     Space {
                         id: "main".into(),
                         name: "Моё пространство".into(),
+                        muted: vec![],
                     },
                 );
                 l.last = Some("main".into());
@@ -88,6 +92,20 @@ impl List {
             }
         }
         Ok(l)
+    }
+
+    pub fn muted(&self, space: &str, chat: &str) -> bool {
+        let s = self.spaces.iter().find(|s| s.id == space);
+        s.is_some_and(|s| s.muted.iter().any(|c| c == chat))
+    }
+
+    pub fn set_muted(&mut self, space: &str, chat: &str, on: bool) {
+        if let Some(s) = self.spaces.iter_mut().find(|s| s.id == space) {
+            s.muted.retain(|c| c != chat);
+            if on {
+                s.muted.push(chat.into());
+            }
+        }
     }
 
     /// Written via a temp file, so a crash never leaves a broken list.
@@ -121,9 +139,17 @@ mod tests {
         assert_eq!(std::fs::read(d.join("blobs").join("x")).unwrap(), b"x");
         assert!(!root.join("salt").exists() && !dir(&root, "gone").exists());
 
-        let l = List::load(&root).unwrap();
+        let mut l = List::load(&root).unwrap();
         assert_eq!(l.spaces.len(), 1);
         assert!(d.join("salt").exists());
+
+        l.set_muted("main", "", true);
+        l.set_muted("main", "", true);
+        l.save(&root).unwrap();
+        let mut l = List::load(&root).unwrap();
+        assert!(l.muted("main", "") && !l.muted("main", "ab") && !l.muted("gone", ""));
+        l.set_muted("main", "", false);
+        assert!(!l.muted("main", ""));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
