@@ -5,4 +5,11 @@ import "@fontsource/inter/600.css";
 import "./styles.css";
 import App from "./App";
 
+// No page zoom: Ctrl+wheel, Ctrl +/−/0, trackpad/Safari pinch.
+addEventListener("wheel", (e) => e.ctrlKey && e.preventDefault(), { passive: false });
+addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && ["+", "=", "-", "_", "0"].includes(e.key)) e.preventDefault();
+});
+for (const t of ["gesturestart", "gesturechange"]) addEventListener(t, (e) => e.preventDefault());
+
 render(() => <App />, document.getElementById("root")!);
