@@ -7,7 +7,7 @@ import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
+  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -1400,7 +1400,9 @@ function Chat(p: {
   const [video, setVideo] = createSignal(false);
   const [rec, setRec] = createSignal<Recording>();
   const [elapsed, setElapsed] = createSignal(0);
-  const [cancelling, setCancelling] = createSignal(false);
+  const [slide, setSlide] = createSignal(0); // finger moved left while holding, px (≤ 0)
+  const [lift, setLift] = createSignal(0); // finger moved up while holding, px (≥ 0)
+  const [locked, setLocked] = createSignal(false); // recording locked: hands-free, send/cancel by buttons
   const [emo, setEmo] = createSignal<number>(); // open emoji panel: tab index, -1 = recent
   const insertEmoji = (e: string) => {
     const a = input.selectionStart, b = input.selectionEnd, t = text();
@@ -1474,14 +1476,44 @@ function Chat(p: {
   });
 
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
-  let holdTimer = 0, tick = 0, startX = 0, holding = false;
+  // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
+  let holdTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, raf = 0, halo!: HTMLElement;
+  let ctx: AudioContext | undefined;
+  const vib = (ms: number) => navigator.vibrate?.(ms);
+  // The halo behind the mic scales 1.0–1.4 with the microphone's loudness (smoothed).
+  const meter = (stream: MediaStream) => {
+    ctx = new AudioContext();
+    const an = ctx.createAnalyser();
+    an.fftSize = 512;
+    ctx.createMediaStreamSource(stream).connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    let lvl = 0;
+    const frame = () => {
+      an.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (const v of buf) sum += (v - 128) ** 2;
+      lvl += (Math.min(1, Math.sqrt(sum / buf.length) / 128 * 4) - lvl) * 0.25;
+      if (halo) halo.style.transform = `scale(${1 + 0.4 * lvl})`;
+      raf = requestAnimationFrame(frame);
+    };
+    frame();
+  };
   const stopRec = async (send: boolean) => {
     const r = rec();
     clearInterval(tick);
+    cancelAnimationFrame(raf);
+    void ctx?.close();
+    ctx = undefined;
     setRec(undefined);
-    setCancelling(false);
+    setSlide(0);
+    setLift(0);
+    setLocked(false);
     if (!r) return;
-    if (!send || Date.now() - r.started < 500) return r.cancel();
+    if (!send || Date.now() - r.started < 500) {
+      if (!send) vib(40); // a deliberate cancel buzzes; a too-short press is silently dropped
+      return r.cancel();
+    }
+    vib(15);
     const blob = await r.stop();
     const kind = video() ? "videonote" : "voice";
     const wave = kind === "voice" ? await waveform(blob) : [];
@@ -1490,8 +1522,14 @@ function Chat(p: {
     await queue({ text: kind === "voice" ? "🎤 Голосовое" : "📹 Видеосообщение" }, () => invoke<string>("send_rec", body, { headers }));
   };
   const down = (e: PointerEvent) => {
+    if (locked()) {
+      // Locked: the big button is Send.
+      void stopRec(true);
+      return;
+    }
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     startX = e.clientX;
+    startY = e.clientY;
     holding = true;
     holdTimer = window.setTimeout(async () => {
       try {
@@ -1499,23 +1537,47 @@ function Chat(p: {
         if (!holding) return r.cancel();
         setRec(r);
         setElapsed(0);
+        vib(15);
         if (video()) preview.srcObject = r.stream;
+        meter(r.stream);
         tick = window.setInterval(() => {
           setElapsed(Date.now() - r.started);
           if (video() && Date.now() - r.started >= 60_000) stopRec(true);
-        }, 200);
+        }, 100);
       } catch (e) {
         setErr("Нет доступа к микрофону или камере: " + errText(e));
       }
     }, 300);
   };
   const up = () => {
+    if (!holding) return; // already cancelled or locked while sliding
     holding = false;
     clearTimeout(holdTimer);
-    if (rec()) stopRec(!cancelling());
+    if (rec()) stopRec(true);
     else setVideo(!video());
   };
-  const move = (e: PointerEvent) => rec() && setCancelling(Math.abs(startX - e.clientX) > 80);
+  const abort = () => {
+    holding = false;
+    clearTimeout(holdTimer);
+    if (rec() && !locked()) stopRec(false);
+  };
+  const move = (e: PointerEvent) => {
+    if (!holding || !rec()) return;
+    const dx = Math.min(0, e.clientX - startX), dy = Math.max(0, startY - e.clientY);
+    if (dy > 80) {
+      holding = false; // from now on the release is ignored
+      setLocked(true);
+      setSlide(0);
+      setLift(0);
+      vib(15);
+    } else if (dx < -120) {
+      holding = false;
+      stopRec(false);
+    } else {
+      setSlide(dx);
+      setLift(Math.min(dy, 80));
+    }
+  };
   let list!: HTMLDivElement;
   let input!: HTMLTextAreaElement;
   // Stay at the bottom if already there (or on own send); otherwise count what came for the ↓ button.
@@ -1801,11 +1863,18 @@ function Chat(p: {
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
         <Show when={rec()}>
-          <div class="recording grow" classList={{ cancel: cancelling() }}>
-            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")}
-            <span class="muted small grow">{cancelling() ? "Отпустите — отмена" : "Отпустите, чтобы отправить · уведите в сторону — отмена"}</span>
-            <X size={18} />
+          <div class="recording grow" classList={{ cancel: slide() < -60 }}>
+            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")},{Math.floor(elapsed() / 100) % 10}
+            <Show when={locked()} fallback={
+              <span class="muted small grow" style={{ opacity: 1 - Math.min(1, -slide() / 120) }}>‹ Влево — отмена</span>
+            }>
+              <span class="grow" />
+              <button class="link" onClick={() => stopRec(false)}>Отмена</button>
+            </Show>
           </div>
+        </Show>
+        <Show when={rec() && !locked()}>
+          <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)`, opacity: 0.3 + 0.7 * (lift() / 80) }}><LockIcon size={18} /></div>
         </Show>
         <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()} style={{ display: rec() ? "none" : undefined }}
           onInput={(e) => { setText(e.currentTarget.value); grow(); }}
@@ -1836,9 +1905,12 @@ function Chat(p: {
           </div>
         </Show>
         <Show when={text().trim() || editing()} fallback={
-          <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
+          <button class="icon mic" classList={{ live: !!rec() }}
+            style={rec() ? { transform: `translateX(${slide()}px) scale(2)` } : undefined}
+            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
-            {video() ? <Video size={20} /> : <Mic size={20} />}
+            <i class="halo" ref={halo} />
+            {locked() ? <Send size={20} /> : video() ? <Video size={20} /> : <Mic size={20} />}
           </button>
         }>
           <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>
