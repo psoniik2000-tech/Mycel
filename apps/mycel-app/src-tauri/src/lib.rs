@@ -1372,6 +1372,8 @@ pub fn run() {
             }
         });
     b.plugin(tauri_plugin_dialog::init())
+        // mycel://join/… links; a second launch hands them over through single-instance.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .manage(App::default())
         .manage(Visible(AtomicBool::new(true)))
@@ -1441,6 +1443,12 @@ pub fn run() {
             }
             #[cfg(mobile)]
             _app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            // The installer registers the scheme; a dev build has none.
+            #[cfg(all(debug_assertions, any(windows, target_os = "linux")))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = _app.deep_link().register_all();
+            }
             // Android has no writable temp dir by default; core and send_* use temp_dir().
             #[cfg(target_os = "android")]
             // SAFETY: set once at startup, before any command can read it.

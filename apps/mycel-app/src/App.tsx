@@ -3,7 +3,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
+import { ask, open } from "@tauri-apps/plugin-dialog";
+import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Camera, Check, CheckCheck, ChevronDown, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Send,
@@ -27,6 +28,8 @@ type ChatRow = { id: string; last: Msg | null; unread: number };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
 type Tab = "chats" | "calls" | "people" | "settings";
+// What the user came to do, picked before the password (unknown: Onboard offers both).
+type How = "create" | "join";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 const hue = (id: string) => parseInt(id.slice(0, 4), 16) % 360;
@@ -160,9 +163,11 @@ function NetDot(p: { n: number }) {
 
 export default function App() {
   const [status, setStatus] = createSignal<Status>();
-  // lock: the password of `space` (none = a new space); spaces: the list.
+  // lock: the password of `space` (none = a new space); spaces: the list (empty on first start: just create / join).
   const [stage, setStage] = createSignal<"spaces" | "lock" | "onboard" | "main">();
   const [space, setSpace] = createSignal<Space>();
+  const [how, setHow] = createSignal<How>();
+  const [invite, setInvite] = createSignal("");
   const [theme, setTheme] = createSignal(localStorage.getItem("theme") ?? "system");
   createEffect(() => {
     document.documentElement.dataset.theme = theme();
@@ -180,8 +185,9 @@ export default function App() {
     if (inSpace) tryAutoAnchor(spaceId);
   };
   // A remembered space opens at once; otherwise (or if the saved password no longer fits) the password screen.
-  const enter = async (sp?: Space) => {
+  const enter = async (sp?: Space, h?: How) => {
     setSpace(sp);
+    setHow(h);
     if (sp?.remembered) {
       try {
         return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
@@ -194,30 +200,47 @@ export default function App() {
   const leave = async () => {
     await invoke("close_space");
     setPeople([]);
-    const s = await refresh();
-    if (s.spaces.length) setStage("spaces");
-    else enter();
+    await refresh();
+    setStage("spaces");
   };
-  onMount(async () => {
+  const start = async () => {
     const s = await refresh();
     if (s.current) return setStage(s.in_space ? "main" : "onboard");
     const last = s.spaces.find((x) => x.id === s.last);
-    if (last || !s.spaces.length) return enter(last);
+    if (last) return enter(last);
     setStage("spaces");
+  };
+  // A mycel://join/… link only fills in the join field: joining stays a button press.
+  const invited = async (urls: string[] | null) => {
+    const url = urls?.find((u) => u.startsWith("mycel://join/"));
+    // Android may hand the launch link over again later: a used one is skipped.
+    if (!url || url === localStorage.getItem("joined")) return;
+    if (stage() === "main") {
+      if (!(await ask("Вступить в другое пространство по этой ссылке? Нынешнее закроется, вернуться в него можно из списка пространств", { title: "Приглашение", okLabel: "Вступить", cancelLabel: "Отмена" }))) return;
+      await leave();
+    }
+    setInvite(url);
+    if (stage() === "onboard") setHow("join");
+    else enter(undefined, "join");
+  };
+  onMount(async () => {
+    await start();
+    await onOpenUrl(invited);
+    await invited(await getCurrent());
   });
   return (
     <Show when={status()}>
       {(s) => (
         <Switch>
           <Match when={stage() === "spaces"}>
-            <Spaces spaces={s().spaces} onOpen={enter} onNew={() => enter()} onRemoved={refresh} />
+            <Spaces spaces={s().spaces} onOpen={enter} onNew={(h) => enter(undefined, h)} onRemoved={refresh} />
           </Match>
           <Match when={stage() === "lock"}>
-            <Lock space={space()} count={s().spaces.length} onDone={opened} onBack={s().spaces.length ? () => setStage("spaces") : undefined}
-              onRemoved={async () => ((await refresh()).spaces.length ? setStage("spaces") : enter())} />
+            <Lock space={space()} how={how()} count={s().spaces.length} onDone={opened} onBack={() => setStage("spaces")}
+              onRemoved={async () => (await refresh(), setStage("spaces"))} />
           </Match>
           <Match when={stage() === "onboard"}>
-            <Onboard onDone={() => setStage("main")} />
+            <Onboard how={how()} setHow={setHow} link={invite()} setLink={setInvite} onDone={() => setStage("main")} />
           </Match>
           <Match when={stage() === "main" && s().spaces.find((x) => x.id === s().current)}>
             {(sp) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh} />}
@@ -228,24 +251,26 @@ export default function App() {
   );
 }
 
-function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => void; onBack?: () => void; onRemoved: () => void }) {
+function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: boolean) => void; onBack: () => void; onRemoved: () => void }) {
   const [forgot, setForgot] = createSignal(false);
-  const [name, setName] = createSignal(p.count ? `Пространство ${p.count + 1}` : "Моё пространство");
+  const defaultName = p.count ? `Пространство ${p.count + 1}` : "Моё пространство";
+  const [name, setName] = createSignal(defaultName);
   const [pw, setPw] = createSignal("");
   const [pw2, setPw2] = createSignal("");
   const [remember, setRemember] = createSignal(true);
   const [err, setErr] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const exists = () => !!p.space;
+  const joining = () => !exists() && p.how === "join";
   const submit = async (e: Event) => {
     e.preventDefault();
-    if (!exists() && !name().trim()) return setErr("Введите название");
+    if (!exists() && !joining() && !name().trim()) return setErr("Введите название");
     if (!exists() && pw() !== pw2()) return setErr("Пароли не совпадают");
     if (!pw()) return setErr("Введите пароль");
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name(), password: pw(), remember: remember(), n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
+      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name().trim() || defaultName, password: pw(), remember: remember(), n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
     } catch (e) {
       setErr(exists() ? "Неверный пароль" : errText(e));
     }
@@ -255,11 +280,12 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
     <div class="center">
       <form class="card intro" onSubmit={submit}>
         <img src={logo} class="logo" alt="" />
-        <h1>{p.space?.name ?? (p.count ? "Новое пространство" : "Mycel")}</h1>
+        <h1>{p.space?.name ?? (joining() ? "Вступить по ссылке" : "Новое пространство")}</h1>
         <p class="muted">
-          {exists() ? "Введите пароль, чтобы открыть переписку" : "Придумайте пароль: им шифруются все данные на этом устройстве. Создать своё пространство или вступить в чужое по ссылке — на следующем шаге"}
+          {exists() ? "Введите пароль, чтобы открыть переписку"
+            : `Придумайте пароль: им шифруются все данные на этом устройстве${joining() ? ". Ссылку-приглашение вставите на следующем шаге" : ""}`}
         </p>
-        <Show when={!exists()}>
+        <Show when={!exists() && !joining()}>
           <input placeholder="Название (видно только вам)" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
         </Show>
         <input type="password" placeholder="Пароль" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} autofocus />
@@ -272,7 +298,7 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
         </label>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <button class="primary" disabled={busy()}>{busy() ? "Открываем…" : exists() ? "Открыть" : "Продолжить"}</button>
-        <Show when={p.onBack}><button type="button" onClick={p.onBack}><ArrowLeft size={18} /> Все пространства</button></Show>
+        <button type="button" onClick={p.onBack}><ArrowLeft size={18} /> {p.count ? "Все пространства" : "Назад"}</button>
         <Show when={exists()}>
           <button type="button" class="link" onClick={() => setForgot(true)}>Забыли пароль?</button>
         </Show>
@@ -284,13 +310,16 @@ function Lock(p: { space?: Space; count: number; onDone: (inSpace: boolean) => v
   );
 }
 
-function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: () => void; onRemoved: () => void }) {
+function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: (how: How) => void; onRemoved: () => void }) {
   const [del, setDel] = createSignal<Space>();
   return (
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
-        <h1>Пространства</h1>
+        <h1>{p.spaces.length ? "Пространства" : "Mycel"}</h1>
+        <Show when={!p.spaces.length}>
+          <p class="muted">Создайте своё пространство или вступите в существующее по ссылке-приглашению</p>
+        </Show>
         <For each={p.spaces}>
           {(s) => (
             <div class="actions">
@@ -299,9 +328,9 @@ function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: () => v
             </div>
           )}
         </For>
-        <div class="or"><span>или</span></div>
-        <button class="primary" onClick={p.onNew}><Plus size={18} /> Создать новое</button>
-        <button onClick={p.onNew}><Link size={18} /> Вступить по ссылке</button>
+        <Show when={p.spaces.length}><div class="or"><span>или</span></div></Show>
+        <button class="primary" onClick={() => p.onNew("create")}><Plus size={18} /> {p.spaces.length ? "Создать новое" : "Создать пространство"}</button>
+        <button onClick={() => p.onNew("join")}><Link size={18} /> Вступить по ссылке</button>
       </div>
       <Show when={del()}>
         {(s) => <RemoveSpace space={s()} onClose={() => setDel()} onDone={() => (setDel(), p.onRemoved())} />}
@@ -574,9 +603,8 @@ function LoginSettings(p: { space: Space; refresh: () => void }) {
   );
 }
 
-function Onboard(p: { onDone: () => void }) {
+function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink: (v: string) => void; onDone: () => void }) {
   const [name, setName] = createSignal("");
-  const [link, setLink] = createSignal("");
   // Set while the camera scanner is open: if it is still set on the next start, the scanner crashed the app.
   const crashed = localStorage.getItem("scanning") === "1";
   localStorage.removeItem("scanning");
@@ -591,6 +619,7 @@ function Onboard(p: { onDone: () => void }) {
     const slow = setTimeout(() => setStage("Всё ещё ищу… Mycel у пригласившего должен быть открыт и в сети"), 12000);
     try {
       await invoke(cmd, args);
+      if (what === "join") localStorage.setItem("joined", p.link.trim()), p.setLink("");
       // Main asks again if this fails.
       await invoke("set_profile", { name: name().trim(), avatar: "", color: Math.floor(Math.random() * PALETTE.length) }).catch(() => {});
       p.onDone();
@@ -604,45 +633,56 @@ function Onboard(p: { onDone: () => void }) {
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
-        <h1>Добро пожаловать</h1>
-        <p class="muted">Создайте своё пространство или вступите в существующее по ссылке-приглашению</p>
+        <h1>{p.how === "join" ? "Вступить по ссылке" : p.how === "create" ? "Новое пространство" : "Добро пожаловать"}</h1>
+        <p class="muted">
+          {p.how === "join" ? "Представьтесь и вставьте ссылку-приглашение" : p.how === "create" ? "Остался один шаг" : "Создайте своё пространство или вступите в существующее по ссылке-приглашению"}
+        </p>
         <input placeholder="Как вас зовут?" maxLength={64} value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
         <Show when={!name().trim()}><p class="muted small">Имя увидят другие участники</p></Show>
-        <button class="primary" disabled={!!busy() || !name().trim()} onClick={() => run("create", "create_space")}>
-          <Plus size={18} /> {busy() === "create" ? "Создаём…" : "Создать пространство"}
-        </button>
-        <div class="or"><span>или</span></div>
-        <textarea rows={3} placeholder="mycel://join/…" value={link()} onInput={(e) => setLink(e.currentTarget.value)} />
-        <Show when={android}>
-          <button disabled={!!busy()} onClick={async () => {
-            try {
-              const bs = await import("@tauri-apps/plugin-barcode-scanner");
-              // The plugin's scan() fails unless the camera permission was asked for first.
-              if ((await bs.checkPermissions()) !== "granted" && (await bs.requestPermissions()) !== "granted")
-                return setErr("Нет доступа к камере: разрешите его Mycel в настройках телефона");
-              // Android back cancels the scan (otherwise it closes the app): give it a history entry to pop.
-              history.pushState(null, "");
-              let back = false;
-              const onBack = () => ((back = true), bs.cancel());
-              addEventListener("popstate", onBack, { once: true });
-              localStorage.setItem("scanning", "1");
-              try {
-                setLink((await bs.scan({ formats: [bs.Format.QRCode] })).content);
-              } finally {
-                localStorage.removeItem("scanning");
-                removeEventListener("popstate", onBack);
-                if (!back) history.back();
-              }
-            } catch (e) {
-              if (errText(e) !== "cancelled") setErr(errText(e));
-            }
-          }}><Camera size={18} /> Сканировать QR</button>
+        <Show when={p.how !== "join"}>
+          <button class="primary" disabled={!!busy() || !name().trim()} onClick={() => run("create", "create_space")}>
+            <Plus size={18} /> {busy() === "create" ? "Создаём…" : "Создать пространство"}
+          </button>
         </Show>
-        <button disabled={!!busy() || !link().trim() || !name().trim()} onClick={() => run("join", "join", { link: link() })}>
-          <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
-        </button>
-        <Show when={busy() === "join"}><p class="muted small">{stage()}</p></Show>
+        <Show when={!p.how}><div class="or"><span>или</span></div></Show>
+        <Show when={p.how !== "create"}>
+          <textarea rows={3} placeholder="mycel://join/…" value={p.link} onInput={(e) => p.setLink(e.currentTarget.value)} />
+          <Show when={android}>
+            <button disabled={!!busy()} onClick={async () => {
+              try {
+                const bs = await import("@tauri-apps/plugin-barcode-scanner");
+                // The plugin's scan() fails unless the camera permission was asked for first.
+                if ((await bs.checkPermissions()) !== "granted" && (await bs.requestPermissions()) !== "granted")
+                  return setErr("Нет доступа к камере: разрешите его Mycel в настройках телефона");
+                // Android back cancels the scan (otherwise it closes the app): give it a history entry to pop.
+                history.pushState(null, "");
+                let back = false;
+                const onBack = () => ((back = true), bs.cancel());
+                addEventListener("popstate", onBack, { once: true });
+                localStorage.setItem("scanning", "1");
+                try {
+                  p.setLink((await bs.scan({ formats: [bs.Format.QRCode] })).content);
+                } finally {
+                  localStorage.removeItem("scanning");
+                  removeEventListener("popstate", onBack);
+                  if (!back) history.back();
+                }
+              } catch (e) {
+                if (errText(e) !== "cancelled") setErr(errText(e));
+              }
+            }}><Camera size={18} /> Сканировать QR</button>
+          </Show>
+          <button classList={{ primary: p.how === "join" }} disabled={!!busy() || !p.link.trim() || !name().trim()} onClick={() => run("join", "join", { link: p.link })}>
+            <Link size={18} /> {busy() === "join" ? "Вступаем…" : "Вступить по ссылке"}
+          </button>
+          <Show when={busy() === "join"}><p class="muted small">{stage()}</p></Show>
+        </Show>
         <Show when={err()}><p class="error">{err()}</p></Show>
+        <Show when={p.how}>
+          <button type="button" class="link" disabled={!!busy()} onClick={() => (setErr(""), p.setHow(p.how === "join" ? "create" : "join"))}>
+            {p.how === "join" ? "Лучше создать своё пространство" : "Есть ссылка-приглашение?"}
+          </button>
+        </Show>
       </div>
     </div>
   );
