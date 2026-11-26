@@ -234,6 +234,11 @@ button.del { color: var(--danger); }
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 24px rgb(0 0 0 / 20%);
 }
 .menu button { border: 0; background: none; justify-content: flex-start; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
+.menu .emojis { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.menu .emojis button { padding: 6px; font-size: 18px; }
+.reacts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.reacts button { padding: 1px 8px; border-radius: 12px; font-size: 13px; border: 1px solid var(--line); background: none; }
+.reacts button.on { border-color: var(--accent); }
 .modal { position: fixed; inset: 0; z-index: 60; background: rgb(0 0 0 / 40%); display: grid; place-items: center; padding: 16px; }
 .dialog { width: min(360px, 100%); padding: 16px 20px 20px; display: flex; flex-direction: column; gap: 8px; }
 .dialog h3 { margin: 4px 0 8px; }

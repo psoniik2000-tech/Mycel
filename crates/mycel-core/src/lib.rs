@@ -13,8 +13,8 @@ use mycel_net::{
     BLOBS_ALPN, CALL_ALPN, ConnInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net,
 };
 use mycel_proto::{
-    BlobRef, Envelope, Event, EventBody, EventId, JoinReq, JoinResp, MediaKind, ReceiptKind,
-    SignedAddr, SyncMsg,
+    BlobRef, DeviceId, Envelope, Event, EventBody, EventId, JoinReq, JoinResp, MediaKind,
+    ReceiptKind, SignedAddr, SyncMsg,
 };
 use mycel_store::Store;
 use n0_future::StreamExt;
@@ -769,6 +769,24 @@ impl Node {
     pub fn pin(&self, target: EventId, pinned: bool) -> Result<Event> {
         let chat = self.event(&target)?.0;
         self.send_event(&chat, EventBody::Pin { target, pinned })
+    }
+
+    /// Toggles own reaction `emoji` on a message: the same one again takes it back.
+    pub fn react(&self, target: EventId, emoji: &str) -> Result<Event> {
+        let chat = self.event(&target)?.0;
+        let me = self.device_id();
+        let remove = reactions(&self.history(&chat)?)
+            .get(&target)
+            .is_some_and(|r| r.iter().any(|(e, who)| e == emoji && who.contains(&me)));
+        let emoji = emoji.into();
+        self.send_event(
+            &chat,
+            EventBody::Reaction {
+                target,
+                emoji,
+                remove,
+            },
+        )
     }
 
     /// Sends a copy of a text or media message as a new own message to chat `to`.
@@ -1652,6 +1670,47 @@ pub fn edits_and_pins(hist: &[Event]) -> (HashMap<EventId, String>, Vec<EventId>
         }
     }
     (edits, pins)
+}
+
+/// The reactions on one message: each emoji (in the order first set) with who set it.
+pub type Reactions = Vec<(String, Vec<DeviceId>)>;
+
+/// Reactions over a history, per message.
+pub fn reactions(hist: &[Event]) -> HashMap<EventId, Reactions> {
+    let known: HashSet<_> = hist.iter().map(|e| e.id).collect();
+    let mut out: HashMap<EventId, Reactions> = HashMap::new();
+    for e in hist {
+        let EventBody::Reaction {
+            target,
+            emoji,
+            remove,
+        } = &e.body
+        else {
+            continue;
+        };
+        // An emoji is a few code points; longer strings from a peer are junk.
+        if !known.contains(target) || emoji.len() > 32 {
+            continue;
+        }
+        let slots = out.entry(*target).or_default();
+        let i = match slots.iter().position(|(x, _)| x == emoji) {
+            Some(i) => i,
+            None => {
+                slots.push((emoji.clone(), vec![]));
+                slots.len() - 1
+            }
+        };
+        let who = &mut slots[i].1;
+        who.retain(|d| *d != e.author_device);
+        if !remove {
+            who.push(e.author_device);
+        }
+    }
+    for slots in out.values_mut() {
+        slots.retain(|(_, who)| !who.is_empty());
+    }
+    out.retain(|_, s| !s.is_empty());
+    out
 }
 
 fn is_msg(b: &EventBody) -> bool {
