@@ -21,7 +21,7 @@ use n0_future::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 mod call;
@@ -39,6 +39,10 @@ pub const JOIN_USED: &str = "invite already used or unknown";
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 /// Periodic address exchange and catch-up with every known peer.
 const RESYNC: std::time::Duration = std::time::Duration::from_secs(60);
+/// The mailbox is pulled this often while an own message awaits its first receipt (receipts
+/// come without a push), for at most `FAST_FOR` after the send.
+const FAST_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+const FAST_FOR: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Network options of a node.
 #[derive(Debug, Default, Clone)]
@@ -268,10 +272,13 @@ pub struct Node {
     /// This phone's FCM token: the mailbox wakes it when something new is posted.
     push_token: Mutex<Option<String>>,
     push_registered: std::sync::atomic::AtomicBool,
+    /// Per chat: (lamport, send time) of the newest own message nobody has confirmed yet.
+    unacked: Mutex<HashMap<Chat, (u64, Instant)>>,
 }
 
 /// Store-and-forward when no member is online: every new envelope is also posted to an HTTP
-/// mailbox (a Cloudflare Worker); members pull what is new at start and every minute.
+/// mailbox (a Cloudflare Worker); members pull what is new at start and every minute
+/// (every `FAST_POLL` while waiting for a receipt).
 /// It sees only ciphertext; the topic is derived from the space id, which only members know.
 // shortcut: envelopes only; media blobs still come from a member who is online.
 struct Mailbox {
@@ -366,6 +373,7 @@ impl Node {
             box_tx,
             push_token: Mutex::new(None),
             push_registered: Default::default(),
+            unacked: Default::default(),
         });
         let (tx, rx) = mpsc::channel(256);
         let n = node.clone();
@@ -385,6 +393,7 @@ impl Node {
                 }
                 match res {
                     Ok(mut evs) => {
+                        n.note_receipts(&evs);
                         if !evs.is_empty() {
                             match n.apply_deletes() {
                                 Ok(gone) => evs.retain(|(_, e)| !gone.contains(&e.id)),
@@ -427,16 +436,23 @@ impl Node {
                 }
                 n.poll_box().await;
             }
+            let mut synced = Instant::now();
             loop {
-                tokio::time::sleep(RESYNC).await;
+                tokio::time::sleep(FAST_POLL).await;
                 let Some(n) = weak.upgrade() else { break };
                 if n.net.is_closed() {
                     break;
                 }
-                if let Err(e) = n.sync() {
-                    eprintln!("mycel: resync failed: {e}");
+                let due = synced.elapsed() >= RESYNC;
+                if due {
+                    synced = Instant::now();
+                    if let Err(e) = n.sync() {
+                        eprintln!("mycel: resync failed: {e}");
+                    }
                 }
-                n.poll_box().await;
+                if due || n.awaiting_receipt() {
+                    n.poll_box().await;
+                }
             }
         });
         Ok((node, rx))
@@ -1121,6 +1137,12 @@ impl Node {
             st.store_env(&env)?;
             (ev, env, st.store.peers()?)
         };
+        if is_msg(&ev.body) {
+            self.unacked
+                .lock()
+                .unwrap()
+                .insert(*chat, (ev.lamport, Instant::now()));
+        }
         self.post_box(&env, push);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(ev)
@@ -1148,6 +1170,31 @@ impl Node {
                 eprintln!("mycel: receipt failed: {e}");
             }
         }
+    }
+
+    /// Forgets the awaited messages that a received receipt covers.
+    fn note_receipts(&self, evs: &[(Chat, Event)]) {
+        let me = self.device_id();
+        for (c, e) in evs {
+            if let EventBody::Receipt { up_to, .. } = e.body
+                && e.author_device != me
+                && let Ok((_, seen)) = self.event(&up_to)
+            {
+                let mut u = self.unacked.lock().unwrap();
+                if u.get(c).is_some_and(|&(l, _)| l <= seen.lamport) {
+                    u.remove(c);
+                }
+            }
+        }
+    }
+
+    /// A message sent within `FAST_FOR` still has no receipt.
+    fn awaiting_receipt(&self) -> bool {
+        self.unacked
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(_, at)| at.elapsed() < FAST_FOR)
     }
 
     fn my_addr(&self) -> Result<SignedAddr> {
@@ -1569,4 +1616,31 @@ pub async fn spawn_relay(url: &str) -> Result<iroh_relay::server::Server> {
     let mut cfg = ServerConfig::default();
     cfg.relay = Some(RelayConfig::new(([0, 0, 0, 0], port)));
     Ok(Server::spawn(cfg).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn awaits_receipt_until_it_arrives() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let opts = Opts::default();
+        let (a, _rx_a) = Node::open(dirs[0].path(), "pa", &opts).await.unwrap();
+        let (b, _rx_b) = Node::open(dirs[1].path(), "pb", &opts).await.unwrap();
+        a.create_space().unwrap();
+        b.join(&a.invite().await.unwrap()).await.unwrap();
+        assert!(!a.awaiting_receipt());
+        a.send_text(&None, "hi", None).unwrap();
+        assert!(a.awaiting_receipt());
+        for _ in 0..100 {
+            if !a.awaiting_receipt() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!a.awaiting_receipt(), "the receipt did not stop the wait");
+        a.close().await;
+        b.close().await;
+    }
 }
