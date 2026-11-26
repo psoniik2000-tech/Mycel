@@ -69,6 +69,7 @@ h3 { font-size: 13px; margin: 20px 0 8px; font-weight: 600; text-transform: uppe
 .small { font-size: 13px; }
 .mono, code { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
 .error { color: var(--danger); font-size: 14px; margin: 4px 0; white-space: pre-line; }
+.ok { color: #2e9d57; white-space: nowrap; }
 .grow { flex: 1; min-width: 0; }
 .ellipsis { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .pad { padding: 16px; }

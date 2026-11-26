@@ -496,7 +496,31 @@ function AnchorSettings(p: { space: Space }) {
   );
 }
 
+// Server check (Settings): url → round trip in ms, or the reason it did not answer.
+type Check = Record<string, { ms: number | null; err: string }>;
+const checkServers = async (urls: string[], mailbox: boolean): Promise<Check> =>
+  Object.fromEntries((await invoke<[string, number | null, string][]>("check_servers", { urls, mailbox })).map(([u, ms, err]) => [u, { ms, err }]));
+function CheckMark(p: { c?: { ms: number | null; err: string } }) {
+  return (
+    <Show when={p.c}>
+      {(c) => (c().ms !== null
+        ? <span class="ok small">✓ {c().ms} мс</span>
+        : <span class="error small" title={c().err}>✗ не отвечает</span>)}
+    </Show>
+  );
+}
+
 function RelaySettings(p: { space: Space }) {
+  const [checked, setChecked] = createSignal<Check>({});
+  const [checking, setChecking] = createSignal(false);
+  // The anchor is a relay too: check it with the backups.
+  const targets = () => [...list(), ...(anchor() && !list().includes(anchor()!) ? [anchor()!] : [])];
+  const check = async () => {
+    setChecking(true);
+    setChecked({});
+    setChecked(await checkServers(targets(), false).catch(() => ({})));
+    setChecking(false);
+  };
   const [list, setList] = createSignal(relays());
   const [url, setUrl] = createSignal("");
   const [msg, setMsg] = createSignal("");
@@ -540,6 +564,7 @@ function RelaySettings(p: { space: Space }) {
         {(r) => (
           <div class="relay-row">
             <code class="grow ellipsis">{r}</code>
+            <CheckMark c={checked()[r]} />
             <button class="icon" title="Удалить" onClick={() => save(list().filter((x) => x !== r))}><Trash2 size={16} /></button>
           </div>
         )}
@@ -559,7 +584,15 @@ function RelaySettings(p: { space: Space }) {
         </ul>
         <p>Удалить сервер можно корзиной справа. Изменения применяются сразу, без перезапуска.</p>
       </details>
+      <Show when={anchor() && !list().includes(anchor()!)}>
+        <div class="relay-row">
+          <span class="muted small">Якорь:</span>
+          <code class="grow ellipsis">{anchor()}</code>
+          <CheckMark c={checked()[anchor()!]} />
+        </div>
+      </Show>
       <div class="actions">
+        <button class="primary" disabled={checking() || !targets().length} onClick={check}>{checking() ? "Проверяю…" : "Проверить серверы"}</button>
         <button onClick={() => save(DEFAULT_RELAYS)}>Вернуть список по умолчанию</button>
       </div>
     </>
@@ -571,6 +604,14 @@ function MailboxSettings(p: { space: Space }) {
   const [ver, setVer] = createSignal("");
   getVersion().then(setVer, () => {});
   const [msg, setMsg] = createSignal("");
+  const [checked, setChecked] = createSignal<Check>({});
+  const [checking, setChecking] = createSignal(false);
+  const check = async () => {
+    setChecking(true);
+    setChecked({});
+    setChecked(await checkServers([mailbox()!], true).catch(() => ({})));
+    setChecking(false);
+  };
   const save = async (e: Event) => {
     e.preventDefault();
     let u = url().trim().replace(/\/+$/, "");
@@ -595,6 +636,12 @@ function MailboxSettings(p: { space: Space }) {
         <button type="submit">Сохранить</button>
       </form>
       <Show when={msg()}><p class="muted small">{msg()}</p></Show>
+      <Show when={mailbox()}>
+        <div class="actions">
+          <button disabled={checking()} onClick={check}>{checking() ? "Проверяю…" : "Проверить ящик"}</button>
+          <CheckMark c={checked()[mailbox()!]} />
+        </div>
+      </Show>
       <details class="muted">
         <summary>Как завести свой ящик (бесплатно, 5 минут)</summary>
         <p>Нужен бесплатный аккаунт Cloudflare. Пошаговая инструкция и код лежат в папке <code>mailbox</code> проекта (файл README). Коротко: создать базу D1, создать Worker, вставить код, привязать базу под именем <code>DB</code>, скопировать адрес вида <code>https://….workers.dev</code> сюда.</p>

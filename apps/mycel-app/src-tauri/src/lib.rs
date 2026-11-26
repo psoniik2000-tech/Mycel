@@ -934,6 +934,29 @@ async fn home_relay(st: State<'_, App>) -> R<Option<String>> {
     Ok(n.home_relay())
 }
 
+/// Settings → «Проверить»: per server, the round trip in ms or why it did not answer.
+#[tauri::command]
+async fn check_servers(urls: Vec<String>, mailbox: bool) -> Vec<(String, Option<u64>, String)> {
+    let jobs: Vec<_> = urls
+        .into_iter()
+        .map(|u| {
+            tauri::async_runtime::spawn(async move {
+                match mycel_core::check_server(&u, mailbox).await {
+                    Ok(ms) => (u, Some(ms), String::new()),
+                    Err(e) => (u, None, err(e)),
+                }
+            })
+        })
+        .collect();
+    let mut out = vec![];
+    for j in jobs {
+        if let Ok(r) = j.await {
+            out.push(r);
+        }
+    }
+    out
+}
+
 /// The router can open ports (UPnP) and has a public address: this PC can be an anchor on its own.
 #[tauri::command]
 async fn upnp_ok() -> bool {
@@ -1577,6 +1600,7 @@ pub fn run() {
             anchor_check,
             upnp_ok,
             home_relay,
+            check_servers,
             sync_now,
             allow_preview,
             create_space,

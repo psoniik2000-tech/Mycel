@@ -1953,6 +1953,27 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Settings → «Проверить»: the server answers over HTTP(S) within 5 s → its round trip in ms.
+/// A relay passes on any reply; a mailbox must also say it is one.
+pub async fn check_server(url: &str, mailbox: bool) -> Result<u64> {
+    let b = Mailbox::new(url)?;
+    let t = Instant::now();
+    let r = b
+        .http
+        .get(&b.url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await?;
+    let ms = t.elapsed().as_millis() as u64;
+    if mailbox {
+        ensure!(
+            r.text().await?.contains("Mycel mailbox"),
+            "this is not a Mycel mailbox"
+        );
+    }
+    Ok(ms)
+}
+
 /// iroh-relay over plain HTTP on the port of `url` (like `http://1.2.3.4:3340`), all interfaces.
 /// Pass the same URL as [`Opts::own_relay`]. Kept running until the returned server is dropped or shut down.
 // shortcut: no TLS (relayed QUIC is end-to-end encrypted anyway, but not disguised as HTTPS);
@@ -1993,5 +2014,14 @@ mod tests {
         assert!(!a.awaiting_receipt(), "the receipt did not stop the wait");
         a.close().await;
         b.close().await;
+    }
+
+    #[tokio::test]
+    async fn checks_a_relay_and_tells_it_from_a_mailbox() {
+        let url = "http://127.0.0.1:34871";
+        let _relay = spawn_relay(url).await.unwrap();
+        assert!(check_server(url, false).await.is_ok());
+        assert!(check_server(url, true).await.is_err());
+        assert!(check_server("http://127.0.0.1:1", false).await.is_err());
     }
 }
