@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -7,7 +7,7 @@ import { ask, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Camera, Check, CheckCheck, ChevronDown, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Send,
+  ArrowLeft, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -94,6 +94,33 @@ async function tryAutoAnchor(id: string) {
 // The open space: per-space keys in localStorage (the first space keeps the old ones).
 let spaceId = "";
 const readKey = () => (spaceId === "main" ? "read" : `read:${spaceId}`);
+// Unsent text per space and chat, kept on this device (storage may be unavailable).
+const [draftsChanged, touchDrafts] = createSignal<void>(undefined, { equals: false });
+const draftKey = (chat: string) => `draft:${spaceId}:${chat}`;
+const getDraft = (key: string) => {
+  draftsChanged();
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+};
+const setDraft = (key: string, text: string) => {
+  try {
+    text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
+  } catch {
+    // not kept
+  }
+  touchDrafts();
+};
+/** Drafts are plain text outside the encrypted database: they go with their space. */
+const dropDrafts = (space: string) => {
+  try {
+    Object.keys(localStorage).filter((k) => k.startsWith(`draft:${space}:`)).forEach((k) => localStorage.removeItem(k));
+  } catch {
+    // nothing stored
+  }
+};
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const callLabel = (c: CallView) =>
   c.missed ? (c.mine ? "Без ответа" : "Пропущенный звонок")
@@ -357,7 +384,7 @@ function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; o
         </p>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <div class="actions">
-          <button class="danger" onClick={() => invoke("remove_space", { id: p.space.id }).then(p.onDone, (e) => setErr(errText(e)))}>
+          <button class="danger" onClick={() => invoke("remove_space", { id: p.space.id }).then(() => (dropDrafts(p.space.id), p.onDone()), (e) => setErr(errText(e)))}>
             <Trash2 size={18} /> Удалить
           </button>
           <button onClick={p.onClose}>Отмена</button>
@@ -908,13 +935,14 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
               <For each={sortedRows()}>
                 {(r) => {
                   const l = () => r.last;
+                  const draft = () => getDraft(draftKey(r.id));
                   return (
                     <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => openChat(r.id)}>
                       {r.id ? <Avatar id={r.id} /> : <div class="avatar group"><Hash size={20} /></div>}
                       <div class="grow">
                         <div class="row-top"><b class="ellipsis">{r.id ? nameOf(r.id) : "Общий чат"}</b><small class="muted">{l() ? time(l()!.ts) : ""}</small></div>
                         <div class="row-bottom">
-                          <span class="muted ellipsis">{l() ? (l()!.mine ? "Вы: " : !r.id && !l()!.call ? `${nameOf(l()!.author)}: ` : "") + (l()!.call ? callLabel(l()!.call!) : l()!.media ? label(l()!.media!) : l()!.text) : "Сообщений пока нет"}</span>
+                          <span class="muted ellipsis">{draft() ? `Черновик: ${draft()}` : l() ? (l()!.mine ? "Вы: " : !r.id && !l()!.call ? `${nameOf(l()!.author)}: ` : "") + (l()!.call ? callLabel(l()!.call!) : l()!.media ? label(l()!.media!) : l()!.text) : "Сообщений пока нет"}</span>
                           <Show when={r.unread}><b class="badge">{r.unread}</b></Show>
                         </div>
                       </div>
@@ -1082,7 +1110,8 @@ function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
   inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void;
 }) {
-  const [text, setText] = createSignal("");
+  const key = draftKey(p.chat);
+  const [text, setText] = createSignal(getDraft(key));
   // Sent but not in the history yet (⏱); `real` is the event id once the node has it.
   const [pending, setPending] = createSignal<(Msg & { real?: string })[]>([]);
   const [reply, setReply] = createSignal<Msg>();
@@ -1130,6 +1159,26 @@ function Chat(p: {
     el.classList.add("flash");
     setTimeout(() => el.classList.remove("flash"), 1600);
   };
+  // Search in the loaded history; query undefined = closed. Starts at the newest match.
+  const [query, setQuery] = createSignal<string>();
+  const [cur, setCur] = createSignal("");
+  const re = createMemo(() => {
+    const q = query()?.trim();
+    // The capturing group makes split() keep the matches (odd items) for highlighting.
+    return q ? new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "iu") : undefined;
+  });
+  const hits = createMemo(() => {
+    const r = re();
+    return r ? p.msgs.filter((m) => !m.call && r.test(m.text)).map((m) => m.id) : [];
+  });
+  const hit = () => (hits().includes(cur()) ? cur() : hits().at(-1));
+  const goHit = (d: number) => {
+    const h = hits();
+    if (!h.length) return;
+    const id = h[(h.indexOf(hit()!) + d + h.length) % h.length];
+    setCur(id);
+    jump(id);
+  };
   const toggle = (id: string) => !id.startsWith("tmp-") && setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   const picked = () => shown().filter((m) => sel().includes(m.id));
   const copy = (ms: Msg[]) => navigator.clipboard.writeText(ms.map(plain).join("\n"));
@@ -1141,13 +1190,13 @@ function Chat(p: {
     queueMicrotask(() => (grow(), input.focus()));
   };
   const startReply = (m: Msg) => {
-    if (editing()) setText("");
+    if (editing()) setText(getDraft(key));
     setEditing(undefined);
     setReply(m);
     input.focus();
   };
   const cancelCompose = () => {
-    if (editing()) setText("");
+    if (editing()) setText(getDraft(key));
     setEditing(undefined);
     setReply(undefined);
     queueMicrotask(grow);
@@ -1212,7 +1261,12 @@ function Chat(p: {
     list.addEventListener("load", bottom, true);
     list.addEventListener("loadedmetadata", bottom, true);
     // The reply bar or a growing input shrinks the list: keep the last message in view.
-    const ro = new ResizeObserver(bottom);
+    // A restored draft gets its height once the chat is visible (hidden on a phone until opened).
+    let sized = false;
+    const ro = new ResizeObserver(() => {
+      if (!sized && list.clientHeight) (sized = true), grow();
+      bottom();
+    });
     ro.observe(list);
     onCleanup(() => ro.disconnect());
     const un = await getCurrentWebview().onDragDropEvent((e) => {
@@ -1227,6 +1281,7 @@ function Chat(p: {
       if (view() || menu() || dlg()) return (setView(""), setMenu(undefined), setDlg(undefined));
       if (rec()) return stopRec(false);
       if (sel().length) return setSel([]);
+      if (query() !== undefined) return setQuery(undefined);
       cancelCompose();
     };
     addEventListener("keydown", esc);
@@ -1305,15 +1360,21 @@ function Chat(p: {
     const t = text().trim();
     if (!t) return;
     const ed = editing(), r = reply();
-    setText("");
+    setText(ed ? getDraft(key) : "");
     setEditing(undefined);
     setReply(undefined);
     queueMicrotask(grow);
     if (ed) return t !== ed.text && act(invoke("edit", { id: ed.id, text: t }));
     queue({ text: t, reply: r ? { id: r.id, author: r.author, text: plain(r) } : null },
       () => invoke<string>("send", { chat: p.chat, text: t, replyTo: r?.id ?? null }),
-      () => (setText(t), setReply(r), queueMicrotask(grow)));
+      // The chat may be closed by now: keep the unsent text as its draft unless a newer one exists.
+      () => (getDraft(key) || setDraft(key, t), setText(t), setReply(r), queueMicrotask(grow)));
   };
+  // While editing, the field holds the old message, not the draft.
+  createEffect(() => {
+    const t = text();
+    if (!editing()) setDraft(key, t);
+  });
   const canAll = (ids: string[]) => p.admin || ids.every((id) => p.msgs.find((m) => m.id === id)?.mine);
   return (
     <section class="chat">
@@ -1325,6 +1386,7 @@ function Chat(p: {
           <div class="muted small">{p.chat ? "личный чат" : `${p.members} участн.`}</div>
         </div>
         <NetDot n={p.peers} />
+        <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
           title={p.chat ? "Звонок" : "Групповой звонок"}><Phone size={20} /></button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}
@@ -1337,6 +1399,19 @@ function Chat(p: {
           <button onClick={() => setDlg({ kind: "forward", ids: picked().map((m) => m.id) })}><Forward size={16} /> Переслать</button>
           <button class="del" onClick={() => setDlg({ kind: "delete", ids: picked().map((m) => m.id) })}><Trash2 size={16} /> Удалить</button>
         </header>
+      </Show>
+      <Show when={query() !== undefined}>
+        <div class="searchbar">
+          <input ref={(el) => queueMicrotask(() => el.focus())} placeholder="Поиск в чате" value={query()}
+            onInput={(e) => { setQuery(e.currentTarget.value); setCur(""); goHit(0); }}
+            onKeyDown={(e) => e.key === "Enter" && !e.isComposing && goHit(e.shiftKey ? 1 : -1)} />
+          <Show when={re()}>
+            <small class="muted">{hits().length ? `${hits().indexOf(hit()!) + 1} из ${hits().length}` : "Не найдено"}</small>
+          </Show>
+          <button class="icon" disabled={!hits().length} onClick={() => goHit(-1)} title="Раньше (Enter)"><ChevronUp size={20} /></button>
+          <button class="icon" disabled={!hits().length} onClick={() => goHit(1)} title="Позже (Shift+Enter)"><ChevronDown size={20} /></button>
+          <button class="icon" onClick={() => setQuery(undefined)} title="Закрыть поиск (Esc)"><X size={20} /></button>
+        </div>
       </Show>
       <Show when={pinShown()}>
         {(m) => (
@@ -1366,7 +1441,7 @@ function Chat(p: {
                     </div>
                   ) : (
                     <div class="msg" data-id={m.id}
-                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id) }}
+                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => e.shiftKey && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerUp={unpress} onPointerCancel={unpress} onPointerMove={unpress}>
                       <button class="pick" title="Выделить" onClick={(e) => (e.stopPropagation(), toggle(m.id))}>
@@ -1391,7 +1466,9 @@ function Chat(p: {
                           )}
                         </Show>
                         <Show when={m.media}><MediaView id={m.id} m={m.media!} onView={setView} /></Show>
-                        <Show when={m.text}><span class="text">{m.text}</span></Show>
+                        <Show when={m.text}>
+                          <span class="text">{re() ? m.text.split(re()!).map((s, i) => (i % 2 ? <mark>{s}</mark> : s)) : m.text}</span>
+                        </Show>
                         <span class="meta">
                           <Show when={m.pinned}><Pin size={11} /></Show>
                           <Show when={m.edited}><span>изменено</span></Show>

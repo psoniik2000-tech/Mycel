@@ -221,6 +221,11 @@ input, textarea {
   border-top: 1px solid var(--line); color: var(--accent); cursor: pointer;
 }
 .replybar + .composer { border-top: 0; }
+.searchbar { display: flex; align-items: center; gap: 4px; padding: 6px 8px 6px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.searchbar input { flex: 1; min-width: 0; }
+.searchbar small { white-space: nowrap; }
+.msg.found { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+mark { background: color-mix(in srgb, var(--accent) 35%, transparent); color: inherit; border-radius: 3px; }
 .selbar button:not(.icon) { padding: 7px 12px; font-size: 14px; }
 button.del { color: var(--danger); }
 .overlay { position: fixed; inset: 0; z-index: 55; }
