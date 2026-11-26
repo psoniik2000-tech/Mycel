@@ -28,6 +28,7 @@ mod call;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
 #[cfg(not(target_os = "android"))]
 pub use iroh_relay::server::Server as RelayServer;
+pub use mycel_crypto::safety_code;
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 

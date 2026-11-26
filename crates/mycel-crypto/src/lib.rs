@@ -65,6 +65,22 @@ fn event_id(ev: &Event) -> [u8; 32] {
     blake3::hash(&postcard::to_allocvec(&e).expect("event serializes")).into()
 }
 
+/// Safety code of two devices (DESIGN.md §4.5): 12 groups of 5 digits, the same on both sides.
+pub fn safety_code(a: &[u8; 32], b: &[u8; 32]) -> String {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = blake3::Hasher::new_derive_key("mycel safety code v1");
+    h.update(lo).update(hi);
+    let mut out = [0u8; 60];
+    h.finalize_xof().fill(&mut out);
+    out.chunks(5)
+        .map(|c| {
+            let n = c.iter().fold(0u64, |n, &x| n << 8 | x as u64);
+            format!("{:05}", n % 100_000)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +110,19 @@ mod tests {
         assert!(verify_addr(&a, k.public().as_bytes()));
         a.relay = Some("http://evil".into());
         assert!(!verify_addr(&a, k.public().as_bytes()));
+    }
+
+    #[test]
+    fn safety_code_symmetric() {
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let code = safety_code(&a, &b);
+        assert_eq!(code, safety_code(&b, &a));
+        assert_eq!(code, safety_code(&a, &b));
+        assert_ne!(code, safety_code(&a, &c));
+        assert_eq!(code.len(), 12 * 5 + 11);
+        assert!(
+            code.split(' ')
+                .all(|g| g.len() == 5 && g.bytes().all(|d| d.is_ascii_digit()))
+        );
     }
 }

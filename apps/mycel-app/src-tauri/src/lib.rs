@@ -977,6 +977,20 @@ async fn invite(st: State<'_, App>) -> R<Invite> {
     Ok(Invite { link, svg })
 }
 
+/// Safety code of this device and a member (short id), with its QR (DESIGN.md §4.5).
+#[tauri::command]
+async fn safety_code(st: State<'_, App>, id: String) -> R<Invite> {
+    let n = &st.node()?;
+    let peer = chat_of(n, &id)?.ok_or("no such member")?;
+    let link = mycel_core::safety_code(&n.device_id(), &peer);
+    let svg = qrcode::QrCode::new(&link)
+        .map_err(|e| e.to_string())?
+        .render::<qrcode::render::svg::Color>()
+        .quiet_zone(true)
+        .build();
+    Ok(Invite { link, svg })
+}
+
 #[tauri::command]
 async fn history(st: State<'_, App>, chat: String) -> R<Vec<Msg>> {
     let n = &st.node()?;
@@ -1527,6 +1541,7 @@ pub fn run() {
             create_space,
             join,
             invite,
+            safety_code,
             history,
             chats,
             open_dm,
