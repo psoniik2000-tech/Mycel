@@ -128,28 +128,32 @@ function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean }) {
   const [playing, setPlaying] = createSignal(false);
   const [pos, setPos] = createSignal(0);
   const [rate, setRate] = createSignal(1);
+  const [dur, setDur] = createSignal(0);
+  // The recorded length; a WebM without it in its header reports Infinity (or junk while loading).
+  const len = () => p.ms || dur();
   const bars = () => (p.wave.length ? p.wave : Array(64).fill(40));
   const toggle = () => (audio.paused ? audio.play() : audio.pause());
   const seek = (e: MouseEvent) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    if (p.ms) audio.currentTime = (((e.clientX - r.left) / r.width) * p.ms) / 1000;
+    if (len()) { audio.currentTime = (((e.clientX - r.left) / r.width) * len()) / 1000; setPos(audio.currentTime * 1000); }
   };
   return (
     <div class="voice">
       <button class="icon play" disabled={!p.ready} onClick={toggle}>{playing() ? <Pause size={18} /> : <Play size={18} />}</button>
       <div class="wave" onClick={seek}>
         <For each={bars()}>
-          {(v, i) => <i style={{ height: `${10 + (v / 255) * 90}%` }} classList={{ done: (i() + 0.5) / bars().length <= pos() / Math.max(1, p.ms) }} />}
+          {(v, i) => <i style={{ height: `${10 + (v / 255) * 90}%` }} classList={{ done: (i() + 0.5) / bars().length <= pos() / Math.max(1, len()) }} />}
         </For>
       </div>
-      <span class="muted small">{clock(playing() || pos() ? pos() : p.ms)}</span>
+      <span class="muted small">{clock(playing() || pos() ? Math.min(pos(), len() || pos()) : len())}</span>
       <button class="link rate" onClick={() => { const r = rate() === 1 ? 1.5 : rate() === 1.5 ? 2 : 1; setRate(r); audio.playbackRate = r; }}>{rate()}×</button>
       {/* Keeps the position on pause: playback continues from where it stopped. */}
       <audio ref={audio} src={p.src} preload="auto"
         onPlay={() => { audio.playbackRate = rate(); setPlaying(true); }}
         onPause={() => setPlaying(false)}
         onEnded={() => { setPlaying(false); setPos(0); }}
-        onTimeUpdate={() => setPos(audio.currentTime * 1000)} />
+        onDurationChange={() => isFinite(audio.duration) && setDur(audio.duration * 1000)}
+        onTimeUpdate={() => !audio.paused && setPos(audio.currentTime * 1000)} />
     </div>
   );
 }

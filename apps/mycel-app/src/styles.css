@@ -343,13 +343,13 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / 88%); display: grid; place-items: center; z-index: 50; cursor: zoom-out; }
 .viewer img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
-.recording { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-variant-numeric: tabular-nums; }
+.recording { display: flex; align-items: center; align-self: stretch; gap: 10px; padding: 0 44px 0 8px; font-variant-numeric: tabular-nums; }
 .recording.cancel { color: var(--danger); }
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
 .recording .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Hold-to-record mic: 2x while live (inline transform carries the slide), halo follows loudness */
-.icon.mic { position: relative; touch-action: none; transition: transform .2s; }
+.icon.mic { position: relative; touch-action: none; transition: transform .2s; transform-origin: 70% 80%; }
 .icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transition: none; }
 .icon.mic .halo { display: none; position: absolute; inset: 0; border-radius: 50%; background: rgb(196 69 47 / 35%); z-index: -1; pointer-events: none; }
 .icon.mic.live .halo { display: block; }
