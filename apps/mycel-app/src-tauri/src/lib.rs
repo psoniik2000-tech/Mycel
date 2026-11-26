@@ -3,7 +3,7 @@
 use mycel_core::mycel_proto::{BlobRef, CallAction, Event, EventBody, EventId, MediaKind, Preview};
 use mycel_core::{Chat, Node, Opts, edits_and_pins, media};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,16 @@ impl App {
             .unwrap()
             .as_ref()
             .map(|o| o.node.clone())
+            .ok_or_else(|| "locked".into())
+    }
+
+    /// The open node and its space id.
+    fn open(&self) -> R<(Arc<Node>, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|o| (o.node.clone(), o.id.clone()))
             .ok_or_else(|| "locked".into())
     }
 
@@ -132,7 +142,7 @@ extern "system" fn Java_org_mycel_app_Push_pull<'l>(
         let list = spaces::List::load(&root).ok()?;
         let id = list.last.clone()?;
         let pw = vault::load_in(&mut env, &root, &id)?;
-        let notes = tauri::async_runtime::block_on(pull(&root, &id, &pw, list))?;
+        let notes = tauri::async_runtime::block_on(pull(&root, &id, &pw, &list))?;
         let s = env.find_class("java/lang/String").ok()?;
         let arr = env
             .new_object_array(2 * notes.len() as i32, s, jni::objects::JObject::null())
@@ -156,14 +166,14 @@ async fn pull(
     root: &Path,
     id: &str,
     pw: &str,
-    list: spaces::List,
+    list: &spaces::List,
 ) -> Option<Vec<(String, String)>> {
     use tokio::time::{Duration, Instant, sleep, timeout_at};
     let end = Instant::now() + Duration::from_secs(8);
     let opts = Opts {
         n0: list.n0,
-        extra_relays: list.relays,
-        mailbox: list.mailbox,
+        extra_relays: list.relays.clone(),
+        mailbox: list.mailbox.clone(),
         ..Default::default()
     };
     let (node, mut rx) = timeout_at(end, Node::open(&spaces::dir(root, id), pw, &opts))
@@ -174,6 +184,8 @@ async fn pull(
         node.set_push_token(t.trim().to_string());
     }
     let mut notes = vec![];
+    // Something of a muted chat came: no content-free notice for it either.
+    let mut muted = false;
     let done = timeout_at(end, async {
         node.sync_now().await;
         // Then a moment more for peers online and the receipts' mailbox posts (sent in the background).
@@ -183,7 +195,13 @@ async fn pull(
             tokio::select! {
                 Some(ev) = rx.recv() => {
                     let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
-                    notes.extend(note(&node, &ev, &chat));
+                    if let Some(t) = note(&node, &ev, &chat) {
+                        if list.muted(id, &chat_id(&chat)) {
+                            muted = true;
+                        } else {
+                            notes.push(t);
+                        }
+                    }
                 }
                 _ = &mut quiet => break,
             }
@@ -192,7 +210,7 @@ async fn pull(
     .await
     .is_ok();
     node.close().await;
-    (done || !notes.is_empty()).then_some(notes)
+    (done || muted || !notes.is_empty()).then_some(notes)
 }
 
 #[derive(Serialize, Clone)]
@@ -335,6 +353,8 @@ struct ChatRow {
     id: String,
     last: Option<Msg>,
     unread: usize,
+    /// No notifications on this device.
+    muted: bool,
 }
 
 #[derive(Serialize)]
@@ -653,6 +673,7 @@ async fn unlock(
             list.spaces.push(spaces::Space {
                 id: id.clone(),
                 name: name.trim().to_string(),
+                muted: vec![],
             });
             id
         }
@@ -739,6 +760,7 @@ async fn unlock(
         node.set_push_token(t.trim().to_string());
     }
     let in_space = node.admin().is_ok();
+    let space = id.clone();
     *st.0.lock().unwrap() = Some(Open {
         node: node.clone(),
         id,
@@ -759,7 +781,9 @@ async fn unlock(
                 break;
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
-            if let Some((who, text)) = note(&node, &ev, &chat) {
+            if let Some((who, text)) = note(&node, &ev, &chat)
+                && !spaces::List::load(&root).is_ok_and(|l| l.muted(&space, &chat_id(&chat)))
+            {
                 notify(&app, who, text);
             }
             if let EventBody::Call { call_id, action } = &ev.body {
@@ -966,24 +990,37 @@ async fn mark_read(st: State<'_, App>, chat: String) -> R<()> {
     n.mark_read(&chat_of(n, &chat)?).map_err(err)
 }
 
-/// The space chat and every 1:1 chat with its last message; `read`: chat → ts read up to.
+/// The space chat and every 1:1 chat with its last message and unread count.
 #[tauri::command]
-async fn chats(st: State<'_, App>, read: HashMap<String, u64>) -> R<Vec<ChatRow>> {
-    let n = &st.node()?;
+async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
+    let (n, space) = &st.open()?;
+    let spaces = spaces::List::load(&data_dir(&app)?).map_err(|e| e.to_string())?;
     let mut list = vec![None];
     list.extend(n.dms().map_err(err)?.into_iter().map(Some));
     list.iter()
         .map(|c| {
             let id = chat_id(c);
             let msgs = chat_msgs(n, c)?;
-            let seen = read.get(&id).copied().unwrap_or(0);
+            let new: HashSet<_> = n.unread(c).map_err(err)?.iter().map(|i| hex(i)).collect();
             Ok(ChatRow {
-                unread: msgs.iter().filter(|m| !m.mine && m.ts > seen).count(),
+                // Only messages the feed shows (a call without its view is not one).
+                unread: msgs.iter().filter(|m| new.contains(&m.id)).count(),
                 last: msgs.into_iter().last(),
+                muted: spaces.muted(space, &id),
                 id,
             })
         })
         .collect()
+}
+
+/// "Без звука": no system notifications for this chat, on this device only.
+#[tauri::command]
+fn set_muted(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()> {
+    let (_, space) = st.open()?;
+    let root = data_dir(&app)?;
+    let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    list.set_muted(&space, &chat, on);
+    list.save(&root).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1516,6 +1553,7 @@ pub fn run() {
             peers,
             set_visible,
             mark_read,
+            set_muted,
             stash,
             close_space,
             remove_space,

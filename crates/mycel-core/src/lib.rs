@@ -871,14 +871,42 @@ impl Node {
             .collect())
     }
 
-    /// Sends one Read receipt up to the chat's newest message from someone else, unless one already covers it (§7.4).
-    /// The UI calls it while the chat is open and the window visible.
+    /// Others' messages and calls in the chat newer than my latest Read receipt.
+    // shortcut: "newer" by lamport, as in `statuses`: in a group, one written offline that arrives after
+    // I read later ones counts as read; keep per-author marks if that misleads.
+    pub fn unread(&self, chat: &Chat) -> Result<Vec<EventId>> {
+        let me = self.device_id();
+        let hist = self.history(chat)?;
+        let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
+        let read = hist
+            .iter()
+            .filter_map(|e| match &e.body {
+                // A receipt whose target was deleted covers everything before itself.
+                EventBody::Receipt {
+                    up_to,
+                    kind: ReceiptKind::Read,
+                } if e.author_device == me => {
+                    Some(lamport.get(up_to).copied().unwrap_or(e.lamport))
+                }
+                _ => None,
+            })
+            .max();
+        Ok(hist
+            .iter()
+            .filter(|e| e.author_device != me && is_incoming(&e.body))
+            .filter(|e| read.is_none_or(|l| e.lamport > l))
+            .map(|e| e.id)
+            .collect())
+    }
+
+    /// Sends one Read receipt up to the chat's newest message or call from someone else, unless one already
+    /// covers it (§7.4). The UI calls it while the chat is open and the window visible.
     pub fn mark_read(&self, chat: &Chat) -> Result<()> {
         let me = self.device_id();
         let hist = self.history(chat)?;
         let Some(last) = hist
             .iter()
-            .filter(|e| e.author_device != me && is_msg(&e.body))
+            .filter(|e| e.author_device != me && is_incoming(&e.body))
             .max_by_key(|e| e.lamport)
         else {
             return Ok(());
@@ -1612,6 +1640,18 @@ pub fn edits_and_pins(hist: &[Event]) -> (HashMap<EventId, String>, Vec<EventId>
 
 fn is_msg(b: &EventBody) -> bool {
     matches!(b, EventBody::Text { .. } | EventBody::Media { .. })
+}
+
+/// What counts as unread from someone else: a message or a call.
+fn is_incoming(b: &EventBody) -> bool {
+    is_msg(b)
+        || matches!(
+            b,
+            EventBody::Call {
+                action: mycel_proto::CallAction::Offer { .. },
+                ..
+            }
+        )
 }
 
 /// The media kind and blob of a Media event.
