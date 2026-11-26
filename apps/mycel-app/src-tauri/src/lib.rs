@@ -64,6 +64,27 @@ impl App {
 /// The window is on screen (the UI reports `visibilitychange`); hidden → system notifications.
 struct Visible(AtomicBool);
 
+/// The system notification for a new event from someone else: (title, body).
+fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
+    if ev.author_device == n.device_id() {
+        return None;
+    }
+    let mut who = name_of(n, &ev.author_device);
+    let text = match &ev.body {
+        EventBody::Call {
+            action: CallAction::Offer { .. },
+            ..
+        } => return Some((who, "Входящий звонок".into())),
+        EventBody::Text { text, .. } => text.clone(),
+        EventBody::Media { .. } => "Медиа".into(),
+        _ => return None,
+    };
+    if chat.is_none() {
+        who += " · Общий чат";
+    }
+    Some((who, text))
+}
+
 fn notify(app: &AppHandle, title: String, body: String) {
     if !app.state::<Visible>().0.load(Ordering::Relaxed) {
         let _ = app.notification().builder().title(title).body(body).show();
@@ -88,6 +109,90 @@ extern "C" fn Java_org_mycel_app_Push_wake(
     };
     tauri::async_runtime::spawn(async move { n.sync_now().await });
     1
+}
+
+/// A push came and no node lives in this process (Push.kt): opens the last space with its remembered
+/// password, pulls the mailbox (which sends the Delivered receipts) and closes. Returns title, body
+/// pairs of the new messages for Push.kt to show; null → no remembered password or it failed.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_mycel_app_Push_pull<'l>(
+    mut env: jni::JNIEnv<'l>,
+    _cls: jni::objects::JClass<'l>,
+    root: jni::objects::JString<'l>,
+    cache: jni::objects::JString<'l>,
+) -> jni::sys::jobjectArray {
+    let res = (|| {
+        let root = PathBuf::from(String::from(env.get_string(&root).ok()?));
+        let cache = String::from(env.get_string(&cache).ok()?);
+        if std::env::var_os("TMPDIR").is_none() {
+            // SAFETY: as in `run`: core reads it only once a node is open.
+            unsafe { std::env::set_var("TMPDIR", cache) };
+        }
+        let list = spaces::List::load(&root).ok()?;
+        let id = list.last.clone()?;
+        let pw = vault::load_in(&mut env, &root, &id)?;
+        let notes = tauri::async_runtime::block_on(pull(&root, &id, &pw, list))?;
+        let s = env.find_class("java/lang/String").ok()?;
+        let arr = env
+            .new_object_array(2 * notes.len() as i32, s, jni::objects::JObject::null())
+            .ok()?;
+        for (i, t) in notes.into_iter().flat_map(|(a, b)| [a, b]).enumerate() {
+            let t = env.new_string(t).ok()?;
+            env.set_object_array_element(&arr, i as i32, t).ok()?;
+        }
+        Some(arr.into_raw())
+    })();
+    if res.is_none() {
+        let _ = env.exception_clear();
+    }
+    res.unwrap_or(std::ptr::null_mut())
+}
+
+/// `Push_pull`'s node: everything new within ~8 s (FCM gives onMessageReceived about 10);
+/// None if it did not open or ran out of time with nothing.
+#[cfg(target_os = "android")]
+async fn pull(
+    root: &Path,
+    id: &str,
+    pw: &str,
+    list: spaces::List,
+) -> Option<Vec<(String, String)>> {
+    use tokio::time::{Duration, Instant, sleep, timeout_at};
+    let end = Instant::now() + Duration::from_secs(8);
+    let opts = Opts {
+        n0: list.n0,
+        extra_relays: list.relays,
+        mailbox: list.mailbox,
+        ..Default::default()
+    };
+    let (node, mut rx) = timeout_at(end, Node::open(&spaces::dir(root, id), pw, &opts))
+        .await
+        .ok()?
+        .ok()?;
+    if let Ok(t) = std::fs::read_to_string(root.join("push_token")) {
+        node.set_push_token(t.trim().to_string());
+    }
+    let mut notes = vec![];
+    let done = timeout_at(end, async {
+        node.sync_now().await;
+        // Then a moment more for peers online and the receipts' mailbox posts (sent in the background).
+        let quiet = sleep(Duration::from_secs(2));
+        tokio::pin!(quiet);
+        loop {
+            tokio::select! {
+                Some(ev) = rx.recv() => {
+                    let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
+                    notes.extend(note(&node, &ev, &chat));
+                }
+                _ = &mut quiet => break,
+            }
+        }
+    })
+    .await
+    .is_ok();
+    node.close().await;
+    (done || !notes.is_empty()).then_some(notes)
 }
 
 #[derive(Serialize, Clone)]
@@ -576,6 +681,7 @@ async fn unlock(
     };
     // Listed before the node creates its folder, so List::load never takes it for an orphan.
     list.last = Some(id.clone());
+    (list.n0, list.relays, list.mailbox) = (n0, relays.clone(), mailbox.clone());
     list.save(&root).map_err(|e| e.to_string())?;
     st.close().await;
     #[cfg(not(target_os = "android"))]
@@ -653,6 +759,9 @@ async fn unlock(
                 break;
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
+            if let Some((who, text)) = note(&node, &ev, &chat) {
+                notify(&app, who, text);
+            }
             if let EventBody::Call { call_id, action } = &ev.body {
                 let (action, video) = match action {
                     CallAction::Offer { video } => ("offer", *video),
@@ -660,10 +769,6 @@ async fn unlock(
                     CallAction::Reject => ("reject", false),
                     CallAction::End => ("end", false),
                 };
-                if action == "offer" {
-                    let who = name_of(&node, &ev.author_device);
-                    notify(&app, who, "Входящий звонок".into());
-                }
                 let _ = app.emit(
                     "call",
                     CallSignal {
@@ -676,17 +781,6 @@ async fn unlock(
                     },
                 );
                 continue;
-            }
-            if ev.author_device != node.device_id() {
-                let mut who = name_of(&node, &ev.author_device);
-                if chat.is_none() {
-                    who += " · Общий чат";
-                }
-                match &ev.body {
-                    EventBody::Text { text, .. } => notify(&app, who, text.clone()),
-                    EventBody::Media { .. } => notify(&app, who, "Медиа".into()),
-                    _ => {}
-                }
             }
             // The UI reloads on `message` / `changed` (payload: the chat); receipts only move the ticks.
             let _ = match &ev.body {

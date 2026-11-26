@@ -32,6 +32,7 @@ mod imp {
 /// the ciphertext in `<root>/keys/<id>` (DESIGN §10).
 #[cfg(target_os = "android")]
 mod imp {
+    use jni::JNIEnv;
     use jni::objects::{JByteArray, JClass, JObject, JValue};
     use std::path::{Path, PathBuf};
 
@@ -40,6 +41,20 @@ mod imp {
     }
 
     /// Calls `Vault.<method>(byte[]): byte[]`.
+    fn call(
+        env: &mut JNIEnv,
+        class: &JClass,
+        method: &str,
+        data: &[u8],
+    ) -> jni::errors::Result<Vec<u8>> {
+        let arr = env.byte_array_from_slice(data)?;
+        let out: JByteArray = env
+            .call_static_method(class, method, "([B)[B", &[JValue::Object(&arr)])?
+            .l()?
+            .into();
+        env.convert_byte_array(&out)
+    }
+
     fn vault(method: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         let cx = ndk_context::android_context();
         // SAFETY: tauri initialises ndk_context with the live VM and activity before any command runs.
@@ -62,12 +77,7 @@ mod imp {
                 )?
                 .l()?
                 .into();
-            let arr = env.byte_array_from_slice(data)?;
-            let out: JByteArray = env
-                .call_static_method(&class, method, "([B)[B", &[JValue::Object(&arr)])?
-                .l()?
-                .into();
-            env.convert_byte_array(&out)
+            call(&mut env, &class, method, data)
         })();
         // A pending Java exception would crash the next JNI call.
         if res.is_err() {
@@ -91,6 +101,20 @@ mod imp {
     pub fn forget(root: &Path, id: &str) {
         let _ = std::fs::remove_file(file(root, id));
     }
+
+    /// `load` on a thread Java called into (a push with no app running): no ndk_context there.
+    pub fn load_in(env: &mut JNIEnv, root: &Path, id: &str) -> Option<String> {
+        let sealed = std::fs::read(file(root, id)).ok()?;
+        let res = env
+            .find_class("org/mycel/app/Vault")
+            .and_then(|c| call(env, &c, "open", &sealed));
+        if res.is_err() {
+            let _ = env.exception_clear();
+        }
+        String::from_utf8(res.ok()?).ok()
+    }
 }
 
+#[cfg(target_os = "android")]
+pub use imp::load_in;
 pub use imp::{forget, load, save};
