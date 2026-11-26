@@ -254,7 +254,7 @@ button.del { color: var(--danger); }
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
 ::-webkit-scrollbar-button { display: none; }
-.composer .send:not(:disabled) { color: var(--accent); }
+.composer .send:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
 
 @media (max-width: 899px) {
   .app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }

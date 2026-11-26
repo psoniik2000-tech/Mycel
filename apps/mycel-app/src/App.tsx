@@ -1705,13 +1705,16 @@ function Chat(p: {
               send();
             }
           }} />
-        <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
-          title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
-          {video() ? <Video size={20} /> : <Mic size={20} />}
-        </button>
-        <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>
-          {editing() ? <Check size={20} /> : <Send size={20} />}
-        </button>
+        <Show when={text().trim() || editing()} fallback={
+          <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
+            title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
+            {video() ? <Video size={20} /> : <Mic size={20} />}
+          </button>
+        }>
+          <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>
+            {editing() ? <Check size={20} /> : <Send size={20} />}
+          </button>
+        </Show>
       </div>
     </section>
   );
