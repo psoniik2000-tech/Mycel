@@ -1363,7 +1363,7 @@ function Chat(p: {
     });
   });
 
-  // 🎤/📹: a tap switches the mode, holding records; release sends, slide left (or Esc) cancels.
+  // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
   let holdTimer = 0, tick = 0, startX = 0, holding = false;
   const stopRec = async (send: boolean) => {
     const r = rec();
@@ -1405,7 +1405,7 @@ function Chat(p: {
     if (rec()) stopRec(!cancelling());
     else setVideo(!video());
   };
-  const move = (e: PointerEvent) => rec() && setCancelling(startX - e.clientX > 80);
+  const move = (e: PointerEvent) => rec() && setCancelling(Math.abs(startX - e.clientX) > 80);
   let list!: HTMLDivElement;
   let input!: HTMLTextAreaElement;
   // Stay at the bottom if already there (or on own send); otherwise count what came for the ↓ button.
@@ -1693,7 +1693,7 @@ function Chat(p: {
         <Show when={rec()}>
           <div class="recording grow" classList={{ cancel: cancelling() }}>
             <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")}
-            <span class="muted small grow">{cancelling() ? "Отпустите — отмена" : "← влево или Esc — отмена"}</span>
+            <span class="muted small grow">{cancelling() ? "Отпустите — отмена" : "Отпустите, чтобы отправить · уведите в сторону — отмена"}</span>
             <X size={18} />
           </div>
         </Show>

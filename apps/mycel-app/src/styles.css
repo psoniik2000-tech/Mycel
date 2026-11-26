@@ -321,7 +321,11 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
 .icon.mic { touch-action: none; }
-.icon.mic.live { background: var(--danger); color: #fff; }
+.icon.mic { transition: transform .15s; }
+.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transform: scale(1.5); animation: pulse 1.2s infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgb(196 69 47 / 55%); } 100% { box-shadow: 0 0 0 16px rgb(196 69 47 / 0%); } }
+.recording { font-variant-numeric: tabular-nums; }
+.recording .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Calls (§9) */
 .call-line { align-self: center; display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted);
