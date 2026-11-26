@@ -33,6 +33,7 @@ pub use mycel_net::RelayUrl;
 pub use mycel_proto;
 
 const LINK: &str = "mycel://join/";
+const CONTACT_LINK: &str = "mycel://contact/";
 /// Join error prefixes (the UI shows a matching text).
 pub const JOIN_BAD_LINK: &str = "not a mycel invite link";
 pub const JOIN_UNREACHABLE: &str = "inviter unreachable";
@@ -78,7 +79,8 @@ fn chat_from(k: &[u8]) -> Chat {
     k.try_into().ok()
 }
 
-// shortcut: a node is in exactly one space = one MLS group, plus one 2-member group per 1:1 chat.
+// shortcut: a node is in exactly one space = one MLS group, plus one 2-member group per 1:1 chat
+// (a space member's, or a contact's: a pair group with its own space id, §4.2).
 struct State {
     store: Store,
     mls: Mls,
@@ -106,6 +108,69 @@ impl State {
         let mut d = self.dms()?;
         d.push((gid, peer));
         self.store.set_meta("dms", &postcard::to_allocvec(&d)?)
+    }
+
+    /// Pair groups made by a contact link (§4.2): their envelopes carry their own space id and
+    /// go to the partner only. The partner is in `dms`.
+    fn contacts(&self) -> Result<Vec<[u8; 32]>> {
+        let r = self.store.meta("contacts")?;
+        Ok(r.map(|b| postcard::from_bytes(&b))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    fn add_contact(&self, gid: [u8; 32], peer: [u8; 32]) -> Result<()> {
+        let mut c = self.contacts()?;
+        c.push(gid);
+        self.store
+            .set_meta("contacts", &postcard::to_allocvec(&c)?)?;
+        self.add_dm(gid, peer)
+    }
+
+    /// Who may get a group's envelopes: the partner of a contact group, the space members for
+    /// the space and its 1:1 groups. A closure, so a sync looks the rest up once.
+    fn audience(&self) -> Result<impl Fn(&[u8; 32], &[u8; 32]) -> bool + use<>> {
+        let members: HashSet<_> = self.mls.members(&self.group()?).into_iter().collect();
+        let dms: HashMap<_, _> = self.dms()?.into_iter().collect();
+        let contacts: HashMap<_, _> = self
+            .contacts()?
+            .into_iter()
+            .filter_map(|g| Some((g, *dms.get(&g)?)))
+            .collect();
+        Ok(
+            move |gid: &[u8; 32], dev: &[u8; 32]| match contacts.get(gid) {
+                Some(p) => p == dev,
+                None => members.contains(dev),
+            },
+        )
+    }
+
+    /// A space member or a contact partner: may sync with us and fetch blobs.
+    fn knows(&self, dev: &[u8; 32]) -> Result<bool> {
+        let dms: HashMap<_, _> = self.dms()?.into_iter().collect();
+        Ok(self.mls.members(&self.group()?).contains(dev)
+            || self.contacts()?.iter().any(|g| dms.get(g) == Some(dev)))
+    }
+
+    /// Stored peers that may get group `gid`'s envelopes.
+    fn peers_of(&self, gid: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
+        let sees = self.audience()?;
+        Ok(self
+            .store
+            .peers()?
+            .into_iter()
+            .filter(|p| peer_addr(p).is_some_and(|a| sees(gid, a.id.as_bytes())))
+            .collect())
+    }
+
+    /// (id, group) of every stored envelope.
+    fn env_groups(&self) -> Result<Vec<([u8; 32], [u8; 32])>> {
+        let mut out = vec![];
+        for (id, data) in self.store.envelopes()? {
+            let e: Envelope = postcard::from_bytes(&data)?;
+            out.extend(id.try_into().ok().map(|id| (id, e.group_id)));
+        }
+        Ok(out)
     }
 
     /// The MLS group a chat sends to.
@@ -155,7 +220,11 @@ impl State {
     fn envelope(&self, group_id: [u8; 32], ciphertext: Vec<u8>, epoch: u64) -> Result<Envelope> {
         Ok(Envelope {
             version: 1,
-            space_id: self.group()?[..16].try_into()?,
+            space_id: if self.contacts()?.contains(&group_id) {
+                group_id[..16].try_into()?
+            } else {
+                self.group()?[..16].try_into()?
+            },
             group_id,
             epoch,
             ciphertext,
@@ -193,7 +262,12 @@ impl State {
     /// Decrypts and stores one envelope; returns the new events (several when it is the
     /// Welcome of a 1:1 chat whose messages came first).
     fn receive(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
-        ensure!(env.space_id == self.group()?[..16], "foreign space");
+        let space = if self.contacts()?.contains(&env.group_id) {
+            env.group_id
+        } else {
+            self.group()?
+        };
+        ensure!(env.space_id == space[..16], "foreign space");
         if self.store.has_envelope(&envelope_id(env))? {
             return Ok(vec![]);
         }
@@ -529,11 +603,98 @@ impl Node {
         Ok(format!("{LINK}{}", BASE32_NOPAD.encode(&bytes)))
     }
 
-    /// Joins a space by invite link: proves the secret, sends a KeyPackage, applies the Welcome.
+    /// One-time contact link (§4.2): base32(one-time secret, our ticket, relay URLs). Anyone may
+    /// make one; whoever accepts it gets a pair group with us and nobody else.
+    pub async fn contact_invite(&self) -> Result<String> {
+        let ticket = self.ticket().await;
+        let relays = self.relays();
+        let mut secret = [0u8; 16];
+        getrandom::fill(&mut secret)?;
+        let st = self.st.lock().unwrap();
+        st.store
+            .set_meta(&format!("contact:{}", hex(&secret)), &[])?;
+        let bytes = postcard::to_allocvec(&(secret, ticket, relays))?;
+        Ok(format!("{CONTACT_LINK}{}", BASE32_NOPAD.encode(&bytes)))
+    }
+
+    /// Partners added by contact links.
+    pub fn contacts(&self) -> Result<Vec<[u8; 32]>> {
+        let st = self.st.lock().unwrap();
+        let dms: HashMap<_, _> = st.dms()?.into_iter().collect();
+        Ok(st
+            .contacts()?
+            .iter()
+            .filter_map(|g| dms.get(g).copied())
+            .collect())
+    }
+
+    /// Proves an invite secret to `to` with a KeyPackage and our address; returns its answer.
+    async fn ask_join(&self, to: EndpointAddr, secret: [u8; 16]) -> Result<JoinResp> {
+        self.wait_relay().await;
+        let req = JoinReq {
+            secret,
+            key_package: self.st.lock().unwrap().mls.key_package(false)?,
+            addr: self.my_addr()?,
+        };
+        let resp = tokio::time::timeout(
+            JOIN_TIMEOUT,
+            self.net.join(to, &postcard::to_allocvec(&req)?),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .context(JOIN_UNREACHABLE)?;
+        // The inviter answers an empty message when it refuses (unknown or used secret).
+        ensure!(!resp.is_empty(), JOIN_USED);
+        postcard::from_bytes(&resp).context("bad join response")
+    }
+
+    /// Accepts a contact link: a pair group with its author. A node without a space gets its own
+    /// first (the app treats "in a space" as "set up").
+    async fn add_contact(&self, link: &str) -> Result<()> {
+        let parsed = || -> Result<_> {
+            let b32 = link.strip_prefix(CONTACT_LINK).context("no prefix")?;
+            let (secret, ticket, relays): ([u8; 16], String, Vec<String>) =
+                postcard::from_bytes(&BASE32_NOPAD.decode(b32.as_bytes())?)?;
+            let to: EndpointAddr = ticket.parse::<EndpointTicket>()?.into();
+            Ok((secret, ticket, relays, to))
+        };
+        let (secret, ticket, relays, to) = parsed().context(JOIN_BAD_LINK)?;
+        let (me, peer) = (self.device_id(), *to.id.as_bytes());
+        ensure!(peer != me, "this is your own link");
+        if !self.st.lock().unwrap().in_space()? {
+            self.create_space()?;
+        }
+        self.learn_relays(&self.st.lock().unwrap(), &relays)?;
+        let resp = self.ask_join(to, secret).await?;
+        {
+            let mut st = self.st.lock().unwrap();
+            let gid = st.mls.join(&resp.welcome)?;
+            let m = st.mls.members(&gid);
+            ensure!(
+                m.len() == 2 && m.contains(&me) && m.contains(&peer),
+                "not a pair group with the link's author"
+            );
+            st.add_contact(gid.try_into().ok().context("bad group id")?, peer)?;
+            st.save_mls()?;
+            st.store.upsert_peer(&peer, ticket.as_bytes())?;
+            self.add_peers(&st, &resp.peers)?;
+        }
+        self.push_registered
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_profile(true)?;
+        self.sync()
+    }
+
+    /// Joins a space by invite link: proves the secret, sends a KeyPackage, applies the Welcome;
+    /// a contact link adds a contact instead.
     /// Errors start with [`JOIN_BAD_LINK`], [`JOIN_UNREACHABLE`] or [`JOIN_USED`] when they are those.
     pub async fn join(&self, link: &str) -> Result<()> {
         // Messengers and notes wrap long links: drop every whitespace, not only the ends.
         let link: String = link.split_whitespace().collect();
+        if link.starts_with(CONTACT_LINK) {
+            return self.add_contact(&link).await;
+        }
         let parsed = || -> Result<_> {
             let b32 = link.strip_prefix(LINK).context("no mycel://join/ prefix")?;
             let (gid, secret, ticket, relays): ([u8; 32], [u8; 16], String, Vec<String>) =
@@ -547,24 +708,8 @@ impl Node {
             ensure!(!st.in_space()?, "already in a space");
             self.learn_relays(&st, &relays)?;
         }
-        self.wait_relay().await;
-        let req = JoinReq {
-            secret,
-            key_package: self.st.lock().unwrap().mls.key_package(false)?,
-            addr: self.my_addr()?,
-        };
         let admin_id = admin.id;
-        let resp = tokio::time::timeout(
-            JOIN_TIMEOUT,
-            self.net.join(admin, &postcard::to_allocvec(&req)?),
-        )
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-        .context(JOIN_UNREACHABLE)?;
-        // The admin answers an empty message when it refuses (unknown or used secret).
-        ensure!(!resp.is_empty(), JOIN_USED);
-        let resp: JoinResp = postcard::from_bytes(&resp).context("bad join response")?;
+        let resp = self.ask_join(admin, secret).await?;
         let mut st = self.st.lock().unwrap();
         ensure!(
             st.mls.join(&resp.welcome)? == gid,
@@ -620,48 +765,60 @@ impl Node {
         Ok(p)
     }
 
-    /// Latest profile of each member: (name, avatar, color, key package).
+    /// Newest Profile event of each author, from every chat (contacts send theirs in the pair chat).
+    fn profile_events(&self) -> Result<HashMap<[u8; 32], Event>> {
+        let mut out: HashMap<[u8; 32], Event> = HashMap::new();
+        for (_, e) in self.all_events()? {
+            if matches!(e.body, EventBody::Profile { .. })
+                && out
+                    .get(&e.author_device)
+                    .is_none_or(|o| o.timestamp_ms <= e.timestamp_ms)
+            {
+                out.insert(e.author_device, e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Latest profile of each member and contact: (name, avatar, color, key package).
     pub fn profiles(&self) -> Result<HashMap<[u8; 32], Profile>> {
         Ok(self
-            .history(&None)?
+            .profile_events()?
             .into_iter()
-            .filter_map(|e| match e.body {
+            .filter_map(|(a, e)| match e.body {
                 EventBody::Profile {
                     name,
                     avatar,
                     color,
                     key_package,
-                } => Some((e.author_device, (name, avatar, color, key_package))),
+                } => Some((a, (name, avatar, color, key_package))),
                 _ => None,
             })
             .collect())
     }
 
-    /// Sends our name and avatar to the space chat, with a fresh last-resort KeyPackage.
+    /// Sends our name and avatar to the space chat and every contact, with a fresh last-resort KeyPackage.
     pub fn set_profile(&self, name: &str, avatar: &str, color: u8) -> Result<Event> {
         let name = name.trim();
         ensure!(!name.is_empty(), "empty name");
         let key_package = self.st.lock().unwrap().mls.key_package(true)?;
-        self.send_event(
-            &None,
-            EventBody::Profile {
-                name: name.chars().take(64).collect(),
-                avatar: avatar.trim().chars().take(2).collect(),
-                color,
-                key_package,
-            },
-        )
+        let body = EventBody::Profile {
+            name: name.chars().take(64).collect(),
+            avatar: avatar.trim().chars().take(2).collect(),
+            color,
+            key_package,
+        };
+        for p in self.contacts()? {
+            self.send_event(&Some(p), body.clone())?;
+        }
+        self.send_event(&None, body)
     }
 
     /// Re-sends our profile when its KeyPackage is a month old (they expire after ~3 months),
     /// or always with `force` (a newcomer cannot read what was sent before its join).
     fn refresh_profile(&self, force: bool) -> Result<()> {
         let me = self.device_id();
-        let last = self
-            .history(&None)?
-            .into_iter()
-            .rev()
-            .find(|e| e.author_device == me && matches!(e.body, EventBody::Profile { .. }));
+        let last = self.profile_events()?.remove(&me);
         if let Some(Event {
             timestamp_ms,
             body:
@@ -685,6 +842,9 @@ impl Node {
     pub fn open_dm(&self, peer: [u8; 32]) -> Result<()> {
         let me = self.device_id();
         ensure!(peer != me, "a chat with yourself");
+        if self.st.lock().unwrap().gid(&Some(peer)).is_ok() {
+            return Ok(());
+        }
         ensure!(self.members().contains(&peer), "not a member");
         let kp = self
             .profiles()?
@@ -705,7 +865,7 @@ impl Node {
             st.save_mls()?;
             let env = st.envelope(gid, welcome, 0)?;
             st.store_env(&env)?;
-            (env, st.store.peers()?)
+            (env, st.peers_of(&gid)?)
         };
         self.post_box(&env, false, None);
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
@@ -1154,7 +1314,8 @@ impl Node {
                 }
                 continue;
             }
-            if !self.members().contains(conn.remote_id().as_bytes()) {
+            let known = self.st.lock().unwrap().knows(conn.remote_id().as_bytes());
+            if !known.unwrap_or(false) {
                 continue;
             }
             let store = (*self.blobs).clone();
@@ -1222,7 +1383,7 @@ impl Node {
             let env = st.envelope(gid, ct, epoch)?;
             st.store_event(&ev, chat)?;
             st.store_env(&env)?;
-            (ev, env, st.store.peers()?)
+            (ev, env, st.peers_of(&gid)?)
         };
         if is_msg(&ev.body) {
             self.unacked
@@ -1319,17 +1480,13 @@ impl Node {
 
     /// Stores verified, newer addresses of members and learns their relays (§6.2).
     fn add_peers(&self, st: &State, list: &[SignedAddr]) -> Result<()> {
-        let members = st.mls.members(&st.group()?);
         let mut relays = vec![];
         for a in list {
             let Ok(t) = a.ticket.parse::<EndpointTicket>() else {
                 continue;
             };
             let id = t.endpoint_addr().id;
-            if id == self.net.id()
-                || !members.contains(id.as_bytes())
-                || !verify_addr(a, id.as_bytes())
-            {
+            if id == self.net.id() || !st.knows(id.as_bytes())? || !verify_addr(a, id.as_bytes()) {
                 continue;
             }
             let old = st.store.peer(id.as_bytes()).ok();
@@ -1346,14 +1503,18 @@ impl Node {
         self.learn_relays(st, &relays)
     }
 
-    /// Our address plus every signed member address we know.
-    fn peer_list(&self, st: &State) -> Result<Vec<SignedAddr>> {
-        let mut list: Vec<SignedAddr> = st
-            .store
-            .peers()?
-            .iter()
-            .filter_map(|b| postcard::from_bytes(b).ok())
-            .collect();
+    /// Our address plus, for a space member, every signed member address we know (a contact
+    /// learns no one else).
+    fn peer_list(&self, st: &State, to: &[u8; 32]) -> Result<Vec<SignedAddr>> {
+        let space = st.group()?;
+        let mut list: Vec<SignedAddr> = vec![];
+        if st.mls.members(&space).contains(to) {
+            list.extend(
+                st.peers_of(&space)?
+                    .iter()
+                    .filter_map(|b| postcard::from_bytes(b).ok()),
+            );
+        }
         list.push(self.my_addr()?);
         Ok(list)
     }
@@ -1364,10 +1525,20 @@ impl Node {
         if !st.in_space()? {
             return Ok(());
         }
-        let peers = st.store.peers()?;
-        self.broadcast(peers.clone(), SyncMsg::Peers(self.peer_list(&st)?));
-        let ids = env_ids(&st.store)?;
-        self.broadcast(peers, SyncMsg::Have { ids, reply: true });
+        let (sees, envs) = (st.audience()?, st.env_groups()?);
+        for p in st.store.peers()? {
+            let Some(id) = peer_addr(&p).map(|a| *a.id.as_bytes()) else {
+                continue;
+            };
+            let ids = envs
+                .iter()
+                .filter(|(_, g)| sees(g, &id))
+                .map(|(i, _)| *i)
+                .collect();
+            let to = vec![p];
+            self.broadcast(to.clone(), SyncMsg::Peers(self.peer_list(&st, &id)?));
+            self.broadcast(to, SyncMsg::Have { ids, reply: true });
+        }
         Ok(())
     }
 
@@ -1433,26 +1604,22 @@ impl Node {
         }
     }
 
+    /// Pulls the topic of the space and of every contact (each has its own space id, §4.2).
     async fn try_poll_box(&self, tx: &mpsc::Sender<Vec<Envelope>>) -> Result<()> {
         let Some(b) = &self.mailbox else {
             return Ok(());
         };
-        let (topic, mut seq, tag) = {
+        // (space id, meta key of its last seen seq).
+        let topics: Vec<(Vec<u8>, String)> = {
             let st = self.st.lock().unwrap();
             if !st.in_space()? {
                 return Ok(());
             }
-            let seq = st
-                .store
-                .meta("box_seq")?
-                .and_then(|v| v.try_into().ok())
-                .map_or(0, u64::from_le_bytes);
-            let space = &st.group()?[..16];
-            (
-                Mailbox::topic(space),
-                seq,
-                Mailbox::device_tag(space, &self.device_id()),
-            )
+            let mut t = vec![(st.group()?[..16].to_vec(), "box_seq".to_string())];
+            for g in st.contacts()? {
+                t.push((g[..16].to_vec(), format!("box_seq:{}", hex(&g[..16]))));
+            }
+            t
         };
         let token = self.push_token.lock().unwrap().clone();
         if let Some(t) = token
@@ -1460,52 +1627,66 @@ impl Node {
                 .push_registered
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            b.http
-                .post(format!("{}/push/{topic}", b.url))
-                .header("x-device", tag)
-                .body(t)
-                .send()
-                .await?
-                .error_for_status()?;
+            for (space, _) in &topics {
+                b.http
+                    .post(format!("{}/push/{}", b.url, Mailbox::topic(space)))
+                    .header("x-device", Mailbox::device_tag(space, &self.device_id()))
+                    .body(t.clone())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
             self.push_registered
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        loop {
-            let url = format!("{}/box/{topic}?after={seq}", b.url);
-            let text = b
-                .http
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            // One envelope per line: "<seq> <base64 postcard>".
-            let mut envs = vec![];
-            let mut n = 0;
-            for line in text.lines() {
-                let Some((s, body)) = line.split_once(' ') else {
-                    continue;
-                };
-                n += 1;
-                seq = seq.max(s.parse()?);
-                match data_encoding::BASE64.decode(body.as_bytes()) {
-                    Ok(b) => envs.extend(postcard::from_bytes::<Envelope>(&b).ok()),
-                    Err(e) => eprintln!("mycel: bad mailbox entry: {e}"),
-                }
-            }
-            if !envs.is_empty() {
-                tx.send(envs).await?;
-            }
-            self.st
+        for (space, key) in topics {
+            let topic = Mailbox::topic(&space);
+            let mut seq = self
+                .st
                 .lock()
                 .unwrap()
                 .store
-                .set_meta("box_seq", &seq.to_le_bytes())?;
-            if n < BOX_PAGE {
-                return Ok(());
+                .meta(&key)?
+                .and_then(|v| v.try_into().ok())
+                .map_or(0, u64::from_le_bytes);
+            loop {
+                let url = format!("{}/box/{topic}?after={seq}", b.url);
+                let text = b
+                    .http
+                    .get(url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .text()
+                    .await?;
+                // One envelope per line: "<seq> <base64 postcard>".
+                let mut envs = vec![];
+                let mut n = 0;
+                for line in text.lines() {
+                    let Some((s, body)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    n += 1;
+                    seq = seq.max(s.parse()?);
+                    match data_encoding::BASE64.decode(body.as_bytes()) {
+                        Ok(b) => envs.extend(postcard::from_bytes::<Envelope>(&b).ok()),
+                        Err(e) => eprintln!("mycel: bad mailbox entry: {e}"),
+                    }
+                }
+                if !envs.is_empty() {
+                    tx.send(envs).await?;
+                }
+                self.st
+                    .lock()
+                    .unwrap()
+                    .store
+                    .set_meta(&key, &seq.to_le_bytes())?;
+                if n < BOX_PAGE {
+                    break;
+                }
             }
         }
+        Ok(())
     }
 
     /// Send to each peer in the background, retrying a few times: sync runs only at start,
@@ -1535,11 +1716,8 @@ impl Node {
 
     fn handle(&self, from: EndpointId, msg: SyncMsg) -> Result<Vec<(Chat, Event)>> {
         let mut st = self.st.lock().unwrap();
-        let space = st.group()?;
-        ensure!(
-            st.mls.members(&space).contains(from.as_bytes()),
-            "sender is not a member"
-        );
+        let who = *from.as_bytes();
+        ensure!(st.knows(&who)?, "sender is not a member or contact");
         let me = self.device_id();
         if !st.store.has_peer(from.as_bytes())? {
             let t = EndpointTicket::new(EndpointAddr::new(from));
@@ -1551,10 +1729,14 @@ impl Node {
             SyncMsg::Envs(envs) => out = st.take(envs, me),
             SyncMsg::Have { ids, reply } => {
                 let theirs: HashSet<_> = ids.into_iter().collect();
+                let sees = st.audience()?;
                 let mut missing = vec![];
                 for (id, data) in st.store.envelopes()? {
                     if !theirs.contains(id.as_slice()) {
-                        missing.push(postcard::from_bytes(&data)?);
+                        let e: Envelope = postcard::from_bytes(&data)?;
+                        if sees(&e.group_id, &who) {
+                            missing.push(e);
+                        }
                     }
                 }
                 let to = vec![st.store.peer(from.as_bytes())?];
@@ -1562,8 +1744,13 @@ impl Node {
                     self.broadcast(to.clone(), SyncMsg::Envs(missing));
                 }
                 if reply {
-                    self.broadcast(to.clone(), SyncMsg::Peers(self.peer_list(&st)?));
-                    let ids = env_ids(&st.store)?;
+                    self.broadcast(to.clone(), SyncMsg::Peers(self.peer_list(&st, &who)?));
+                    let ids = st
+                        .env_groups()?
+                        .into_iter()
+                        .filter(|(_, g)| sees(g, &who))
+                        .map(|(i, _)| i)
+                        .collect();
                     self.broadcast(to, SyncMsg::Have { ids, reply: false });
                 }
             }
@@ -1598,6 +1785,30 @@ impl Node {
             "address is not the sender's"
         );
         let mut st = self.st.lock().unwrap();
+        if st
+            .store
+            .take_meta(&format!("contact:{}", hex(&req.secret)))?
+        {
+            // A contact link: a new pair group with just the two of us (§4.2).
+            let mut gid = [0u8; 32];
+            getrandom::fill(&mut gid)?;
+            st.mls.create_group(&gid)?;
+            let (id, _commit, welcome) = st.mls.add_member(&gid, &req.key_package)?;
+            ensure!(id == *from.as_bytes(), "KeyPackage is not the sender's");
+            st.add_contact(gid, id)?;
+            st.save_mls()?;
+            st.store
+                .upsert_peer(&id, &postcard::to_allocvec(&req.addr)?)?;
+            if let Some(r) = &req.addr.relay {
+                self.learn_relays(&st, std::slice::from_ref(r))?;
+            }
+            self.push_registered
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(postcard::to_allocvec(&JoinResp {
+                welcome,
+                peers: vec![self.my_addr()?],
+            })?);
+        }
         ensure!(st.admin()? == self.device_id(), "not the admin");
         if !st
             .store
@@ -1612,8 +1823,8 @@ impl Node {
         st.save_mls()?;
         let env = st.envelope(gid, commit, epoch)?;
         st.store_env(&env)?;
-        let peers = st.store.peers()?;
-        let list = self.peer_list(&st)?;
+        let peers = st.peers_of(&gid)?;
+        let list = self.peer_list(&st, &id)?;
         st.store
             .upsert_peer(from.as_bytes(), &postcard::to_allocvec(&req.addr)?)?;
         if let Some(r) = &req.addr.relay {
@@ -1627,14 +1838,6 @@ impl Node {
             peers: list,
         })?)
     }
-}
-
-fn env_ids(store: &Store) -> Result<Vec<[u8; 32]>> {
-    Ok(store
-        .envelopes()?
-        .into_iter()
-        .filter_map(|(id, _)| id.try_into().ok())
-        .collect())
 }
 
 /// A stored peer is a SignedAddr, or a bare ticket string (admin from the invite, data before 2b).

@@ -3,7 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { ask, open } from "@tauri-apps/plugin-dialog";
+import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
@@ -252,9 +252,15 @@ export default function App() {
   };
   // A mycel://join/… link only fills in the join field: joining stays a button press.
   const invited = async (urls: string[] | null) => {
-    const url = urls?.find((u) => u.startsWith("mycel://join/"));
+    const url = urls?.find((u) => u.startsWith("mycel://join/") || u.startsWith("mycel://contact/"));
     // Android may hand the launch link over again later: a used one is skipped.
     if (!url || url === localStorage.getItem("joined")) return;
+    // A contact link (§4.2) adds a chat to the open space, nothing closes.
+    if (stage() === "main" && url.startsWith("mycel://contact/")) {
+      if (!(await ask("Добавить этот контакт?", { title: "Контакт", okLabel: "Добавить", cancelLabel: "Отмена" }))) return;
+      localStorage.setItem("joined", url);
+      return invoke("join", { link: url }).catch((e) => message(errText(e), { title: "Контакт", kind: "error" }));
+    }
     if (stage() === "main") {
       const q = simple()
         ? "Это приглашение в другой круг контактов. Принять? Нынешние чаты закроются, вернуться к ним можно через режим пространств в Настройках"
@@ -1118,7 +1124,19 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
     setBusy(true);
     setErr("");
     try {
-      setInv(await invoke<{ link: string; svg: string }>("invite"));
+      setInv(await invoke<{ link: string; svg: string }>(p.simple ? "contact_invite" : "invite"));
+    } catch (e) {
+      setErr(errText(e));
+    }
+    setBusy(false);
+  };
+  const [got, setGot] = createSignal("");
+  const accept = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      await invoke("join", { link: got() });
+      setGot("");
     } catch (e) {
       setErr(errText(e));
     }
@@ -1132,20 +1150,24 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
   return (
     <div class="scroll">
       <div class="pad">
-        <button class="primary" disabled={!amAdmin() || busy()} onClick={invite}>
+        <button class="primary" disabled={!(p.simple || amAdmin()) || busy()} onClick={invite}>
           <UserPlus size={18} /> {busy() ? "Готовим ссылку…" : p.simple ? "Добавить контакт" : "Пригласить"}
         </button>
-        <Show when={!amAdmin()}>
-          <p class="muted small">{p.simple ? `Новых людей добавляет ${nameOf(p.members.find((m) => m.admin)?.id ?? "")} — ссылку можно попросить у этого контакта` : "Приглашать может только администратор"}</p>
+        <Show when={!p.simple && !amAdmin()}>
+          <p class="muted small">Приглашать может только администратор</p>
         </Show>
-        <Show when={p.simple && amAdmin() && !inv()}>
+        <Show when={p.simple && !inv()}>
           <p class="muted small">Покажите QR или отправьте ссылку человеку — когда он её примет, вы появитесь друг у друга в контактах</p>
+          <div class="row">
+            <input class="grow" placeholder="Или вставьте ссылку, которую прислали вам" value={got()} onInput={(e) => setGot(e.currentTarget.value)} />
+            <button disabled={busy() || !got().trim()} onClick={accept}><Link size={18} /> Принять</button>
+          </div>
         </Show>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <Show when={inv()}>
           <div class="card invite">
             <div class="qr" innerHTML={inv()!.svg} />
-            <p class="muted small">{p.simple ? "Ссылка одноразовая: для одного человека. Он увидит и других ваших контактов из этого списка" : "Ссылка одноразовая: по ней сможет вступить один человек"}</p>
+            <p class="muted small">{p.simple ? "Ссылка одноразовая: для одного человека. Других ваших контактов он не увидит" : "Ссылка одноразовая: по ней сможет вступить один человек"}</p>
             <code class="path">{inv()!.link}</code>
             <button onClick={copy}>{copied() ? <Check size={18} /> : <Copy size={18} />} {copied() ? "Скопировано" : "Копировать"}</button>
           </div>

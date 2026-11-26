@@ -983,7 +983,16 @@ async fn join(st: State<'_, App>, link: String) -> R<()> {
 
 #[tauri::command]
 async fn invite(st: State<'_, App>) -> R<Invite> {
-    let link = st.node()?.invite().await.map_err(err)?;
+    qr(st.node()?.invite().await.map_err(err)?)
+}
+
+/// One-time contact link (DESIGN.md §4.2): anyone can make one.
+#[tauri::command]
+async fn contact_invite(st: State<'_, App>) -> R<Invite> {
+    qr(st.node()?.contact_invite().await.map_err(err)?)
+}
+
+fn qr(link: String) -> R<Invite> {
     let svg = qrcode::QrCode::new(&link)
         .map_err(|e| e.to_string())?
         .render::<qrcode::render::svg::Color>()
@@ -1384,7 +1393,14 @@ async fn members(st: State<'_, App>) -> R<Vec<Member>> {
     let n = &st.node()?;
     let (me, admin) = (n.device_id(), n.admin().map_err(err)?);
     let mut prof = n.profiles().map_err(err)?;
-    Ok(n.members()
+    // Space members, then contacts added by link (§4.2).
+    let mut all = n.members();
+    for c in n.contacts().map_err(err)? {
+        if !all.contains(&c) {
+            all.push(c);
+        }
+    }
+    Ok(all
         .iter()
         .map(|m| {
             let p = prof.remove(m);
@@ -1566,6 +1582,7 @@ pub fn run() {
             create_space,
             join,
             invite,
+            contact_invite,
             safety_code,
             history,
             chats,

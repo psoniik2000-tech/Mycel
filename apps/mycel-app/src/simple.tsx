@@ -1,4 +1,4 @@
-// "Simple messenger" mode (DESIGN.md §4.2): the same space, shown as a contact list. A UI setting of this device.
+// "Simple messenger" mode (DESIGN.md §4.2): a hidden space plus pairwise contacts, shown as a contact list. A UI setting of this device.
 import { createSignal } from "solid-js";
 import { Hash, MessageCircle } from "lucide-solid";
 import logo from "../app-icon.svg";

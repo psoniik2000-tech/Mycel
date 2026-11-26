@@ -103,3 +103,38 @@ async fn offline_message_through_mailbox() {
     assert!(matches!(&ev.body, EventBody::Text { text, .. } if text == "while you were away"));
     b.close().await;
 }
+
+/// A contact's pair group has its own mailbox topic: B, offline, still gets A's message (§4.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_contact_message_through_mailbox() {
+    let opts = Opts {
+        mailbox: Some(mock_mailbox().await),
+        ..Default::default()
+    };
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (a, _rx_a) = Node::open(dirs[0].path(), "pa", &opts).await.unwrap();
+    let (b, _rx_b) = Node::open(dirs[1].path(), "pb", &opts).await.unwrap();
+    a.create_space().unwrap();
+    b.join(&a.contact_invite().await.unwrap()).await.unwrap();
+    let kb = Some(b.device_id());
+    b.close().await;
+    drop(b);
+
+    a.send_text(&kb, "лично тебе", None).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    a.close().await;
+    drop(a);
+
+    let (b, mut rx_b) = Node::open(dirs[1].path(), "pb", &opts).await.unwrap();
+    let ev = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("closed");
+        if matches!(ev.body, EventBody::Text { .. }) {
+            break ev;
+        }
+    };
+    assert!(matches!(&ev.body, EventBody::Text { text, .. } if text == "лично тебе"));
+    b.close().await;
+}
