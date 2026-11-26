@@ -1,7 +1,7 @@
 //! Tauri shell: thin commands over mycel-core; new events go to the UI as `message`.
 
 use mycel_core::mycel_proto::{BlobRef, CallAction, Event, EventBody, EventId, MediaKind, Preview};
-use mycel_core::{Chat, Node, Opts, edits_and_pins, media};
+use mycel_core::{Chat, Node, Opts, edits_and_pins, media, reactions};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -209,6 +209,8 @@ struct Msg {
     reply: Option<Reply>,
     edited: bool,
     pinned: bool,
+    /// (emoji, short ids of who set it).
+    reactions: Vec<(String, Vec<String>)>,
 }
 
 /// The quoted message above a reply.
@@ -224,6 +226,7 @@ struct Ctx<'a> {
     calls: HashMap<String, CallView>,
     edits: HashMap<EventId, String>,
     pins: Vec<EventId>,
+    reactions: HashMap<EventId, mycel_core::Reactions>,
     by_id: HashMap<EventId, &'a Event>,
 }
 
@@ -234,6 +237,7 @@ impl<'a> Ctx<'a> {
             calls: calls(n, hist, chat),
             edits,
             pins,
+            reactions: reactions(hist),
             by_id: hist.iter().map(|e| (e.id, e)).collect(),
         }
     }
@@ -391,6 +395,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
             reply: None,
             edited: false,
             pinned: false,
+            reactions: vec![],
         });
     }
     let (mv, reply_to) = match &ev.body {
@@ -430,6 +435,12 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
         reply,
         edited: cx.edits.contains_key(&ev.id),
         pinned: cx.pins.contains(&ev.id),
+        reactions: cx.reactions.get(&ev.id).map_or(vec![], |r| {
+            let r = r
+                .iter()
+                .map(|(e, who)| (e.clone(), who.iter().map(short).collect()));
+            r.collect()
+        }),
     })
 }
 
@@ -1051,6 +1062,13 @@ async fn pin(st: State<'_, App>, id: String, pinned: bool) -> R<()> {
     Ok(())
 }
 
+/// Toggles own reaction `emoji`.
+#[tauri::command]
+async fn react(st: State<'_, App>, id: String, emoji: String) -> R<()> {
+    st.node()?.react(unhex(&id)?, &emoji).map_err(err)?;
+    Ok(())
+}
+
 /// 📎 / drag-and-drop: photos are re-encoded (no EXIF) unless `original`, then they go as a file.
 #[tauri::command]
 async fn send_file(st: State<'_, App>, chat: String, path: String, original: bool) -> R<String> {
@@ -1499,6 +1517,7 @@ pub fn run() {
             delete,
             forward,
             pin,
+            react,
             send_file,
             send_rec,
             fetch_media,

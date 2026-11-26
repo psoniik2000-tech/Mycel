@@ -18,7 +18,8 @@ import { Signal, VoiceSettings } from "./voice";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
-  reply: { id: string; author: string; text: string } | null; edited: boolean; pinned: boolean };
+  reply: { id: string; author: string; text: string } | null; edited: boolean; pinned: boolean;
+  reactions: [string, string[]][] };
 type CallView = { id: string; video: boolean; author: string; chat: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
@@ -1107,7 +1108,7 @@ function Chat(p: {
   let chain: Promise<unknown> = Promise.resolve();
   const queue = async (m: Partial<Msg>, run: () => Promise<string>, undo?: () => void) => {
     const id = `tmp-${++tmp}`;
-    setPending((ps) => [...ps, { id, author: p.me, mine: true, text: "", ts: Date.now(), status: 0, media: null, call: null, reply: null, edited: false, pinned: false, ...m }]);
+    setPending((ps) => [...ps, { id, author: p.me, mine: true, text: "", ts: Date.now(), status: 0, media: null, call: null, reply: null, edited: false, pinned: false, reactions: [], ...m }]);
     try {
       const job = chain.then(run);
       chain = job.catch(() => {});
@@ -1392,6 +1393,18 @@ function Chat(p: {
                         </Show>
                         <Show when={m.media}><MediaView id={m.id} m={m.media!} onView={setView} /></Show>
                         <Show when={m.text}><span class="text">{m.text}</span></Show>
+                        <Show when={m.reactions.length}>
+                          <div class="reacts">
+                            <For each={m.reactions}>
+                              {([e, who]) => (
+                                <button classList={{ on: who.includes(p.me) }} title={who.map(name).join(", ")}
+                                  onClick={(ev) => (ev.stopPropagation(), act(invoke("react", { id: m.id, emoji: e })))}>
+                                  {e} {who.length}
+                                </button>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
                         <span class="meta">
                           <Show when={m.pinned}><Pin size={11} /></Show>
                           <Show when={m.edited}><span>изменено</span></Show>
@@ -1422,7 +1435,12 @@ function Chat(p: {
       <Show when={menu()}>
         {(mn) => (
           <div class="overlay" onClick={() => setMenu(undefined)} onContextMenu={(e) => (e.preventDefault(), setMenu(undefined))}>
-            <div class="menu" style={{ left: `${Math.min(mn().x, innerWidth - 210)}px`, top: `${Math.min(mn().y, innerHeight - 310)}px` }}>
+            <div class="menu" style={{ left: `${Math.min(mn().x, innerWidth - 210)}px`, top: `${Math.min(mn().y, innerHeight - 350)}px` }}>
+              <div class="emojis">
+                <For each={["👍", "❤️", "😂", "😮", "😢", "🔥"]}>
+                  {(e) => <button onClick={() => act(invoke("react", { id: mn().m.id, emoji: e }))}>{e}</button>}
+                </For>
+              </div>
               <button onClick={() => startReply(mn().m)}><Reply size={16} /> Ответить</button>
               <Show when={plain(mn().m)}><button onClick={() => copy([mn().m])}><Copy size={16} /> Копировать</button></Show>
               <Show when={mn().m.mine}><button onClick={() => startEdit(mn().m)}><Pencil size={16} /> Редактировать</button></Show>

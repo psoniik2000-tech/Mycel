@@ -1,4 +1,4 @@
-use mycel_core::{Node, Opts, edits_and_pins};
+use mycel_core::{Node, Opts, edits_and_pins, reactions};
 use std::time::Duration;
 
 async fn until(cond: impl Fn() -> bool) {
@@ -34,6 +34,13 @@ async fn edit_delete_pin_between_two_nodes() {
     // Pin.
     b.pin(m.id, true).unwrap();
     until(|| edits_and_pins(&a.history(&None).unwrap()).1 == vec![m.id]).await;
+
+    // Reaction; the same one again takes it back.
+    let r_of = |n: &Node| reactions(&n.history(&None).unwrap()).get(&m.id).cloned();
+    b.react(m.id, "👍").unwrap();
+    until(|| r_of(&a) == Some(vec![("👍".into(), vec![b.device_id()])])).await;
+    b.react(m.id, "👍").unwrap();
+    until(|| r_of(&a).is_none()).await;
 
     // Only the author or the admin deletes for everyone; it is gone on both nodes.
     assert!(b.delete(m.id, true).is_err());
