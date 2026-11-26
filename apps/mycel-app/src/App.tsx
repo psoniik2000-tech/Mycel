@@ -1374,22 +1374,46 @@ function Chat(p: {
     setReply(undefined);
     queueMicrotask(grow);
   };
-  let pressTimer = 0;
+  // Touch: holding opens the menu, sliding right replies.
+  let pressTimer = 0, held = false, touch: { x: number; y: number } | undefined;
+  const [swipe, setSwipe] = createSignal<{ id: string; dx: number }>();
   const press = (e: PointerEvent, m: Msg) => {
-    if (e.pointerType !== "touch") return;
+    if (e.pointerType !== "touch" || sel().length || m.id.startsWith("tmp-")) return;
     const { clientX: x, clientY: y } = e;
-    pressTimer = window.setTimeout(() => setMenu({ m, x, y }), 500);
+    touch = { x, y };
+    held = false;
+    pressTimer = window.setTimeout(() => ((held = true), (touch = undefined), setMenu({ m, x, y })), 500);
   };
-  const unpress = () => clearTimeout(pressTimer);
+  const slide = (e: PointerEvent, m: Msg) => {
+    if (!touch) return;
+    const dx = e.clientX - touch.x;
+    // A resting finger jitters: only a real move cancels the hold.
+    if (!swipe() && Math.hypot(dx, e.clientY - touch.y) < 10) return;
+    clearTimeout(pressTimer);
+    setSwipe({ id: m.id, dx: Math.max(0, Math.min(dx, 80)) });
+  };
+  // pointercancel means the list took the gesture to scroll: no reply then.
+  const unpress = (e: PointerEvent, m: Msg) => {
+    clearTimeout(pressTimer);
+    if (e.type === "pointerup" && (swipe()?.dx ?? 0) >= 60) startReply(m);
+    touch = undefined;
+    setSwipe(undefined);
+  };
   const openMenu = (e: MouseEvent, m: Msg) => {
     e.preventDefault();
     if (!sel().length && !m.id.startsWith("tmp-")) setMenu({ m, x: e.clientX, y: e.clientY });
   };
+  // Double click / double tap = ❤️. Counted by hand: not every WebView sends dblclick for taps.
+  let tap = { id: "", at: 0 };
   const clickMsg = (e: MouseEvent, m: Msg) => {
     if (sel().length || e.shiftKey) {
       e.preventDefault();
-      toggle(m.id);
+      return toggle(m.id);
     }
+    if (m.id.startsWith("tmp-") || (e.target as Element).closest("button, a, img, video, .wave")) return;
+    const double = tap.id === m.id && e.timeStamp - tap.at < 350;
+    tap = { id: double ? "" : m.id, at: e.timeStamp };
+    if (double) act(invoke("react", { id: m.id, emoji: "❤️" }));
   };
   const [err, setErr] = createSignal("");
   const [view, setView] = createSignal("");
@@ -1531,6 +1555,10 @@ function Chat(p: {
     queueMicrotask(() => (stick ? toBottom(false) : setFresh((n) => n + added)));
   });
   const onScroll = () => {
+    // Date pills all stick to the same spot: hide each one the next has reached.
+    const days = list.querySelectorAll<HTMLElement>(".day");
+    days.forEach((d, i) =>
+      (d.style.visibility = i + 1 < days.length && days[i + 1].offsetTop - d.offsetTop < d.offsetHeight ? "hidden" : ""));
     setAtBottom(near());
     if (near()) setFresh(0);
   };
@@ -1628,14 +1656,20 @@ function Chat(p: {
                   ) : (
                     <div class="msg" data-id={m.id}
                       classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id }}
-                      onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => e.shiftKey && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
-                      onPointerDown={(e) => press(e, m)} onPointerUp={unpress} onPointerCancel={unpress} onPointerMove={unpress}>
+                      onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
+                      onPointerDown={(e) => press(e, m)} onPointerMove={(e) => slide(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
+                      // Lifting the finger after a hold must not click the menu's backdrop and close it.
+                      onTouchEnd={(e) => held && e.preventDefault()}
+                      style={swipe()?.id === m.id ? { transform: `translateX(${swipe()!.dx}px)`, transition: "none" } : {}}>
+                      <Show when={swipe()?.id === m.id}>
+                        <span class="swipe-reply" style={{ opacity: Math.min(1, swipe()!.dx / 60) }}><Reply size={18} /></span>
+                      </Show>
                       <button class="pick" title="Выделить" onClick={(e) => (e.stopPropagation(), toggle(m.id))}>
                         <Show when={sel().includes(m.id)}><Check size={14} /></Show>
                       </button>
-                      <Show when={!m.mine}>
+                      <Show when={!m.mine && !p.chat}>
                         <Show when={!same(m, next())} fallback={<div class="av-gap" />}>
-                          <Avatar id={m.author} onClick={p.chat ? undefined : () => p.openChat(m.author)} />
+                          <Avatar id={m.author} onClick={() => p.openChat(m.author)} />
                         </Show>
                       </Show>
                       <div class="bubble">
