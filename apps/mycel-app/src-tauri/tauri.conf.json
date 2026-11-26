@@ -29,6 +29,12 @@
       }
     }
   },
+  "plugins": {
+    "deep-link": {
+      "mobile": [{ "scheme": ["mycel"], "appLink": false }],
+      "desktop": { "schemes": ["mycel"] }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": [
