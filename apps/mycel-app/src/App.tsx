@@ -7,7 +7,7 @@ import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
+  ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -1313,6 +1313,7 @@ function Chat(p: {
   const [reply, setReply] = createSignal<Msg>();
   const [editing, setEditing] = createSignal<Msg>();
   const [menu, setMenu] = createSignal<{ m: Msg; x: number; y: number }>();
+  const [more, setMore] = createSignal(false); // the chat header's ⋮ menu
   const [sel, setSel] = createSignal<string[]>([]);
   const [dlg, setDlg] = createSignal<Dialog>();
   const [atBottom, setAtBottom] = createSignal(true);
@@ -1683,16 +1684,19 @@ function Chat(p: {
             {typingText(p.chat) || (p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`)}
           </div>
         </div>
-        <NetDot n={p.peers} />
-        <button class="icon" onClick={() => setQuery(query() === undefined ? "" : undefined)} title="Поиск в чате"><Search size={20} /></button>
-        <button class="icon" aria-pressed={p.muted} onClick={() => p.onMute(!p.muted)}
-          title={p.muted ? "Без звука: включить уведомления" : "Отключить уведомления"}>
-          {p.muted ? <BellOff size={20} /> : <Bell size={20} />}
-        </button>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
           title={p.chat ? "Звонок" : "Групповой звонок"}><Phone size={20} /></button>
-        <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}
-          title={p.chat ? "Видеозвонок" : "Групповой видеозвонок"}><Video size={20} /></button>
+        <button class="icon" onClick={() => setMore(true)} title="Ещё"><EllipsisVertical size={20} /></button>
+        <Show when={more()}>
+          <div class="overlay" onClick={() => setMore(false)}>
+            <div class="menu more">
+              <button disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}><Video size={18} /> {p.chat ? "Видеозвонок" : "Групповой видеозвонок"}</button>
+              <button onClick={() => setQuery(query() === undefined ? "" : undefined)}><Search size={18} /> Поиск</button>
+              <button onClick={() => p.onMute(!p.muted)}>{p.muted ? <><Bell size={18} /> Включить уведомления</> : <><BellOff size={18} /> Без звука</>}</button>
+              <div class="muted small more-net"><NetDot n={p.peers} /></div>
+            </div>
+          </div>
+        </Show>
       </header>}>
         <header class="bar selbar">
           <button class="icon" onClick={() => setSel([])} title="Отмена (Esc)"><X size={20} /></button>

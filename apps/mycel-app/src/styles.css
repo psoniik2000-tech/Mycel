@@ -256,7 +256,9 @@ button.del { color: var(--danger); }
   position: fixed; min-width: 200px; padding: 4px; display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 24px rgb(0 0 0 / 20%);
 }
-.menu button { border: 0; background: none; justify-content: flex-start; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
+.menu.more { top: 52px; right: 8px; }
+.more-net { padding: 8px 12px; border-top: 1px solid var(--line); margin-top: 4px; }
+.menu button { gap: 12px; border: 0; background: none; justify-content: flex-start; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
 .menu .emojis { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
 .menu .emojis button { padding: 6px; font-size: 18px; }
 .reacts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
@@ -273,7 +275,8 @@ button.del { color: var(--danger); }
   display: flex; align-items: flex-end; gap: 4px; padding: 10px 12px;
   background: var(--panel); border-top: 1px solid var(--line);
 }
-.composer textarea { border-radius: 14px; max-height: 160px; padding: 9px 14px; overflow-y: auto; }
+.composer textarea { border-radius: 14px; max-height: 160px; padding: 9px 14px; overflow-y: auto; scrollbar-width: none; resize: none; }
+.composer textarea::-webkit-scrollbar { display: none; }
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
 ::-webkit-scrollbar-button { display: none; }
@@ -297,7 +300,7 @@ button.del { color: var(--danger); }
 
 /* Touch / phone width: finger-sized targets (≥44px) */
 @media (pointer: coarse), (max-width: 599px) {
-  .chat .bar .net { font-size: 0; }
+  .chat .bar > .net { font-size: 0; }
   .chat .bar b { white-space: nowrap; }
   button.icon { padding: 12px; }
   .row { padding: 14px 16px; }
