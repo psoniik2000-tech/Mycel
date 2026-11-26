@@ -400,3 +400,13 @@ label.check input { width: auto; }
 .relay-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; min-width: 0; }
 .relay-row input { min-width: 0; }
 details.muted summary { cursor: pointer; margin: 8px 0; }
+
+/* Emoji picker above the composer */
+.composer { position: relative; }
+.composer .icon.on { color: var(--accent); }
+.emoji-panel { position: absolute; right: 8px; bottom: calc(100% + 6px); z-index: 56; width: min(352px, calc(100% - 16px)); display: flex; flex-direction: column; }
+.emoji-tabs { display: flex; overflow-x: auto; gap: 2px; padding: 4px; border-bottom: 1px solid var(--line); }
+.emoji-tabs button { flex: none; border: 0; background: none; padding: 6px; font-size: 18px; border-radius: 8px; color: var(--muted); }
+.emoji-tabs button.active { background: var(--hover); }
+.emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); height: 260px; overflow-y: auto; padding: 4px; align-content: start; }
+.emoji-grid button { border: 0; background: none; padding: 4px; font-size: 24px; line-height: 1; border-radius: 8px; height: 40px; }

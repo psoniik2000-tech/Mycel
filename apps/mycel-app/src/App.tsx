@@ -8,10 +8,11 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
+import { EMOJI, recentEmoji, useEmoji } from "./emoji";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
@@ -1300,6 +1301,15 @@ function Chat(p: {
   const [rec, setRec] = createSignal<Recording>();
   const [elapsed, setElapsed] = createSignal(0);
   const [cancelling, setCancelling] = createSignal(false);
+  const [emo, setEmo] = createSignal<number>(); // open emoji panel: tab index, -1 = recent
+  const insertEmoji = (e: string) => {
+    const a = input.selectionStart, b = input.selectionEnd, t = text();
+    setText(t.slice(0, a) + e + t.slice(b));
+    input.value = text();
+    input.setSelectionRange(a + e.length, a + e.length);
+    useEmoji(e);
+    grow();
+  };
   let preview!: HTMLVideoElement;
   // Android pickers give content:// URIs, not paths: read the files here and stash them for send_file.
   let picker!: HTMLInputElement;
@@ -1705,6 +1715,26 @@ function Chat(p: {
               send();
             }
           }} />
+        <Show when={!rec()}>
+          <button class="icon" classList={{ on: emo() !== undefined }} title="Смайлики"
+            onClick={() => setEmo(emo() !== undefined ? undefined : recentEmoji().length ? -1 : 0)}><Smile size={20} /></button>
+        </Show>
+        <Show when={emo() !== undefined}>
+          <div class="overlay" onClick={() => setEmo(undefined)} />
+          <div class="emoji-panel card">
+            <div class="emoji-tabs">
+              <Show when={recentEmoji().length}>
+                <button classList={{ active: emo() === -1 }} onClick={() => setEmo(-1)} title="Недавние"><Clock size={18} /></button>
+              </Show>
+              <For each={EMOJI}>{([icon], i) => <button classList={{ active: emo() === i() }} onClick={() => setEmo(i())}>{icon}</button>}</For>
+            </div>
+            <div class="emoji-grid">
+              <For each={emo() === -1 ? recentEmoji() : EMOJI[emo()!][1].split(" ")}>
+                {(e) => <button onClick={() => (insertEmoji(e), input.focus())}>{e}</button>}
+              </For>
+            </div>
+          </div>
+        </Show>
         <Show when={text().trim() || editing()} fallback={
           <button class="icon mic" classList={{ live: !!rec() }} onPointerDown={down} onPointerUp={up} onPointerMove={move}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
