@@ -1,4 +1,4 @@
-use mycel_core::mycel_proto::EventBody;
+use mycel_core::mycel_proto::{EventBody, ReceiptKind};
 use mycel_core::{Node, Opts, edits_and_pins};
 use std::time::Duration;
 
@@ -64,6 +64,35 @@ async fn names_and_private_chat_closed_to_third() {
     a.open_dm(b.device_id()).unwrap(); // no second group
     let hi = a.send_text(&kb, "секрет для Бори", None).unwrap();
     until(|| texts(b, &ka) == ["секрет для Бори"]).await;
+    // §7.4: ✓ once B's device has it, ✓✓ once B read it; a second mark_read sends nothing.
+    let st = |n: &Node| {
+        n.statuses(&kb)
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == hi.id)
+            .unwrap()
+            .1
+    };
+    until(|| st(a) == 1).await;
+    let reads = |n: &Node| {
+        n.history(&ka)
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.body,
+                    EventBody::Receipt {
+                        kind: ReceiptKind::Read,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    b.mark_read(&ka).unwrap();
+    b.mark_read(&ka).unwrap();
+    assert_eq!(reads(b), 1);
+    until(|| st(a) == 2).await;
     assert_eq!(b.dms().unwrap(), vec![a.device_id()]);
     b.send_text(&ka, "ответ Ане", Some(hi.id)).unwrap();
     until(|| texts(a, &kb).len() == 2).await;

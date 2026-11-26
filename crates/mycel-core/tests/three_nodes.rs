@@ -160,6 +160,7 @@ async fn anchor_store_and_forward_receipts() {
     drop(b);
     let (c, mut rx_c) = open(&dirs[2], "pc").await;
     assert_eq!(text(&recv(&mut rx_c).await), "for c");
+    c.mark_read(&None).unwrap();
 
     let (a, _rx_a) = open(&dirs[0], "pa").await;
     until(|| status(&a) == 2).await;

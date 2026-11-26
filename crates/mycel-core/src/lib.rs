@@ -815,46 +815,74 @@ impl Node {
         Ok(ids)
     }
 
-    /// Delivery of own text events (§7.4): 0 ⏱ nobody confirmed yet, 1 ✓ some member device has it,
-    /// 2 ✓✓ every other member device has it (by their Delivered receipts).
+    /// Status of own messages (§7.4): 0 ⏱ nobody confirmed yet, 1 ✓ some other member device has it
+    /// (Delivered receipt), 2 ✓✓ some other member device has read it (Read receipt). In a group chat ✓✓
+    /// means "read by at least one", like 1:1.
     // shortcut: "has it" = a receipt up to an event with lamport >= ours; use per-author clocks if concurrent sends mislead it.
     pub fn statuses(&self, chat: &Chat) -> Result<Vec<(EventId, u8)>> {
         let me = self.device_id();
-        let others: Vec<_> = self
-            .chat_members(chat)?
-            .into_iter()
-            .filter(|m| *m != me)
-            .collect();
         let hist = self.history(chat)?;
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
-        let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
+        // Highest lamport delivered / read by anyone else.
+        let (mut delivered, mut read) = (None, None);
         for e in &hist {
-            if let EventBody::Receipt {
-                up_to,
-                kind: ReceiptKind::Delivered,
-            } = &e.body
+            if let EventBody::Receipt { up_to, kind } = &e.body
+                && e.author_device != me
                 && let Some(&l) = lamport.get(up_to)
             {
-                let s = seen.entry(e.author_device).or_default();
-                *s = (*s).max(l);
+                let s = if *kind == ReceiptKind::Read {
+                    &mut read
+                } else {
+                    &mut delivered
+                };
+                *s = (*s).max(Some(l));
             }
         }
         Ok(hist
             .iter()
             .filter(|e| e.author_device == me && is_msg(&e.body))
             .map(|e| {
-                let n = others
-                    .iter()
-                    .filter(|m| seen.get(*m).is_some_and(|&l| l >= e.lamport))
-                    .count();
-                let s = match n {
-                    0 => 0,
-                    n if n == others.len() => 2,
-                    _ => 1,
+                let has = |s: Option<u64>| s.is_some_and(|l| l >= e.lamport);
+                let s = if has(read) {
+                    2
+                } else if has(delivered) {
+                    1
+                } else {
+                    0
                 };
                 (e.id, s)
             })
             .collect())
+    }
+
+    /// Sends one Read receipt up to the chat's newest message from someone else, unless one already covers it (§7.4).
+    /// The UI calls it while the chat is open and the window visible.
+    pub fn mark_read(&self, chat: &Chat) -> Result<()> {
+        let me = self.device_id();
+        let hist = self.history(chat)?;
+        let Some(last) = hist
+            .iter()
+            .filter(|e| e.author_device != me && is_msg(&e.body))
+            .max_by_key(|e| e.lamport)
+        else {
+            return Ok(());
+        };
+        let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
+        let done = hist.iter().any(|e| {
+            e.author_device == me
+                && matches!(&e.body, EventBody::Receipt { up_to, kind: ReceiptKind::Read }
+                    if lamport.get(up_to).is_some_and(|&l| l >= last.lamport))
+        });
+        if !done {
+            self.send_event(
+                chat,
+                EventBody::Receipt {
+                    up_to: last.id,
+                    kind: ReceiptKind::Read,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Store-and-forward retention (§7.3): drops envelopes and events older than `days`,
