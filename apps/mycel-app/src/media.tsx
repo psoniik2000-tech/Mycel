@@ -15,11 +15,27 @@ export type Media = {
   wave: number[] | null;
   duration_ms: number | null;
   dims: [number, number] | null;
+  /** Shared by the media of one album. */
+  album: string | null;
   path: string | null;
 };
 
 const [progress, setProgress] = createSignal<Record<string, number>>({});
 listen<{ id: string; done: number }>("progress", (e) => setProgress((p) => ({ ...p, [e.payload.id]: e.payload.done })));
+
+// One download per message at a time: its bubble and the viewer may both ask.
+const running: Record<string, Promise<string> | undefined> = {};
+// Paths got since the history was loaded.
+const got: Record<string, string | undefined> = {};
+const download = (id: string) =>
+  (running[id] ??= invoke<string>("fetch_media", { id }).then((p) => (got[id] = p)).finally(() => delete running[id]));
+
+/** "Save as" through the system dialog. */
+export async function saveAs(id: string, m: Media) {
+  // Photos from a phone gallery may come without a name; Android needs one with an extension.
+  const to = await save({ defaultPath: m.name ?? `mycel.${m.mime.split(/[/;]/)[1] ?? "bin"}` });
+  if (to) await invoke("save_media", { id, to });
+}
 
 export const size = (n: number) =>
   n < 1024 ? `${n} Б` : n < 1 << 20 ? `${(n / 1024).toFixed(0)} КБ` : n < 1 << 30 ? `${(n / (1 << 20)).toFixed(1)} МБ` : `${(n / (1 << 30)).toFixed(2)} ГБ`;
@@ -39,8 +55,9 @@ function blurUrl(hash: string, w: number, h: number) {
   return c.toDataURL();
 }
 
-export function MediaView(p: { id: string; m: Media; onView: (src: string) => void }) {
-  const [path, setPath] = createSignal(p.m.path);
+/** The file of a media message: downloads it (at once when `auto`) and shows the progress. */
+export function useMedia(id: string, m: Media, auto: boolean) {
+  const [path, setPath] = createSignal(m.path ?? got[id] ?? null);
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
   const src = () => (path() ? convertFileSrc(path()!) : "");
@@ -49,46 +66,59 @@ export function MediaView(p: { id: string; m: Media; onView: (src: string) => vo
     setBusy(true);
     setErr("");
     try {
-      setPath(await invoke<string>("fetch_media", { id: p.id }));
+      setPath(await download(id));
     } catch (e) {
       setErr("Не удалось скачать: никого с файлом нет на связи");
       console.warn(e);
     }
     setBusy(false);
   };
-  // §8.3: photos and voice always, video and files up to 20 MB.
   onMount(() => {
-    const auto = ["photo", "voice", "videonote"].includes(p.m.kind) || p.m.size <= 20 << 20;
     if (!path() && auto) fetch();
   });
-  const pct = () => Math.min(100, Math.round(((progress()[p.id] ?? 0) / Math.max(1, p.m.size)) * 100));
+  const pct = () => Math.min(100, Math.round(((progress()[id] ?? 0) / Math.max(1, m.size)) * 100));
   const waiting = () => (
     <div class="dl">
-      <Show when={busy()} fallback={<button class="icon" onClick={fetch} title="Скачать"><Download size={18} /></button>}>
+      <Show when={busy()} fallback={<button class="icon" onClick={(e) => (e.stopPropagation(), fetch())} title="Скачать"><Download size={18} /></button>}>
         <div class="ring" style={{ "--p": pct() }} />
       </Show>
-      <span class="muted small">{busy() ? `${pct()}% из ${size(p.m.size)}` : size(p.m.size)}</span>
+      <span class="muted small">{busy() ? `${pct()}% из ${size(m.size)}` : size(m.size)}</span>
     </div>
   );
+  return { path, src, err, waiting };
+}
+
+/** `tile`: a cell of an album grid, which sets the size. `onView` opens the full-screen viewer. */
+export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: boolean }) {
+  // §8.3: photos and voice always, video and files up to 20 MB.
+  const { path, src, err, waiting } = useMedia(p.id, p.m, ["photo", "voice", "videonote"].includes(p.m.kind) || p.m.size <= 20 << 20);
   const [w, h] = p.m.dims ?? [4, 3];
   return (
     <div class="media">
       <Switch>
         <Match when={p.m.kind === "photo"}>
-          <div class="photo" style={{ "aspect-ratio": `${w} / ${h}` }}>
+          <div class="photo" style={p.tile ? {} : { "aspect-ratio": `${w} / ${h}` }}>
             <Show when={path()} fallback={
               <>
                 <Show when={p.m.blurhash}><img class="blur" src={blurUrl(p.m.blurhash!, w, h)} alt="" /></Show>
                 <div class="over">{waiting()}</div>
               </>
             }>
-              <img src={src()} alt="Фото" onClick={() => p.onView(src())} />
+              <img src={src()} alt="Фото" onClick={p.onView} />
             </Show>
           </div>
         </Match>
         <Match when={p.m.kind === "video"}>
-          <Show when={path()} fallback={<div class="file"><Film size={28} /><div class="grow"><div class="ellipsis">{p.m.name ?? "Видео"}</div>{waiting()}</div></div>}>
-            <video class="video" src={src()} controls preload="metadata" />
+          <Show when={path()} fallback={
+            <Show when={p.tile} fallback={<div class="file"><Film size={28} /><div class="grow"><div class="ellipsis">{p.m.name ?? "Видео"}</div>{waiting()}</div></div>}>
+              <div class="photo"><div class="over">{waiting()}</div></div>
+            </Show>
+          }>
+            {/* #t: Android's WebView shows no first frame without it. */}
+            <button class="video" onClick={p.onView} title="Смотреть видео">
+              <video src={`${src()}#t=0.1`} preload="metadata" muted playsinline />
+              <span class="playbtn"><Play size={22} /></span>
+            </button>
           </Show>
         </Match>
         <Match when={p.m.kind === "voice"}>
@@ -108,10 +138,7 @@ export function MediaView(p: { id: string; m: Media; onView: (src: string) => vo
                 <div class="actions">
                   <span class="muted small">{size(p.m.size)}</span>
                   <button class="link" onClick={() => invoke("open_media", { id: p.id })}><ExternalLink size={14} /> Открыть</button>
-                  <button class="link" onClick={async () => {
-                    const to = await save({ defaultPath: p.m.name ?? undefined });
-                    if (to) invoke("save_media", { id: p.id, to });
-                  }}><Save size={14} /> Сохранить как</button>
+                  <button class="link" onClick={() => saveAs(p.id, p.m)}><Save size={14} /> Сохранить как</button>
                 </div>
               </Show>
             </div>

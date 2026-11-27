@@ -12,6 +12,8 @@ import {
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
+import { Album, albums } from "./album";
+import { Shot, Viewer } from "./viewer";
 import { EMOJI, recentEmoji, useEmoji } from "./emoji";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
@@ -1386,6 +1388,7 @@ const plain = (m: Msg) => m.text || (m.media ? label(m.media) : "");
 type Dialog = { kind: "delete" | "forward"; ids: string[] };
 const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const isPhoto = (path: string) => /\.(jpe?g|png|webp)$/i.test(path);
+const isVideo = (path: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(path);
 
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
@@ -1409,6 +1412,21 @@ function Chat(p: {
   const shown = () => {
     const ids = new Set(p.msgs.map((m) => m.id));
     return [...p.msgs, ...pending().filter((x) => !x.real || !ids.has(x.real))];
+  };
+  // Bubbles: an album is one, shown at its first message.
+  const grouped = createMemo(() => albums(shown()));
+  const itemsOf = (m: Msg) => grouped().items.get(m.id) ?? [m];
+  // An album speaks (reply, copy, edit) through the message carrying its caption.
+  const headOf = (m: Msg) => itemsOf(m).find((x) => x.text) ?? m;
+  // Reactions of all an album's messages; a tap goes to the one already holding mine.
+  const reactionsOf = (m: Msg) => {
+    const all = new Map<string, { who: string[]; id: string }>();
+    for (const x of itemsOf(m))
+      for (const [e, who] of x.reactions) {
+        const r = all.get(e) ?? { who: [], id: x.id };
+        all.set(e, { who: [...new Set([...r.who, ...who])], id: who.includes(p.me) ? x.id : r.id });
+      }
+    return [...all];
   };
   createEffect(() => {
     const ids = new Set(p.msgs.map((m) => m.id));
@@ -1436,7 +1454,7 @@ function Chat(p: {
   const pinned = () => p.msgs.filter((m) => m.pinned);
   const pinShown = () => pinned()[pinIx() % Math.max(1, pinned().length)];
   const jump = (id: string) => {
-    const el = list.querySelector(`[data-id="${id}"]`);
+    const el = list.querySelector(`[data-id~="${id}"]`);
     if (!el) return;
     el.scrollIntoView({ block: "center", behavior: "smooth" });
     el.classList.add("flash");
@@ -1462,7 +1480,11 @@ function Chat(p: {
     setCur(id);
     jump(id);
   };
-  const toggle = (id: string) => !id.startsWith("tmp-") && setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const toggle = (m: Msg) => {
+    if (m.id.startsWith("tmp-")) return;
+    const ids = itemsOf(m).map((x) => x.id);
+    setSel((s) => (s.includes(m.id) ? s.filter((x) => !ids.includes(x)) : [...s, ...ids]));
+  };
   const picked = () => shown().filter((m) => sel().includes(m.id));
   const copy = (ms: Msg[]) => navigator.clipboard.writeText(ms.map(plain).join("\n"));
   const act = (run: Promise<unknown>) => run.then(p.reload, (e) => setErr(errText(e)));
@@ -1505,7 +1527,7 @@ function Chat(p: {
   // pointercancel means the list took the gesture to scroll: no reply then.
   const unpress = (e: PointerEvent, m: Msg) => {
     clearTimeout(pressTimer);
-    if (e.type === "pointerup" && (swipe()?.dx ?? 0) >= 60) startReply(m);
+    if (e.type === "pointerup" && (swipe()?.dx ?? 0) >= 60) startReply(headOf(m));
     touch = undefined;
     setSwipe(undefined);
   };
@@ -1518,17 +1540,21 @@ function Chat(p: {
   const clickMsg = (e: MouseEvent, m: Msg) => {
     if (sel().length || e.shiftKey) {
       e.preventDefault();
-      return toggle(m.id);
+      return toggle(m);
     }
     if (m.id.startsWith("tmp-") || (e.target as Element).closest("button, a, img, video, .wave")) return;
     const double = tap.id === m.id && e.timeStamp - tap.at < 350;
     tap = { id: double ? "" : m.id, at: e.timeStamp };
-    if (double) act(invoke("react", { id: m.id, emoji: "❤️" }));
+    if (double) act(invoke("react", { id: headOf(m).id, emoji: "❤️" }));
   };
   const [err, setErr] = createSignal("");
+  // The message open in the full-screen viewer, and everything it can leaf through.
   const [view, setView] = createSignal("");
+  const openView = (id: string) => !sel().length && setView(id);
+  const shots = createMemo(() => p.msgs.filter((m) => m.media?.kind === "photo" || m.media?.kind === "video") as Shot[]);
   // Files waiting in the "send" window (like Telegram's): photos compressed unless unticked.
   const [toSend, setToSend] = createSignal<string[]>([]);
+  const [caption, setCaption] = createSignal("");
   const [compress, setCompress] = createSignal(localStorage.getItem("compress") !== "0");
   const [drag, setDrag] = createSignal(false);
   const [video, setVideo] = createSignal(false);
@@ -1547,7 +1573,7 @@ function Chat(p: {
     grow();
   };
   let preview!: HTMLVideoElement;
-  // Android pickers give content:// URIs, not paths: read the files here and stash them for send_file.
+  // Android pickers give content:// URIs, not paths: read the files here and stash them for send_files.
   let picker!: HTMLInputElement;
   const pick = async () => {
     const files = [...(picker.files ?? [])];
@@ -1560,13 +1586,17 @@ function Chat(p: {
   const sendFiles = async (paths: string[]) => {
     if (!paths.length) return;
     await invoke("allow_preview", { paths }).catch(() => {});
+    setCaption("");
     setToSend(paths);
   };
-  const confirmSend = async () => {
-    const paths = toSend(), original = !compress();
+  const confirmSend = () => {
+    const paths = toSend(), original = !compress(), text = caption();
+    if (!paths.length) return;
     setToSend([]);
-    for (const path of paths)
-      await queue({ text: `📎 ${baseName(path)}` }, () => invoke<string>("send_file", { chat: p.chat, path, original }));
+    queue({ text: paths.length > 1 ? `📎 Файлов: ${paths.length}` : `📎 ${baseName(paths[0])}` },
+      () => invoke<string>("send_files", { chat: p.chat, paths, original, caption: text }),
+      // Part of them may have gone out before the failure.
+      () => void p.reload());
   };
   const attach = async () => {
     if (android) return picker.click();
@@ -1594,9 +1624,9 @@ function Chat(p: {
       } else setDrag(e.payload.type !== "leave");
     });
     const esc = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (e.key !== "Escape" || view()) return; // the viewer closes itself
       if (toSend().length) return setToSend([]);
-      if (view() || menu() || dlg()) return (setView(""), setMenu(undefined), setDlg(undefined));
+      if (menu() || dlg()) return (setMenu(undefined), setDlg(undefined));
       if (rec()) return stopRec(false);
       if (sel().length) return setSel([]);
       if (query() !== undefined) return setQuery(undefined);
@@ -1820,9 +1850,11 @@ function Chat(p: {
       <div class="msgs-wrap">
         <div class="msgs" ref={list} onScroll={onScroll} classList={{ selecting: !!sel().length }}>
           <Show when={!shown().length}><p class="empty muted">Здесь пока тихо. Напишите первым!</p></Show>
-          <For each={shown()}>
+          <For each={grouped().list}>
             {(m, i) => {
-              const prev = () => shown()[i() - 1], next = () => shown()[i() + 1];
+              const prev = () => grouped().list[i() - 1], next = () => grouped().list[i() + 1];
+              const items = () => itemsOf(m), head = () => headOf(m);
+              const status = () => Math.min(...items().map((x) => x.status));
               return (
                 <>
                   <Show when={!prev() || dayKey(prev()!.ts) !== dayKey(m.ts)}><div class="day"><span>{dayLabel(m.ts)}</span></div></Show>
@@ -1832,10 +1864,10 @@ function Chat(p: {
                       {m.mine || p.chat ? "" : `${nameOf(m.author)} · `}{callLabel(m.call)} · {time(m.ts)}
                     </div>
                   ) : (
-                    <div class="msg" data-id={m.id}
-                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id,
+                    <div class="msg" data-id={items().map((x) => x.id).join(" ")}
+                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: items().some((x) => x.id === hit()),
                         // Photo/video alone: edge to edge with the time over it; a video note has no bubble at all.
-                        bare: !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.reactions.length,
+                        bare: items().length === 1 && !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.reactions.length,
                         note: m.media?.kind === "videonote" && !m.text && !m.reply }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
@@ -1845,7 +1877,7 @@ function Chat(p: {
                       <Show when={swipe()?.id === m.id}>
                         <span class="swipe-reply" style={{ opacity: Math.min(1, swipe()!.dx / 60) }}><Reply size={18} /></span>
                       </Show>
-                      <button class="pick" title="Выделить" onClick={(e) => (e.stopPropagation(), toggle(m.id))}>
+                      <button class="pick" title="Выделить" onClick={(e) => (e.stopPropagation(), toggle(m))}>
                         <Show when={sel().includes(m.id)}><Check size={14} /></Show>
                       </button>
                       <Show when={!m.mine && !p.chat}>
@@ -1866,16 +1898,20 @@ function Chat(p: {
                             </div>
                           )}
                         </Show>
-                        <Show when={m.media}><MediaView id={m.id} m={m.media!} onView={setView} /></Show>
-                        <Show when={m.text}>
-                          <span class="text">{re() ? m.text.split(re()!).map((s, i) => (i % 2 ? <mark>{s}</mark> : s)) : m.text}</span>
+                        <Show when={items().length > 1} fallback={
+                          <Show when={m.media}><MediaView id={m.id} m={m.media!} onView={() => openView(m.id)} /></Show>
+                        }>
+                          <Album items={items()} onView={openView} />
                         </Show>
-                        <Show when={m.reactions.length}>
+                        <Show when={head().text}>
+                          <span class="text">{re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{s}</mark> : s)) : head().text}</span>
+                        </Show>
+                        <Show when={reactionsOf(m).length}>
                           <div class="reacts">
-                            <For each={m.reactions}>
-                              {([e, who]) => (
+                            <For each={reactionsOf(m)}>
+                              {([e, { who, id }]) => (
                                 <button classList={{ on: who.includes(p.me) }} title={who.map(name).join(", ")}
-                                  onClick={(ev) => (ev.stopPropagation(), act(invoke("react", { id: m.id, emoji: e })))}>
+                                  onClick={(ev) => (ev.stopPropagation(), act(invoke("react", { id, emoji: e })))}>
                                   {e} {who.length}
                                 </button>
                               )}
@@ -1883,14 +1919,14 @@ function Chat(p: {
                           </div>
                         </Show>
                         <span class="meta">
-                          <Show when={m.pinned}><Pin size={11} /></Show>
-                          <Show when={m.edited}><span>изменено</span></Show>
+                          <Show when={items().some((x) => x.pinned)}><Pin size={11} /></Show>
+                          <Show when={items().some((x) => x.edited)}><span>изменено</span></Show>
                           {time(m.ts)}
                           <Show when={m.mine}>
                             <Switch>
-                              <Match when={m.status === 0}><span title="Отправляется"><Clock size={14} /></span></Match>
-                              <Match when={m.status === 1}><span title="Доставлено"><Check size={14} /></span></Match>
-                              <Match when={m.status === 2}><span title="Прочитано"><CheckCheck size={14} /></span></Match>
+                              <Match when={status() === 0}><span title="Отправляется"><Clock size={14} /></span></Match>
+                              <Match when={status() === 1}><span title="Доставлено"><Check size={14} /></span></Match>
+                              <Match when={status() === 2}><span title="Прочитано"><CheckCheck size={14} /></span></Match>
                             </Switch>
                           </Show>
                         </span>
@@ -1910,26 +1946,30 @@ function Chat(p: {
         </Show>
       </div>
       <Show when={menu()}>
-        {(mn) => (
+        {(mn) => {
+          const head = () => headOf(mn().m), ids = () => itemsOf(mn().m).map((x) => x.id);
+          const pinnedOne = () => itemsOf(mn().m).find((x) => x.pinned);
+          return (
           <div class="overlay" onClick={() => setMenu(undefined)} onContextMenu={(e) => (e.preventDefault(), setMenu(undefined))}>
             <div class="menu" style={{ left: `${Math.min(mn().x, innerWidth - 210)}px`, top: `${Math.min(mn().y, innerHeight - 350)}px` }}>
               <div class="emojis">
                 <For each={["👍", "❤️", "😂", "😮", "😢", "🔥"]}>
-                  {(e) => <button onClick={() => act(invoke("react", { id: mn().m.id, emoji: e }))}>{e}</button>}
+                  {(e) => <button onClick={() => act(invoke("react", { id: head().id, emoji: e }))}>{e}</button>}
                 </For>
               </div>
-              <button onClick={() => startReply(mn().m)}><Reply size={16} /> Ответить</button>
-              <Show when={plain(mn().m)}><button onClick={() => copy([mn().m])}><Copy size={16} /> Копировать</button></Show>
-              <Show when={mn().m.mine}><button onClick={() => startEdit(mn().m)}><Pencil size={16} /> Редактировать</button></Show>
-              <button onClick={() => act(invoke("pin", { id: mn().m.id, pinned: !mn().m.pinned }))}>
-                {mn().m.pinned ? <PinOff size={16} /> : <Pin size={16} />} {mn().m.pinned ? "Открепить" : "Закрепить"}
+              <button onClick={() => startReply(head())}><Reply size={16} /> Ответить</button>
+              <Show when={plain(head())}><button onClick={() => copy([head()])}><Copy size={16} /> Копировать</button></Show>
+              <Show when={mn().m.mine}><button onClick={() => startEdit(head())}><Pencil size={16} /> Редактировать</button></Show>
+              <button onClick={() => act(invoke("pin", { id: (pinnedOne() ?? head()).id, pinned: !pinnedOne() }))}>
+                {pinnedOne() ? <PinOff size={16} /> : <Pin size={16} />} {pinnedOne() ? "Открепить" : "Закрепить"}
               </button>
-              <button onClick={() => setDlg({ kind: "forward", ids: [mn().m.id] })}><Forward size={16} /> Переслать</button>
-              <button onClick={() => setSel([mn().m.id])}><CircleCheck size={16} /> Выделить</button>
-              <button class="del" onClick={() => setDlg({ kind: "delete", ids: [mn().m.id] })}><Trash2 size={16} /> Удалить</button>
+              <button onClick={() => setDlg({ kind: "forward", ids: ids() })}><Forward size={16} /> Переслать</button>
+              <button onClick={() => setSel(ids())}><CircleCheck size={16} /> Выделить</button>
+              <button class="del" onClick={() => setDlg({ kind: "delete", ids: ids() })}><Trash2 size={16} /> Удалить</button>
             </div>
           </div>
-        )}
+          );
+        }}
       </Show>
       <Show when={dlg()}>
         {(d) => (
@@ -1979,6 +2019,8 @@ function Chat(p: {
               <For each={toSend()}>
                 {(f) => isPhoto(f)
                   ? <img src={convertFileSrc(f)} alt="" />
+                  : isVideo(f)
+                  ? <video src={`${convertFileSrc(f)}#t=0.1`} preload="metadata" muted playsinline />
                   : <div class="file-chip"><Paperclip size={16} /> <span class="ellipsis">{baseName(f)}</span></div>}
               </For>
             </div>
@@ -1994,13 +2036,15 @@ function Chat(p: {
                 ? "Отправится быстрее и займёт меньше места. Место съёмки и данные камеры будут удалены."
                 : "Фото уйдёт файлом в исходном качестве, вместе с метаданными (место и время съёмки, камера)."}</p>
             </Show>
+            <input placeholder="Подпись" aria-label="Подпись" value={caption()} onInput={(e) => setCaption(e.currentTarget.value)}
+              onKeyDown={(e) => e.key === "Enter" && !e.isComposing && confirmSend()} />
             <button class="primary" onClick={confirmSend}><Send size={16} /> Отправить</button>
             <button onClick={() => setToSend([])}>Отмена</button>
           </div>
         </div>
       </Show>
       <Show when={drag()}><div class="drop">Отпустите, чтобы отправить</div></Show>
-      <Show when={view()}><div class="viewer" onClick={() => setView("")}><img src={view()} alt="" /></div></Show>
+      <Show when={view()}><Viewer shots={shots()} at={view()} onAt={setView} onClose={() => setView("")} name={name} /></Show>
       <Show when={rec() && video()}><video ref={preview} class="circle live" autoplay muted playsinline /></Show>
       <Show when={editing() || reply()}>
         <div class="replybar">

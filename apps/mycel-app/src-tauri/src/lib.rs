@@ -424,6 +424,8 @@ struct Media {
     wave: Option<Vec<u8>>,
     duration_ms: Option<u32>,
     dims: Option<(u32, u32)>,
+    /// Shared by the media of one album.
+    album: Option<String>,
     /// The decrypted file, once downloaded.
     path: Option<String>,
 }
@@ -655,7 +657,8 @@ fn media_view(n: &Node, kind: MediaKind, b: &BlobRef) -> Media {
             MediaKind::VideoNote => "videonote",
         },
         name: b.name.clone(),
-        mime: b.mime.clone(),
+        mime: b.mime_type().into(),
+        album: b.album().map(Into::into),
         size: b.size,
         blurhash: match &b.preview {
             Some(Preview::Blurhash(h)) => Some(h.clone()),
@@ -1275,10 +1278,8 @@ async fn forward(st: State<'_, App>, ids: Vec<String>, to: String) -> R<()> {
     if let Some(p) = to {
         n.open_dm(p).map_err(err)?;
     }
-    for id in ids {
-        n.forward(unhex(&id)?, &to).map_err(err)?;
-    }
-    Ok(())
+    let ids: Vec<_> = ids.iter().map(|i| unhex(i)).collect::<R<_>>()?;
+    n.forward(&ids, &to).map_err(err)
 }
 
 #[tauri::command]
@@ -1294,44 +1295,98 @@ async fn react(st: State<'_, App>, id: String, emoji: String) -> R<()> {
     Ok(())
 }
 
-/// 📎 / drag-and-drop: photos are re-encoded (no EXIF) unless `original`, then they go as a file.
-#[tauri::command]
-async fn send_file(st: State<'_, App>, chat: String, path: String, original: bool) -> R<String> {
-    let n = &st.node()?;
-    let chat = &chat_of(n, &chat)?;
-    let src = Path::new(&path);
+/// A picked file ready to send; `tmp` marks a re-encoded copy to remove afterwards.
+struct Prepared {
+    kind: MediaKind,
+    src: PathBuf,
+    meta: BlobRef,
+    tmp: bool,
+}
+
+/// Photos are re-encoded (no EXIF) unless `original`, then they go as a file.
+async fn prepare(n: &Node, path: String, original: bool) -> R<Prepared> {
+    let src = PathBuf::from(path);
     let name = src.file_name().map(|s| s.to_string_lossy().into_owned());
     let ext = src
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let mime = mime_of(&ext);
-    let ev = if !original && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
-        let s = src.to_owned();
+    n.check_size(&src).map_err(err)?;
+    if !original && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        let s = src.clone();
         let ph = tauri::async_runtime::spawn_blocking(move || mycel_media::photo(&s))
             .await
             .map_err(|e| e.to_string())?
             .map_err(err)?;
         let tmp = tmp_file("jpg");
         std::fs::write(&tmp, &ph.jpeg).map_err(|e| e.to_string())?;
-        let mut m = blob_meta("image/jpeg", name.map(|n| format!("{n}.jpg")));
-        m.preview = Some(Preview::Blurhash(ph.blurhash));
-        m.dims = Some(ph.dims);
-        let r = n.send_media(chat, MediaKind::Photo, &tmp, m, None).await;
-        let _ = std::fs::remove_file(&tmp);
-        r.map_err(err)?
+        let mut meta = blob_meta("image/jpeg", name.map(|n| format!("{n}.jpg")));
+        meta.preview = Some(Preview::Blurhash(ph.blurhash));
+        meta.dims = Some(ph.dims);
+        return Ok(Prepared {
+            kind: MediaKind::Photo,
+            src: tmp,
+            meta,
+            tmp: true,
+        });
+    }
+    // shortcut: video goes as is, no re-encode or preview frame; ffmpeg when people complain about size.
+    let kind = if mime.starts_with("video/") {
+        MediaKind::Video
     } else {
-        // shortcut: video goes as is, no re-encode or preview frame; ffmpeg when people complain about size.
-        let kind = if mime.starts_with("video/") {
-            MediaKind::Video
-        } else {
-            MediaKind::File
-        };
-        n.send_media(chat, kind, src, blob_meta(mime, name), None)
-            .await
-            .map_err(err)?
+        MediaKind::File
     };
-    Ok(hex(&ev.id))
+    Ok(Prepared {
+        kind,
+        src,
+        meta: blob_meta(mime, name),
+        tmp: false,
+    })
+}
+
+/// 📎 / drag-and-drop: photos and videos first, up to 10 per album, then the other files.
+/// `caption` goes with the first one. Returns the last event's id.
+#[tauri::command]
+async fn send_files(
+    st: State<'_, App>,
+    chat: String,
+    paths: Vec<String>,
+    original: bool,
+    caption: String,
+) -> R<String> {
+    let n = &st.node()?;
+    let chat = &chat_of(n, &chat)?;
+    let mut files = vec![];
+    let sent = async {
+        // Everything is prepared before anything goes out: an unreadable file sends nothing.
+        for p in paths {
+            files.push(prepare(n, p, original).await?);
+        }
+        // Stable: the picked order stays within the media and within the files.
+        files.sort_by_key(|f| f.kind == MediaKind::File);
+        let media = files.iter().filter(|f| f.kind != MediaKind::File).count();
+        let mut caption = Some(caption.trim().to_owned()).filter(|c| !c.is_empty());
+        let (mut album, mut last) = (String::new(), None);
+        for (i, f) in files.iter().enumerate() {
+            let mut meta = f.meta.clone();
+            // A lone item (one picked, or the 11th) is not an album.
+            if i < media && media.min(i / 10 * 10 + 10) - i / 10 * 10 > 1 {
+                if i % 10 == 0 {
+                    album = mycel_core::new_album().map_err(err)?;
+                }
+                meta.set_album(&album);
+            }
+            let ev = n.send_media(chat, f.kind, &f.src, meta, caption.take());
+            last = Some(hex(&ev.await.map_err(err)?.id));
+        }
+        last.ok_or_else(|| "no files".to_string())
+    }
+    .await;
+    for f in files.iter().filter(|f| f.tmp) {
+        let _ = std::fs::remove_file(&f.src);
+    }
+    sent
 }
 
 /// Raw IPC body; Android's IPC delivers a Uint8Array as a JSON array of numbers instead.
@@ -1349,7 +1404,7 @@ fn set_visible(v: bool, vis: State<Visible>) {
     vis.0.store(v, Ordering::Relaxed);
 }
 
-/// A file picked in the WebView (Android has no paths): raw body saved as temp/`name`; returns the path for `send_file`.
+/// A file picked in the WebView (Android has no paths): raw body saved as temp/`name`; returns the path for `send_files`.
 #[tauri::command]
 fn stash(request: tauri::ipc::Request<'_>) -> R<String> {
     let data = &body(&request)?;
@@ -1434,6 +1489,25 @@ async fn fetch_media(app: AppHandle, st: State<'_, App>, id: String) -> R<String
 async fn save_media(st: State<'_, App>, id: String, to: String) -> R<()> {
     let n = &st.node()?;
     let p = n.media_path(&find_media(n, &id)?.1).await.map_err(err)?;
+    #[cfg(target_os = "android")]
+    if to.starts_with("content://") {
+        return vault::with_class("org.mycel.app.Save", |env, class, ctx| {
+            use jni::objects::{JObject, JValue};
+            let from = JObject::from(env.new_string(p.to_string_lossy())?);
+            let to = JObject::from(env.new_string(&to)?);
+            env.call_static_method(
+                class,
+                "copy",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+                &[
+                    JValue::Object(ctx),
+                    JValue::Object(&from),
+                    JValue::Object(&to),
+                ],
+            )?;
+            Ok(())
+        });
+    }
     std::fs::copy(p, to).map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -1763,7 +1837,7 @@ pub fn run() {
             forward,
             pin,
             react,
-            send_file,
+            send_files,
             send_rec,
             fetch_media,
             save_media,
