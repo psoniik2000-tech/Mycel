@@ -1607,8 +1607,72 @@ async fn save_media(st: State<'_, App>, id: String, to: String) -> R<()> {
 #[tauri::command]
 async fn open_media(st: State<'_, App>, id: String) -> R<()> {
     let n = &st.node()?;
-    let p = n.media_path(&find_media(n, &id)?.1).await.map_err(err)?;
-    tauri_plugin_opener::open_path(p, None::<&str>).map_err(|e| e.to_string())
+    let (_, b) = find_media(n, &id)?;
+    let p = n.media_path(&b).await.map_err(err)?;
+    #[cfg(target_os = "android")]
+    let r = vault::with_class("org.mycel.app.Save", |env, class, ctx| {
+        use jni::objects::{JObject, JValue};
+        let from = JObject::from(env.new_string(p.to_string_lossy())?);
+        let name = JObject::from(env.new_string(b.name.clone().unwrap_or_default())?);
+        env.call_static_method(
+            class,
+            "open",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(ctx),
+                JValue::Object(&from),
+                JValue::Object(&name),
+            ],
+        )?;
+        Ok(())
+    })
+    .map_err(|_| "Не удалось открыть файл".to_string());
+    #[cfg(not(target_os = "android"))]
+    let r = tauri_plugin_opener::open_path(p, None::<&str>).map_err(|e| e.to_string());
+    r
+}
+
+/// Android "Сохранить": copies the file to Pictures, Movies or Downloads (MediaStore, Save.kt).
+/// Returns that folder. Desktop saves through the save dialog instead (`save_media`).
+#[tauri::command]
+async fn save_download(st: State<'_, App>, id: String) -> R<String> {
+    let n = &st.node()?;
+    let (_, b) = find_media(n, &id)?;
+    let p = n.media_path(&b).await.map_err(err)?;
+    #[cfg(target_os = "android")]
+    let r = {
+        let name = b.name.clone().unwrap_or_else(|| {
+            format!("mycel.{}", b.mime.split(['/', ';']).nth(1).unwrap_or("bin"))
+        });
+        vault::with_class("org.mycel.app.Save", |env, class, ctx| {
+            use jni::objects::{JObject, JString, JValue};
+            let from = JObject::from(env.new_string(p.to_string_lossy())?);
+            let name_j = JObject::from(env.new_string(&name)?);
+            let mime = JObject::from(env.new_string(&b.mime)?);
+            let out = env
+                .call_static_method(
+                    class,
+                    "download",
+                    "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Object(ctx),
+                        JValue::Object(&from),
+                        JValue::Object(&name_j),
+                        JValue::Object(&mime),
+                    ],
+                )?
+                .l()?;
+            let s: String = env.get_string(&JString::from(out))?.into();
+            Ok(s)
+        })
+        .map_err(|_| "Не удалось сохранить файл".to_string())
+    };
+    #[cfg(not(target_os = "android"))]
+    let r: R<String> = {
+        let _ = p;
+        Err("Сохранение в папку только на Android".to_string())
+    };
+    r
 }
 
 /// Calls tab: newest first.
@@ -1781,8 +1845,17 @@ async fn remove_space(app: AppHandle, st: State<'_, App>, id: String) -> R<()> {
     }
     list.save(&root).map_err(|e| e.to_string())?;
     vault::forget(&root, &id);
-    // Fails while the closed node's last references still hold files; List::load retries at start.
-    let _ = std::fs::remove_dir_all(spaces::dir(&root, &id));
+    // Windows keeps files of a closed node open until its last task ends: retry in the background
+    // (List::load also retries at start).
+    let dir = spaces::dir(&root, &id);
+    std::thread::spawn(move || {
+        for _ in 0..120 {
+            if !dir.exists() || std::fs::remove_dir_all(&dir).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
     Ok(())
 }
 
@@ -2059,6 +2132,28 @@ fn autostart(app: AppHandle, on: Option<bool>) -> R<bool> {
     }
 }
 
+/// Push-to-talk key during a call (desktop): a global shortcut, so it works while another window
+/// has the focus. `Some(code)` (a KeyboardEvent.code) registers it, `None` releases it; each press
+/// and release comes as the event "ptt" with `true` or `false`. Phones keep the in-window keys.
+#[tauri::command]
+fn ptt_key(app: AppHandle, key: Option<String>) -> R<()> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+        let gs = app.global_shortcut();
+        gs.unregister_all().map_err(|e| e.to_string())?;
+        if let Some(key) = key {
+            gs.on_shortcut(key.as_str(), |app, _, ev| {
+                let _ = app.emit("ptt", matches!(ev.state, ShortcutState::Pressed));
+            })
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(not(desktop))]
+    let _ = (app, key);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let b = tauri::Builder::default();
@@ -2072,6 +2167,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .on_window_event(|w, e| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = e {
                 api.prevent_close();
@@ -2086,6 +2182,8 @@ pub fn run() {
         .manage(App::default())
         .manage(Visible(AtomicBool::new(true)))
         .invoke_handler(tauri::generate_handler![
+            ptt_key,
+            save_download,
             status,
             unlock,
             backup,
