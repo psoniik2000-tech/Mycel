@@ -1834,11 +1834,17 @@ async fn backup(
     to: Option<String>,
     password: String,
     media: bool,
+    phrase: bool,
 ) -> R<(String, Vec<String>)> {
+    let root = data_dir(&app)?;
+    let password = if phrase {
+        vault::load(&root, PHRASE).ok_or("Сначала создайте фразу восстановления")?
+    } else {
+        password
+    };
     if password.is_empty() {
         return Err("Введите пароль".into());
     }
-    let root = data_dir(&app)?;
     let list = spaces::List::load(&root).map_err(|e| e.to_string())?;
     let open =
         st.0.lock()
@@ -1871,10 +1877,43 @@ async fn backup(
     Ok((out.display().to_string(), without))
 }
 
+/// Vault entry of the recovery phrase (never a space id).
+const PHRASE: &str = "recovery-phrase";
+
+/// Settings → Резервная копия → Фраза восстановления: 24 new words, kept only after `set_phrase`.
+#[tauri::command]
+fn new_phrase() -> R<String> {
+    mycel_core::backup::new_phrase().map_err(err)
+}
+
+/// The user wrote the words down: backups by phrase now use them.
+#[tauri::command]
+fn set_phrase(app: AppHandle, phrase: String) -> R<()> {
+    let p = mycel_core::backup::phrase(&phrase).map_err(err)?;
+    vault::save(&data_dir(&app)?, PHRASE, &p)
+}
+
+#[tauri::command]
+fn has_phrase(app: AppHandle) -> R<bool> {
+    Ok(vault::load(&data_dir(&app)?, PHRASE).is_some())
+}
+
+#[tauri::command]
+fn phrase_words() -> Vec<&'static str> {
+    mycel_core::backup::words().to_vec()
+}
+
 /// Restores a backup as new spaces of a new device (DESIGN §10), their password the backup's,
 /// remembered; the first one opens next. Nothing is left behind on failure.
+/// `phrase`: `password` is the 24 words, then also this device's recovery phrase.
 #[tauri::command]
-async fn restore_backup(app: AppHandle, path: String, password: String) -> R<()> {
+async fn restore_backup(app: AppHandle, path: String, password: String, phrase: bool) -> R<()> {
+    let password = if phrase {
+        mycel_core::backup::phrase(&password)
+            .map_err(|_| "Фраза неверна: проверьте слова и их порядок")?
+    } else {
+        password
+    };
     let root = data_dir(&app)?;
     let r = root.clone();
     let pw = password.clone();
@@ -1921,6 +1960,9 @@ async fn restore_backup(app: AppHandle, path: String, password: String) -> R<()>
     }
     for id in &made {
         vault::save(&root, id, &password)?;
+    }
+    if phrase {
+        vault::save(&root, PHRASE, &password)?;
     }
     Ok(())
 }
@@ -2090,6 +2132,10 @@ pub fn run() {
             unlock,
             backup,
             restore_backup,
+            new_phrase,
+            set_phrase,
+            has_phrase,
+            phrase_words,
             export_chat,
             public_ip,
             anchor_check,

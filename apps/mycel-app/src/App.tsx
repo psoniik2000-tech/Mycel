@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -803,19 +803,39 @@ function BackupSettings(p: { chats: string[] }) {
   const [msg, setMsg] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [restoring, setRestoring] = createSignal(false);
+  // Recovery phrase: kept by the OS vault, shown once when made; a backup sealed by it opens with the words.
+  const [hasPhrase, setHasPhrase] = createSignal(false);
+  const [byPhrase, setByPhrase] = createSignal(true);
+  const [shown, setShown] = createSignal("");
+  onMount(() => invoke<boolean>("has_phrase").then(setHasPhrase, () => {}));
+  const newPhrase = async () => {
+    if (hasPhrase() && !(await ask("Старые копии, сделанные по фразе, откроются только старой фразой. Создать новую?", { title: "Фраза восстановления", okLabel: "Создать", cancelLabel: "Отмена" }))) return;
+    invoke<string>("new_phrase").then(setShown, (e) => setMsg(errText(e)));
+  };
+  const written = async () => {
+    try {
+      await invoke("set_phrase", { phrase: shown() });
+      setHasPhrase(true);
+      setByPhrase(true);
+      setShown("");
+    } catch (e) {
+      setMsg(errText(e));
+    }
+  };
+  const phrase = () => hasPhrase() && byPhrase();
   // Android: no save dialog paths, the file goes to Downloads.
   const target = async (name: string, ext: string) =>
     android ? null : save({ defaultPath: name, filters: [{ name: ext, extensions: [ext] }] });
   const make = async (e: Event) => {
     e.preventDefault();
-    if (!pw()) return setMsg("Придумайте пароль для копии");
-    if (pw() !== pw2()) return setMsg("Пароли не совпадают");
+    if (!phrase() && !pw()) return setMsg("Придумайте пароль для копии");
+    if (!phrase() && pw() !== pw2()) return setMsg("Пароли не совпадают");
     const to = await target("mycel.mycelbak", "mycelbak");
     if (!to && !android) return;
     setBusy(true);
     setMsg("Создаём копию…");
     try {
-      const [path, left] = await invoke<[string, string[]]>("backup", { to, password: pw(), media: media() });
+      const [path, left] = await invoke<[string, string[]]>("backup", { to, password: pw(), media: media(), phrase: phrase() });
       setPw("");
       setPw2("");
       setMsg(`Сохранено: ${path}` + (left.length ? `. Без пароля на этом устройстве не вошли: ${left.join(", ")}` : ""));
@@ -835,8 +855,16 @@ function BackupSettings(p: { chats: string[] }) {
       <h3>Резервная копия</h3>
       <p class="muted">Один файл с историей, чатами и пространствами для нового устройства или после переустановки. Ключи шифрования в копию не входят: после восстановления это новое устройство, в пространства и к контактам нужно войти заново по приглашению — история останется.</p>
       <form class="section" onSubmit={make}>
-        <input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
-        <input type="password" placeholder="Повторите пароль" value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} />
+        <Show when={hasPhrase()}>
+          <label class="check">
+            <input type="checkbox" checked={byPhrase()} onChange={(e) => setByPhrase(e.currentTarget.checked)} />
+            Зашифровать фразой восстановления (вместо пароля)
+          </label>
+        </Show>
+        <Show when={!phrase()}>
+          <input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
+          <input type="password" placeholder="Повторите пароль" value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} />
+        </Show>
         <label class="check">
           <input type="checkbox" checked={media()} onChange={(e) => setMedia(e.currentTarget.checked)} />
           С фото, видео и файлами (скачанными на это устройство)
@@ -846,6 +874,26 @@ function BackupSettings(p: { chats: string[] }) {
           <button type="button" onClick={() => setRestoring(true)}>Восстановить из копии</button>
         </div>
       </form>
+      <h3>Фраза восстановления</h3>
+      <p class="muted">24 слова вместо пароля копии: файл копии и эти слова восстанавливают историю на новом устройстве.</p>
+      <div class="actions">
+        <button onClick={newPhrase}>{hasPhrase() ? "Создать новую фразу" : "Создать фразу восстановления"}</button>
+      </div>
+      <Show when={shown()}>
+        <div class="modal">
+          <div class="card dialog">
+            <h3>Фраза восстановления</h3>
+            <p class="error">Запишите слова по порядку на бумаге. Больше они не покажутся. Кто знает фразу и получит файл копии, прочтёт всю переписку.</p>
+            <ol style={{ columns: 2, margin: "8px 0", "padding-left": "28px" }}>
+              <For each={shown().split(" ")}>{(w) => <li>{w}</li>}</For>
+            </ol>
+            <div class="actions">
+              <button class="primary" onClick={written}>Я записал(а)</button>
+              <button onClick={() => setShown("")}>Отмена</button>
+            </div>
+          </div>
+        </div>
+      </Show>
       <div class="actions">
         <select value={chat()} onChange={(e) => setChat(e.currentTarget.value)}>
           <For each={p.chats}>{(c) => <option value={c}>{c ? nameOf(c) : "Общий чат"}</option>}</For>
@@ -864,6 +912,25 @@ function Restore(p: { onClose: () => void }) {
   const [pw, setPw] = createSignal("");
   const [err, setErr] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  // By recovery phrase: 24 fields with the BIP-39 list as autocomplete; the checksum is checked by Rust.
+  const [byPhrase, setByPhrase] = createSignal(false);
+  const [words, setWords] = createSignal<string[]>(Array(24).fill(""));
+  const [list, setList] = createSignal<Set<string>>(new Set());
+  const usePhrase = (on: boolean) => {
+    setByPhrase(on);
+    if (on && !list().size) invoke<string[]>("phrase_words").then((l) => setList(new Set(l)), () => {});
+  };
+  // A pasted phrase fills the fields from this one on.
+  const setWord = (i: number, v: string) => {
+    const parts = v.toLowerCase().trim().split(/\s+/);
+    const w = [...words()];
+    if (parts.length > 1) parts.slice(0, 24 - i).forEach((p, k) => (w[i + k] = p));
+    else w[i] = v.toLowerCase().trim();
+    setWords(w);
+  };
+  // Red only once no word starts so; the button waits for every word to be in the list.
+  const bad = (w: string) => !!w && list().size > 0 && ![...list()].some((x) => x.startsWith(w));
+  const phraseOk = () => words().every((w) => list().has(w));
   // Android pickers give content:// URIs: the file is read here and stashed (as for attachments).
   let picker!: HTMLInputElement;
   const pick = async () => {
@@ -879,7 +946,7 @@ function Restore(p: { onClose: () => void }) {
     setBusy(true);
     setErr("");
     try {
-      await invoke("restore_backup", { path: path(), password: pw() });
+      await invoke("restore_backup", { path: path(), password: byPhrase() ? words().join(" ") : pw(), phrase: byPhrase() });
       await invoke("close_space");
       location.reload();
     } catch (e) {
@@ -893,11 +960,28 @@ function Restore(p: { onClose: () => void }) {
         <h3>Восстановить из копии</h3>
         <input ref={picker} type="file" hidden onChange={stash} />
         <button type="button" onClick={pick}>{path() ? baseName(path()) : "Выбрать файл .mycelbak"}</button>
-        <input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
+        <label class="check">
+          <input type="checkbox" checked={byPhrase()} onChange={(e) => usePhrase(e.currentTarget.checked)} />
+          По фразе из 24 слов
+        </label>
+        <Show when={byPhrase()} fallback={<input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />}>
+          <datalist id="bip39">
+            <For each={[...list()]}>{(w) => <option value={w} />}</For>
+          </datalist>
+          <div style={{ display: "grid", "grid-template-columns": "1fr 1fr 1fr", gap: "4px" }}>
+            <Index each={words()}>
+              {(w, i) => (
+                <input list="bip39" autocapitalize="off" autocomplete="off" spellcheck={false} placeholder={`${i + 1}`} value={w()}
+                  style={{ "min-width": 0, "border-color": bad(w()) ? "var(--danger)" : undefined }}
+                  onInput={(e) => setWord(i, e.currentTarget.value)} />
+              )}
+            </Index>
+          </div>
+        </Show>
         <p class="muted small">Пространства из копии добавятся на это устройство, их пароль — пароль копии. Затем войдите в них заново по приглашению: история уже будет на месте.</p>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <div class="actions">
-          <button class="primary" disabled={busy() || !path() || !pw()}>{busy() ? "Восстанавливаем…" : "Восстановить"}</button>
+          <button class="primary" disabled={busy() || !path() || (byPhrase() ? !phraseOk() : !pw())}>{busy() ? "Восстанавливаем…" : "Восстановить"}</button>
           <button type="button" onClick={p.onClose}>Отмена</button>
         </div>
       </form>

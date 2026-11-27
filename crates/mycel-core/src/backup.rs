@@ -5,6 +5,9 @@
 //! Format: `MAGIC | salt 16 | nonce prefix 19 | segments`, a segment `u32 LE len | ciphertext`
 //! of the STREAM construction (XChaCha20-Poly1305, Argon2id key), so reordering and truncation
 //! fail. The plaintext is a run of `u32 LE len | postcard (tag, a, b)` items.
+//!
+//! Recovery phrase (DESIGN §4.1): 24 BIP-39 words (256 bits) used as the password, normalized by
+//! [`phrase`], so a backup file plus the words restore it.
 
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32};
@@ -22,6 +25,28 @@ const SPACE: u8 = 0;
 const EVENT: u8 = 1;
 const FILE: u8 = 2;
 pub const BAD_PASSWORD: &str = "wrong password or damaged backup";
+pub const BAD_PHRASE: &str = "not a valid recovery phrase";
+
+/// A new recovery phrase: 24 BIP-39 English words.
+pub fn new_phrase() -> Result<String> {
+    let mut e = [0u8; 32];
+    getrandom::fill(&mut e)?;
+    Ok(bip39::Mnemonic::from_entropy(&e)?.to_string())
+}
+
+/// Checks typed words (word list, checksum, 24 of them) and returns the phrase normalized:
+/// the backup password.
+pub fn phrase(words: &str) -> Result<String> {
+    let m = bip39::Mnemonic::parse_in(bip39::Language::English, words.to_lowercase())
+        .map_err(|_| anyhow::anyhow!(BAD_PHRASE))?;
+    ensure!(m.word_count() == 24, BAD_PHRASE);
+    Ok(m.to_string())
+}
+
+/// The BIP-39 English word list, for autocomplete.
+pub fn words() -> &'static [&'static str; 2048] {
+    bip39::Language::English.word_list()
+}
 
 fn cipher(password: &str, salt: &[u8]) -> Result<XChaCha20Poly1305> {
     let mut key = [0u8; 32];

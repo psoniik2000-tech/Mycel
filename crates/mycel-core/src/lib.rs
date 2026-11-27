@@ -2669,6 +2669,50 @@ mod tests {
         b.close().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_by_recovery_phrase() {
+        let (src, dst) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, _rx) = Node::open(src.path(), "pa", &Opts::default())
+            .await
+            .unwrap();
+        a.create_space().unwrap();
+        let ev = a.send_text(&None, "hi", None).unwrap();
+        a.close().await;
+
+        let words = backup::new_phrase().unwrap();
+        assert_eq!(words.split(' ').count(), 24);
+        let file = dst.path().join("b.mycelbak");
+        backup::write(&file, &words, &[("Моё", src.path(), "pa")], false).unwrap();
+        // Typed back with other case and spacing.
+        let typed = format!(
+            "  {}
+",
+            words.to_uppercase().replace(' ', "   ")
+        );
+        assert_eq!(backup::phrase(&typed).unwrap(), words);
+        // A swapped word breaks the checksum (almost always) or the key.
+        let mut w: Vec<_> = words.split(' ').collect();
+        w.swap(0, 1);
+        let other = backup::new_phrase().unwrap();
+        assert!(backup::phrase("abandon ability").is_err());
+        assert!(backup::phrase(&format!("{} zzzz", &words[..words.rfind(' ').unwrap()])).is_err());
+        let to = dst.path().join("s");
+        let err = backup::restore(&file, &other, "pw", |_| Ok(to.clone())).unwrap_err();
+        assert_eq!(err.to_string(), backup::BAD_PASSWORD);
+        if let Ok(p) = backup::phrase(&w.join(" ")) {
+            assert!(backup::restore(&file, &p, "pw", |_| Ok(to.clone())).is_err());
+        }
+        assert!(!to.exists());
+        let pw = backup::phrase(&typed).unwrap();
+        assert_eq!(
+            backup::restore(&file, &pw, "pw", |_| Ok(to.clone())).unwrap(),
+            ["Моё"]
+        );
+        let (b, _rx) = Node::open(&to, "pw", &Opts::default()).await.unwrap();
+        assert!(b.history(&None).unwrap().contains(&ev));
+        b.close().await;
+    }
+
     #[tokio::test]
     async fn checks_a_relay_and_tells_it_from_a_mailbox() {
         let url = "http://127.0.0.1:34871";
