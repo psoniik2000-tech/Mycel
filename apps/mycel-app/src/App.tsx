@@ -32,7 +32,7 @@ type Active = { id: string; video: boolean; started: number; peers: string[]; ch
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
-type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
+type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean; anchor: string | null };
 type Tab = "chats" | "calls" | "people" | "settings";
 // What the user came to do, picked before the password (unknown: Onboard offers both).
 type How = "create" | "join";
@@ -98,7 +98,7 @@ async function tryAutoAnchor(id: string) {
   if (!autoAnchor() || anchor() || !(await invoke<boolean>("upnp_ok").catch(() => false))) return;
   try {
     await setAnchor(id, true);
-    const [, mapped] = await invoke<[boolean, boolean]>("anchor_check");
+    const [, mapped] = await invoke<[boolean, boolean, boolean]>("anchor_check");
     if (!mapped) await setAnchor(id, false);
   } catch {
     // stays a plain member
@@ -300,6 +300,8 @@ export default function App() {
   });
   const refresh = async () => {
     const s = await invoke<Status>("status");
+    // Anchor mode survives a lost WebView storage: the backend keeps the last unlock's URL.
+    if (s.anchor && !android && !anchor()) localStorage.setItem("anchor", s.anchor);
     setStatus(s);
     spaceId = s.current ?? "";
     return s;
@@ -514,13 +516,13 @@ function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; o
 // Settings → Вход: password at start, password change.
 function AnchorSettings(p: { space: Space }) {
   const [url, setUrl] = createSignal(anchor() ?? "");
-  const [state, setState] = createSignal<[boolean, boolean]>();
+  const [state, setState] = createSignal<[boolean, boolean, boolean]>();
   const [msg, setMsg] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [auto, setAuto] = createSignal(autoAnchor());
   const check = async () => {
     setState(undefined);
-    setState(await invoke<[boolean, boolean]>("anchor_check"));
+    setState(await invoke<[boolean, boolean, boolean]>("anchor_check"));
   };
   const apply = async (on: boolean) => {
     setBusy(true);
@@ -558,6 +560,7 @@ function AnchorSettings(p: { space: Space }) {
           <Show when={state()} fallback={<div class="muted">Проверяю доступность…</div>}>
             {(st) => (
               <>
+                <div>Сервер якоря: {st()[2] ? "работает" : "не запущен, перезапускаю…"}</div>
                 <div>Порт на роутере: {st()[1] ? "открыт автоматически" : "не открыт автоматически"}</div>
                 <div>Доступ из интернета: {st()[0] ? "есть ✓" : "не подтверждён"}</div>
                 <Show when={!st()[0]}>

@@ -30,11 +30,90 @@ struct Open {
     n0: bool,
     relays: Vec<String>,
     mailbox: Option<String>,
-    /// The router opened the anchor's port (UPnP).
-    mapped: bool,
-    /// The anchor's relay, stopped when dropped.
-    #[cfg(not(target_os = "android"))]
-    _relay: Option<mycel_core::RelayServer>,
+}
+
+/// The anchor's relay server. Lives apart from the open space: a reopen (settings change, space
+/// switch) no longer stops and rebinds it — a rebind racing the old server's shutdown failed
+/// with "address in use" and took anchor mode down. Restarted whenever it stops.
+#[cfg(not(target_os = "android"))]
+struct Relay {
+    url: String,
+    /// The server is listening right now.
+    up: Arc<AtomicBool>,
+    /// The router opened the port (UPnP).
+    mapped: Arc<AtomicBool>,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+static RELAY: Mutex<Option<Relay>> = Mutex::new(None);
+
+/// Starts the anchor's relay at `url` (kept if it already runs there); returns whether the
+/// router opened the port.
+#[cfg(not(target_os = "android"))]
+async fn start_relay(url: &str) -> bool {
+    if let Some(r) = RELAY.lock().unwrap().as_ref().filter(|r| r.url == url) {
+        return r.mapped.load(Ordering::Relaxed);
+    }
+    drop(RELAY.lock().unwrap().take());
+    let port = port_of(url);
+    let mapped = Arc::new(AtomicBool::new(upnp(port, true).await.is_ok()));
+    let up = Arc::new(AtomicBool::new(false));
+    let task = tauri::async_runtime::spawn(keep_relay(url.to_string(), up.clone(), mapped.clone()));
+    // Briefly, so the node finds its relay up; if the port is busy it keeps retrying.
+    for _ in 0..30 {
+        if up.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let m = mapped.load(Ordering::Relaxed);
+    *RELAY.lock().unwrap() = Some(Relay {
+        url: url.to_string(),
+        up,
+        mapped,
+        task,
+    });
+    m
+}
+
+/// Runs the relay, restarting it 3 s after it stops or fails to start; renews the UPnP lease
+/// (7 days where a permanent one is refused) every 6 h.
+#[cfg(not(target_os = "android"))]
+async fn keep_relay(url: String, up: Arc<AtomicBool>, mapped: Arc<AtomicBool>) {
+    const RENEW: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW, RENEW);
+    loop {
+        match mycel_core::spawn_relay(&url).await {
+            Ok(mut s) => {
+                up.store(true, Ordering::Relaxed);
+                let stopped = loop {
+                    let r = tokio::select! {
+                        r = s.join() => Some(r),
+                        _ = renew.tick() => None,
+                    };
+                    match r {
+                        Some(r) => break r,
+                        None => {
+                            let ok = upnp(port_of(&url), true).await.is_ok();
+                            mapped.store(ok, Ordering::Relaxed);
+                        }
+                    }
+                };
+                eprintln!("mycel: anchor relay stopped ({stopped:?}), restarting");
+                up.store(false, Ordering::Relaxed);
+            }
+            Err(e) => eprintln!("mycel: anchor relay did not start: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 impl App {
@@ -439,6 +518,8 @@ struct Status {
     /// Its data folder.
     dir: String,
     in_space: bool,
+    /// Anchor URL of the last unlock.
+    anchor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -774,6 +855,7 @@ fn status(app: AppHandle, st: State<App>) -> R<Status> {
             })
             .collect(),
         last: list.last,
+        anchor: list.anchor,
         dir: spaces::dir(&root, current.as_deref().unwrap_or(""))
             .display()
             .to_string(),
@@ -835,7 +917,6 @@ async fn unlock(
     if let Some((_, true, _)) = open {
         return Ok(st.node()?.admin().is_ok());
     }
-    let was_anchor = open.as_ref().and_then(|o| o.2.clone());
     let pw = match (&password, open) {
         (Some(p), _) => p.clone(),
         (None, Some((p, ..))) => p,
@@ -844,33 +925,27 @@ async fn unlock(
     // Listed before the node creates its folder, so List::load never takes it for an orphan.
     list.last = Some(id.clone());
     (list.n0, list.relays, list.mailbox) = (n0, relays.clone(), mailbox.clone());
+    list.anchor = anchor.clone();
     list.save(&root).map_err(|e| e.to_string())?;
     st.close().await;
     #[cfg(not(target_os = "android"))]
-    let (relay, mapped) = match &anchor {
+    match &anchor {
         Some(u) => {
             #[cfg(windows)]
             allow_firewall(port_of(u));
-            (
-                Some(mycel_core::spawn_relay(u).await.map_err(err)?),
-                upnp(port_of(u), true).await.is_ok(),
-            )
+            start_relay(u).await;
         }
         None => {
-            if let Some(u) = was_anchor {
-                let _ = upnp(port_of(&u), false).await;
+            let old = RELAY.lock().unwrap().take();
+            if let Some(r) = old {
+                let _ = upnp(port_of(&r.url), false).await;
             }
-            (None, false)
         }
-    };
+    }
     #[cfg(target_os = "android")]
-    let mapped = {
-        let _ = was_anchor;
-        if anchor.is_some() {
-            return Err("якорь работает только на ПК".into());
-        }
-        false
-    };
+    if anchor.is_some() {
+        return Err("якорь работает только на ПК".into());
+    }
     // Anchors' relays come via invite/peer exchange; n0 (Settings, on by default) is the public fallback.
     // An anchor also keeps every blob for members who were offline when it was sent.
     let dir = spaces::dir(&root, &id);
@@ -914,9 +989,6 @@ async fn unlock(
         n0,
         relays,
         mailbox,
-        mapped,
-        #[cfg(not(target_os = "android"))]
-        _relay: relay,
     });
     let (mut typing, app2, node2) = (node.typing_events(), app.clone(), node.clone());
     tauri::async_runtime::spawn(async move {
@@ -1151,11 +1223,30 @@ fn public_v4(ip: std::net::Ipv4Addr) -> bool {
     !ip.is_private() && !ip.is_loopback() && !(ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
 }
 
-/// [reaches its own relay through the public URL (waits up to 5 s), the router opened the port].
+/// [reaches its own relay through the public URL (waits up to 5 s), the router opened the port,
+/// the relay server is running].
 #[tauri::command]
-async fn anchor_check(st: State<'_, App>) -> R<(bool, bool)> {
-    let mapped = st.0.lock().unwrap().as_ref().is_some_and(|o| o.mapped);
-    Ok((st.node()?.relay_connected().await, mapped))
+async fn anchor_check(st: State<'_, App>) -> R<(bool, bool, bool)> {
+    #[cfg(not(target_os = "android"))]
+    let (url, mapped, up) = RELAY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|r| {
+            (
+                r.url.parse::<mycel_core::RelayUrl>().ok(),
+                r.mapped.load(Ordering::Relaxed),
+                r.up.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or_default();
+    #[cfg(target_os = "android")]
+    let (url, mapped, up) = (None::<mycel_core::RelayUrl>, false, false);
+    let n = st.node()?;
+    n.relay_connected().await;
+    // Home on our own relay, not on a fallback one.
+    let home = n.home_relay().and_then(|h| h.parse().ok());
+    Ok((url.is_some() && home == url, mapped, up))
 }
 
 #[tauri::command]
