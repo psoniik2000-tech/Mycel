@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, Index, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
+import { createEffect, createMemo, createRenderEffect, createSignal, For, getOwner, Index, Match, on, onCleanup, onMount, runWithOwner, Show, Switch, untrack } from "solid-js";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -7,7 +7,7 @@ import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
-  ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
+  ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Contact, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer, SwitchCamera,
   EyeOff,
 } from "lucide-solid";
@@ -20,9 +20,9 @@ import { Emoji, rich } from "./rich";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
-import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
+import { groupTitle, mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
-import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameSettings, withBox, withServer } from "./directory";
+import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameBanner, UsernameSettings, withBox, withServer } from "./directory";
 import { lastSeen, PrivacySettings } from "./privacy";
 import { mentionIds, mentionText, useMention } from "./mention";
 import { ForwardList } from "./forward";
@@ -40,8 +40,8 @@ type Active = { id: string; video: boolean; started: number; peers: string[]; ch
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; online: boolean; seen: number | null; hidden: boolean; removed: boolean };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; mention: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
-type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean; anchor: string | null };
-type Tab = "chats" | "calls" | "people" | "settings";
+type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
+type Tab = "chats" | "people" | "groups" | "calls" | "settings";
 // What the user came to do, picked before the password (unknown: Onboard offers both).
 type How = "create" | "join";
 
@@ -59,7 +59,15 @@ const PALETTE = [210, 0, 25, 45, 130, 175, 265, 320];
 // Members with their profiles, for names and avatars everywhere.
 const [people, setPeople] = createSignal<Member[]>([]);
 const memberOf = (id: string) => people().find((m) => m.id === id);
-const nameOf = (id: string) => memberOf(id)?.name ?? `Участник ${id}`;
+const nameOf = (id: string) => memberOf(id)?.name ?? (simple() ? "Участник" : `Участник ${id}`);
+// The open space: the personal one has no common chat, in any other it is the group's chat.
+const [openName, setOpenName] = createSignal("");
+const personal = () => openName() === SIMPLE_NAME;
+const groupName = () => groupTitle(openName());
+// Last message of each group left during this run, for its row in the chat list.
+// shortcut: only the open space's database is readable and message text stays out of plain storage,
+// so after a restart a group row has no preview until visited; needs the backend to read closed spaces.
+const lastMsg = new Map<string, { text: string; ts: number }>();
 const colorOf = (id: string) => {
   const c = memberOf(id)?.color;
   return c == null ? hue(id) : PALETTE[c % PALETTE.length];
@@ -78,8 +86,17 @@ const sk = (k: string, space?: string | null) => (space ? `${k}:${space}` : k);
 // Per-space value, else the old shared one (settings made before 0.1.15 keep working).
 const ls = (k: string, space?: string | null) => localStorage.getItem(sk(k, space)) ?? localStorage.getItem(k);
 const n0 = (space?: string | null) => ls("n0", space) !== "0";
-// This PC is an anchor: its relay URL (Settings → Якорь).
-const anchor = (space?: string | null) => ls("anchor", space) || null;
+// This PC is an anchor: its relay URL (Settings → Связь → Якорь). Spaces mode only.
+const anchor = (space?: string | null) => (simple() ? null : ls("anchor", space) || null);
+// Up to 0.1.17 the anchor switched itself on (UPnP) and held port 3340. Turned off once, unless the
+// user had unticked that automation ("0"): then it is their own, and so is spaces mode.
+{
+  const keys = Object.keys(localStorage).filter((k) => k === "anchor" || k.startsWith("anchor:"));
+  if (localStorage.getItem("anchor_auto") !== "0") {
+    keys.forEach((k) => localStorage.removeItem(k));
+    localStorage.setItem("anchor_auto", "0");
+  } else if (!mode() && keys.length) setMode("spaces");
+}
 // Backup public relays (n0's test servers): used besides the main n0 ones; editable in Settings → Связь.
 const DEFAULT_RELAYS = ["https://euc1-1.staging-relay.n0.iroh.link", "https://use1-1.staging-relay.n0.iroh.link"];
 const relays = (space?: string | null): string[] => {
@@ -97,25 +114,14 @@ const mailbox = () => (localStorage.getItem("mailbox") ?? DEFAULT_MAILBOX) || nu
 /** Applies changed connection settings to the open space at once (it reopens). */
 const reopen = (id: string) =>
   invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: anchor(id), relays: withServer(relays(id)), mailbox: withBox(mailbox()) });
-const autoAnchor = () => !android && localStorage.getItem("anchor_auto") !== "0";
 /** Turns this PC's anchor on (relay at the external IP, port 3340) or off; reopens the space. Returns the URL. */
 async function setAnchor(id: string, on: boolean): Promise<string> {
   // shortcut: fixed port 3340; a port field when someone needs another one.
+  if (on) await invoke("anchor_port_free", { port: 3340 });
   const u = on ? `http://${await invoke<string>("public_ip")}:3340` : "";
   await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: u || null, relays: withServer(relays(id)), mailbox: withBox(mailbox()) });
   u ? localStorage.setItem(sk("anchor", id), u) : localStorage.removeItem(sk("anchor", id));
   return u;
-}
-/** The router lets us open the port: become an anchor without asking (Settings → Якорь turns it off). */
-async function tryAutoAnchor(id: string) {
-  if (!autoAnchor() || anchor(id) || !(await invoke<boolean>("upnp_ok").catch(() => false))) return;
-  try {
-    await setAnchor(id, true);
-    const [, mapped] = await invoke<[boolean, boolean, boolean]>("anchor_check");
-    if (!mapped) await setAnchor(id, false);
-  } catch {
-    // stays a plain member
-  }
 }
 // The open space.
 let spaceId = "";
@@ -313,8 +319,6 @@ export default function App() {
   });
   const refresh = async () => {
     const s = await invoke<Status>("status");
-    // Anchor mode survives a lost WebView storage: the backend keeps the last unlock's URL.
-    if (s.anchor && !android && !anchor(s.current)) localStorage.setItem(sk("anchor", s.current), s.anchor);
     setStatus(s);
     spaceId = s.current ?? "";
     return s;
@@ -322,7 +326,7 @@ export default function App() {
   const opened = async (inSpace: boolean) => {
     await refresh();
     setStage(inSpace ? "main" : "onboard");
-    if (inSpace) (tryAutoAnchor(spaceId), keepRegistered(spaceId));
+    if (inSpace) keepRegistered(spaceId);
   };
   // A remembered space opens at once; otherwise (or if the saved password no longer fits) the password screen.
   const enter = async (sp?: Space, h?: How) => {
@@ -363,7 +367,7 @@ export default function App() {
     }
     if (stage() === "main") {
       const q = simple()
-        ? "Это приглашение в другой круг контактов. Принять? Нынешние чаты закроются, вернуться к ним можно через режим пространств в Настройках"
+        ? "Принять приглашение? Откроется новая группа, вернуться к нынешним чатам можно из списка чатов"
         : "Вступить в другое пространство по этой ссылке? Нынешнее закроется, вернуться в него можно из списка пространств";
       if (!(await ask(q, { title: "Приглашение", okLabel: "Принять", cancelLabel: "Отмена" }))) return;
       await leave();
@@ -390,7 +394,7 @@ export default function App() {
             <Spaces spaces={s().spaces} onOpen={enter} onNew={(h) => enter(undefined, h)} onRemoved={refresh} />
           </Match>
           <Match when={stage() === "lock"}>
-            <Lock space={space()} how={how()} count={s().spaces.length} onDone={opened}
+            <Lock space={space()} how={how()} link={invite()} count={s().spaces.length} onDone={opened}
               onBack={() => (s().spaces.length || setMode(null), setStage("spaces"))}
               onRemoved={async () => (await refresh(), setStage("spaces"))} />
           </Match>
@@ -398,8 +402,8 @@ export default function App() {
             <Onboard how={how()} setHow={setHow} link={invite()} setLink={setInvite} onDone={() => setStage("main")} />
           </Match>
           <Match when={stage() === "main" && s().spaces.find((x) => x.id === s().current)}>
-            {(sp) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh}
-              onEnter={async (id) => { const sp = (await refresh()).spaces.find((x) => x.id === id); if (sp) enter(sp); }} />}
+            {(sp) => /* Another space is another node: Main starts over (chats, messages, listeners). */ <Show when={sp().id} keyed>{(_) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh}
+              onEnter={async (id) => { const sp = (await refresh()).spaces.find((x) => x.id === id); if (sp) enter(sp); }} />}</Show>}
           </Match>
         </Switch>
       )}
@@ -407,9 +411,11 @@ export default function App() {
   );
 }
 
-function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: boolean) => void; onBack: () => void; onRemoved: () => void }) {
+function Lock(p: { space?: Space; how?: How; link: string; count: number; onDone: (inSpace: boolean) => void; onBack: () => void; onRemoved: () => void }) {
   const [forgot, setForgot] = createSignal(false);
-  const defaultName = simple() ? SIMPLE_NAME : p.count ? `Пространство ${p.count + 1}` : "Моё пространство";
+  // A new space joined by anything but a contact link is a group, not the personal one.
+  const group = p.how === "join" && !p.link.startsWith("mycel://contact/");
+  const defaultName = simple() && !group ? SIMPLE_NAME : p.count ? `Пространство ${p.count + 1}` : "Моё пространство";
   const [name, setName] = createSignal(defaultName);
   const [pw, setPw] = createSignal("");
   const [pw2, setPw2] = createSignal("");
@@ -475,20 +481,22 @@ function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: (how: H
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
-        <h1>{p.spaces.length ? "Пространства" : "Mycel"}</h1>
+        <h1>{p.spaces.length ? (simple() ? "Чаты и группы" : "Пространства") : "Mycel"}</h1>
         <Show when={!p.spaces.length}>
-          <p class="muted">Создайте своё пространство или вступите в существующее по ссылке-приглашению</p>
+          <p class="muted">{simple() ? "Начните переписку или вступите в группу по ссылке-приглашению" : "Создайте своё пространство или вступите в существующее по ссылке-приглашению"}</p>
         </Show>
         <For each={p.spaces}>
           {(s) => (
             <div class="actions">
-              <button class="grow" onClick={() => p.onOpen(s)}><Hash size={18} /> <span class="ellipsis">{s.name}</span></button>
+              <button class="grow" onClick={() => p.onOpen(s)}><Hash size={18} /> <span class="ellipsis">{groupTitle(s.name)}</span></button>
               <button class="icon" title="Удалить с этого устройства" onClick={() => setDel(s)}><Trash2 size={18} /></button>
             </div>
           )}
         </For>
         <Show when={p.spaces.length}><div class="or"><span>или</span></div></Show>
-        <button class="primary" onClick={() => p.onNew("create")}><Plus size={18} /> {p.spaces.length ? "Создать новое" : "Создать пространство"}</button>
+        <Show when={!simple() || !p.spaces.some((s) => s.name === SIMPLE_NAME)}>
+          <button class="primary" onClick={() => p.onNew("create")}><Plus size={18} /> {simple() ? "Начать" : p.spaces.length ? "Создать новое" : "Создать пространство"}</button>
+        </Show>
         <button onClick={() => p.onNew("join")}><Link size={18} /> Вступить по ссылке</button>
         <button class="link" onClick={() => setRestore(true)}>Восстановить из копии</button>
       </div>
@@ -505,15 +513,15 @@ function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; o
   return (
     <div class="modal" onClick={(e) => e.target === e.currentTarget && p.onClose()}>
       <div class="card dialog">
-        <h3>Удалить «{p.space.name}» с этого устройства?</h3>
+        <h3>Удалить «{groupTitle(p.space.name)}» с этого устройства?</h3>
         <Show when={p.forgot}>
           <p class="muted small">
-            Пароль восстановить нельзя: им зашифрована вся переписка на этом устройстве. Можно удалить это пространство отсюда и
-            создать новое или вступить заново по приглашению.
+            Пароль восстановить нельзя: им зашифрована вся переписка на этом устройстве. Можно удалить {simple() ? "эти чаты" : "это пространство"} отсюда и
+            начать заново или вступить по приглашению.
           </p>
         </Show>
         <p class="muted small">
-          Вся переписка и файлы этого пространства на этом устройстве будут стёрты. У других участников всё останется. Вернуться можно
+          Вся переписка и файлы {simple() ? "этих чатов" : "этого пространства"} на этом устройстве будут стёрты. У других участников всё останется. Вернуться можно
           только по новому приглашению.
         </p>
         <Show when={err()}><p class="error">{err()}</p></Show>
@@ -534,10 +542,13 @@ function AnchorSettings(p: { space: Space }) {
   const [state, setState] = createSignal<[boolean, boolean, boolean]>();
   const [msg, setMsg] = createSignal("");
   const [busy, setBusy] = createSignal(false);
-  const [auto, setAuto] = createSignal(autoAnchor());
   const check = async () => {
     setState(undefined);
-    setState(await invoke<[boolean, boolean, boolean]>("anchor_check"));
+    setMsg("");
+    const st = await invoke<[boolean, boolean, boolean]>("anchor_check");
+    setState(st);
+    // The relay is not listening: say if someone else holds its port.
+    if (!st[2]) await invoke("anchor_port_free", { port: 3340 }).catch((e) => setMsg(errText(e)));
   };
   const apply = async (on: boolean) => {
     setBusy(true);
@@ -561,13 +572,6 @@ function AnchorSettings(p: { space: Space }) {
         <li>помогает соединиться устройствам из разных сетей (телефон в мобильном интернете ↔ ПК дома) без чужих серверов.</li>
       </ul>
       <p class="muted">Переписка остаётся зашифрованной: якорь не может её прочитать. Работает, пока ПК включён и Mycel запущен (можно свернуть в трей).</p>
-      <label class="check">
-        <input type="checkbox" checked={auto()} onChange={(e) => {
-          localStorage.setItem("anchor_auto", e.currentTarget.checked ? "1" : "0");
-          setAuto(e.currentTarget.checked);
-        }} />
-        Включать автоматически, если роутер позволяет
-      </label>
       <p class="muted small">Mycel сам откроет порт на роутере (UPnP), если роутер это разрешает и у вас «белый» IP.</p>
       <Show when={url()}>
         <div class="anchor-status">
@@ -684,9 +688,11 @@ function RelaySettings(p: { space: Space }) {
       <details class="muted">
         <summary>Где взять адрес сервера</summary>
         <ul>
-          <li><b>Якорь друга.</b> Если у кого-то из участников включён якорь, его адрес виден у него в «Настройки» → «Якорь» (вида <code>http://1.2.3.4:3340</code>). Попросите прислать и добавьте сюда.</li>
-          <li><b>Ещё один свой ПК.</b> Установите на нём Mycel, войдите в пространство и нажмите «Настройки» → «Якорь» → «Сделать этот ПК якорем». Отдельная программа не нужна, адрес появится там же.</li>
-          <li><b>VPS или сервер без экрана.</b> Нужна программа <code>mycel-anchor</code> (Linux или Windows): где её взять и как запустить — в разделе «Якорь» файла README проекта.</li>
+          <Show when={!simple()}>
+            <li><b>Якорь друга.</b> Если у кого-то из участников включён якорь, его адрес виден у него в «Настройки» → «Якорь» (вида <code>http://1.2.3.4:3340</code>). Попросите прислать и добавьте сюда.</li>
+            <li><b>Ещё один свой ПК.</b> Установите на нём Mycel, войдите в пространство и нажмите «Настройки» → «Якорь» → «Сделать этот ПК якорем». Отдельная программа не нужна, адрес появится там же.</li>
+            <li><b>VPS или сервер без экрана.</b> Нужна программа <code>mycel-anchor</code> (Linux или Windows): где её взять и как запустить — в разделе «Якорь» файла README проекта.</li>
+          </Show>
           <li><b>Публичные iroh-relay.</b> Подойдёт любой сервер iroh-relay, например <code>https://euc1-1.staging-relay.n0.iroh.link</code>.</li>
         </ul>
         <p>Удалить сервер можно корзиной справа. Изменения применяются сразу, без перезапуска.</p>
@@ -752,7 +758,7 @@ function MailboxSettings(p: { space: Space }) {
       <details class="muted">
         <summary>Как завести свой ящик (бесплатно, 5 минут)</summary>
         <p>Нужен бесплатный аккаунт Cloudflare. Пошаговая инструкция и код лежат в папке <code>mailbox</code> проекта (файл README). Коротко: создать базу D1, создать Worker, вставить код, привязать базу под именем <code>DB</code>, скопировать адрес вида <code>https://….workers.dev</code> сюда.</p>
-        <p>Пустое поле выключает ящик: тогда сообщения доходят, только когда отправитель или якорь в сети.</p>
+        <p>Пустое поле выключает ящик: тогда сообщения доходят, только когда {simple() ? "отправитель" : "отправитель или якорь"} в сети.</p>
       </details>
       <p class="muted small">Mycel {ver()}</p>
       <p class="muted small">Эмодзи: Twemoji © Twitter и участники jdecked/twemoji, лицензия CC-BY 4.0</p>
@@ -798,7 +804,7 @@ function AppSettings() {
           <input type="checkbox" checked={on()} onChange={(e) => invoke<boolean>("autostart", { on: e.currentTarget.checked }).then(setOn, (err) => alert(errText(err)))} />
           Запускать вместе с Windows
         </label>
-        <p class="muted">Закрытие окна сворачивает Mycel в трей (значок у часов): сообщения и звонки продолжают приходить, уведомления показываются. Выйти полностью: правой кнопкой по значку → «Выйти». Когда Mycel полностью закрыт, новые сообщения придут при следующем запуске — от отправителя или от якоря.</p>
+        <p class="muted">Закрытие окна сворачивает Mycel в трей (значок у часов): сообщения и звонки продолжают приходить, уведомления показываются. Выйти полностью: правой кнопкой по значку → «Выйти». Когда Mycel полностью закрыт, новые сообщения придут при следующем запуске — {simple() ? "от отправителя или с сервера" : "от отправителя или от якоря"}.</p>
       </Show>
       <Show when={release()} fallback={<button onClick={check}>Проверить обновления</button>}>
         {(r) => (
@@ -909,7 +915,7 @@ function BackupSettings(p: { chats: string[] }) {
   return (
     <>
       <h3>Резервная копия</h3>
-      <p class="muted">Один файл с историей, чатами и пространствами для нового устройства или после переустановки. Ключи шифрования в копию не входят: после восстановления это новое устройство, в пространства и к контактам нужно войти заново по приглашению — история останется.</p>
+      <p class="muted">Один файл с историей и чатами для нового устройства или после переустановки. Ключи шифрования в копию не входят: после восстановления это новое устройство, в {simple() ? "группы" : "пространства"} и к контактам нужно войти заново по приглашению — история останется.</p>
       <form class="section" onSubmit={make}>
         <Show when={hasPhrase()}>
           <label class="check">
@@ -952,7 +958,7 @@ function BackupSettings(p: { chats: string[] }) {
       </Show>
       <div class="actions">
         <select value={chat()} onChange={(e) => setChat(e.currentTarget.value)}>
-          <For each={p.chats}>{(c) => <option value={c}>{c ? nameOf(c) : "Общий чат"}</option>}</For>
+          <For each={p.chats}>{(c) => <option value={c}>{c ? nameOf(c) : groupName()}</option>}</For>
         </select>
         <button onClick={exportChat}>Экспорт переписки</button>
       </div>
@@ -1034,7 +1040,7 @@ function Restore(p: { onClose: () => void }) {
             </Index>
           </div>
         </Show>
-        <p class="muted small">Пространства из копии добавятся на это устройство, их пароль — пароль копии. Затем войдите в них заново по приглашению: история уже будет на месте.</p>
+        <p class="muted small">{simple() ? "Чаты" : "Пространства"} из копии добавятся на это устройство, их пароль — пароль копии. Затем войдите в них заново по приглашению: история уже будет на месте.</p>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <div class="actions">
           <button class="primary" disabled={busy() || !path() || (byPhrase() ? !phraseOk() : !pw())}>{busy() ? "Восстанавливаем…" : "Восстановить"}</button>
@@ -1163,9 +1169,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const wideQuery = matchMedia("(min-width: 900px)");
   const [wide, setWide] = createSignal(wideQuery.matches);
   const chatVisible = () => (wide() || chatOpen()) && focused();
-  // Simple mode has no space chat ("").
-  const loadChats = () => invoke<ChatRow[]>("chats").then((r) => setRows(simple() && p.space.name === SIMPLE_NAME ? r.filter((x) => x.id) : r));
-  createEffect(() => (simple(), untrack(loadChats)));
+  createRenderEffect(() => setOpenName(p.space.name));
+  const owner = getOwner();
+  // The personal space has no common chat ("").
+  const loadChats = () => invoke<ChatRow[]>("chats").then((r) => setRows(personal() ? r.filter((x) => x.id) : r));
+  // The anchor runs in spaces mode only: switching the mode applies that at once.
+  createEffect(on(simple, () => reopen(p.space.id).then(loadChats, (e) => alert(errText(e))), { defer: true }));
   // Unread counts follow our Read receipts: reload them once the receipt is stored.
   const markRead = () => invoke("mark_read", { chat: chat() }).catch(() => {}).then(loadChats);
   const toggleMute = (on: boolean) =>
@@ -1228,7 +1237,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     loadChats();
   };
   const [profile, setProfile] = createSignal<string>();
-  // «Удалить чат» stays on this device; «Удалить контакт» also hides the person in «Люди» (no kick in the protocol).
+  // «Удалить чат» stays on this device; «Удалить контакт» also hides the person in «Контакты» (no kick in the protocol).
   const deleteChat = async (id: string, contact: boolean) => {
     const text = contact
       ? `Удалить ${nameOf(id)} из контактов? Переписка удалится с этого устройства${simple() ? "" : ", из пространства человек не исключается"}`
@@ -1288,7 +1297,15 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     }
     go();
   };
-  const enterSpace = (id: string) => afterCall(() => p.onEnter(id));
+  const enterSpace = (id: string) => afterCall(() => {
+    const r = rows().find((x) => !x.id);
+    if (r?.last) lastMsg.set(p.space.id, { text: preview(r), ts: r.last.ts });
+    p.onEnter(id);
+  });
+  const spaceLast = (id: string) => {
+    const l = lastMsg.get(id);
+    return l && { text: l.text, time: when(l.ts) };
+  };
   const openMedia = async (video: boolean) => {
     media = new CallMedia(setTiles);
     await media.start(video);
@@ -1355,6 +1372,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   onMount(async () => {
     loadMembers();
     loadCalls();
+    loadChats();
     pollPeers();
     // A join comes as an MLS commit, not a message: poll members with peers.
     const timer = setInterval(() => (pollPeers(), loadMembers()), 3000);
@@ -1385,7 +1403,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     wideQuery.addEventListener("change", onWide);
     addEventListener("focus", onFocus);
     addEventListener("blur", onBlur);
-    onCleanup(() => {
+    // After the awaits the owner is gone: without it the cleanup would never run.
+    runWithOwner(owner, () => onCleanup(() => {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
       removeEventListener("popstate", onBack);
@@ -1398,7 +1417,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       wideQuery.removeEventListener("change", onWide);
       removeEventListener("focus", onFocus);
       removeEventListener("blur", onBlur);
-    });
+    }));
   });
 
   const preview = (r: ChatRow) => {
@@ -1412,8 +1431,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     return rows().filter((r) => (q ? `${chatName(r.id)} ${preview(r)}`.toLowerCase().includes(q) : r.archived === arch()))
       .sort((a, b) => (a.pin ?? Infinity) - (b.pin ?? Infinity) || (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
   };
-  const chatName = (id: string) => (id ? nameOf(id) : "Общий чат");
-  const titles = () => ({ chats: "Чаты", calls: "Звонки", people: simple() ? "Контакты" : "Люди", settings: "Настройки" });
+  const chatName = (id: string) => (id ? nameOf(id) : groupName());
+  const titles = { chats: "Чаты", people: "Контакты", groups: "Группы", calls: "Звонки", settings: "Настройки" };
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
     <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); setSub(""); setArch(false); setFind(undefined); }} title={label}>
       <Icon size={22} />
@@ -1427,8 +1446,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       <nav class="rail">
         <img src={logo} class="rail-logo" alt="Mycel" />
         {navItem("chats", "Чаты", MessageCircle)}
+        {navItem("people", titles.people, Contact)}
+        {navItem("groups", titles.groups, Users)}
         {navItem("calls", "Звонки", Phone)}
-        {navItem("people", titles().people, Users)}
         {navItem("settings", "Настройки", Settings)}
       </nav>
 
@@ -1449,7 +1469,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
             <button class="icon" onClick={() => history.back()} title="Назад"><ArrowLeft size={20} /></button>
           </Show>
           <Show when={find() !== undefined} fallback={<>
-            <h2 class="ellipsis">{tab() === "settings" && sub() ? sub() : tab() === "chats" && arch() ? "Архив" : titles()[tab()]}</h2>
+            <h2 class="ellipsis">{tab() === "settings" && sub() ? sub() : tab() === "chats" && arch() ? "Архив" : titles[tab()]}</h2>
             <NetDot n={peers()} />
             <Show when={tab() === "chats"}><button class="icon" onClick={() => setFind("")} title="Поиск"><Search size={20} /></button></Show>
           </>}>
@@ -1461,6 +1481,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         <Switch>
           <Match when={tab() === "chats"}>
             <div class="scroll">
+              <Show when={!arch() && find() === undefined}>
+                <UsernameBanner onOpen={() => (setTab("settings"), openSub("Профиль"))} />
+              </Show>
               <Show when={!arch() && !find()?.trim() && archived().length}>
                 <button class="row chat-row" onClick={openArch}>
                   <div class="avatar archive"><Archive size={24} /></div>
@@ -1474,7 +1497,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 </button>
               </Show>
               <Show when={!arch() && !find()?.trim()}>
-                <SpaceRows current={p.space.id} personal={SIMPLE_NAME} onEnter={enterSpace} />
+                <SpaceRows current={p.space.id} personal={SIMPLE_NAME} last={spaceLast} onEnter={enterSpace} />
               </Show>
               <For each={sortedRows()}>
                 {(r) => {
@@ -1492,7 +1515,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                       <Show when={dx()}>
                         <span class="swipe-archive" style={{ opacity: Math.min(1, -dx() / 70) }}>{r.archived ? <ArchiveRestore size={22} /> : <Archive size={22} />}</span>
                       </Show>
-                      {r.id ? <Avatar id={r.id} dot /> : <div class="avatar group"><Hash size={20} /></div>}
+                      {r.id ? <Avatar id={r.id} dot /> : <div class="avatar group"><Users size={20} /></div>}
                       <div class="grow">
                         <div class="row-top">
                           <b class="ellipsis">{name()}</b>
@@ -1513,7 +1536,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   );
                 }}
               </For>
-              <Show when={!rows().length}><p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p></Show>
+              <Show when={!rows().length}><p class="muted small pad">Новый чат: «Контакты» → нажмите на человека → «Написать». Добавить человека — там же</p></Show>
               <Show when={find()?.trim() && !sortedRows().length}><p class="muted small pad">Ничего не найдено</p></Show>
               <Show when={find()?.trim()}>
                 <DirSearch q={find()!} onOpen={(id) => (setFind(undefined), loadChats(), openChat(id))} />
@@ -1554,8 +1577,23 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
           </Match>
           <Match when={tab() === "people"}>
-            <NewGroup people={members()} onEnter={enterSpace} />
-            <People members={members()} simple={simple()} onWrite={openChat} onProfile={setProfile} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
+            <People members={members()} simple={simple() && personal()} onWrite={openChat} onProfile={setProfile} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
+          </Match>
+          <Match when={tab() === "groups"}>
+            <div class="scroll">
+              <NewGroup people={members()} onEnter={enterSpace} />
+              {/* The open space, if it is a group, then the others. */}
+              <Show when={!personal()}>
+                <button class="row chat-row" onClick={() => openChat("")}>
+                  <div class="avatar group"><Users size={20} /></div>
+                  <div class="grow">
+                    <div class="row-top"><b class="ellipsis">{groupName()}</b></div>
+                    <Show when={rows().find((r) => !r.id)}>{(r) => <div class="row-bottom"><span class="muted ellipsis">{rich(preview(r()))}</span></div>}</Show>
+                  </div>
+                </button>
+              </Show>
+              <SpaceRows current={p.space.id} personal={SIMPLE_NAME} groupsOnly last={spaceLast} onEnter={enterSpace} />
+            </div>
           </Match>
           <Match when={tab() === "settings"}>
             <Show when={sub()} fallback={
@@ -1571,13 +1609,13 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   <For each={[
                     ["Оформление", Palette, "Тема, обои, размер текста"],
                     ["Голос и видео", Mic, "Микрофон, камера, громкость"],
-                    ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
+                    ["Связь", Wifi, "Серверы, почтовый ящик" + (android || simple() ? "" : ", якорь")],
                     ["Приложение", Monitor, android ? "Обновления" : "Автозапуск, трей, обновления"],
                     ["Устройства", Smartphone, "Телефон и ПК как один аккаунт"],
                     ["Конфиденциальность", EyeOff, "Время захода, звонки, прочтение, поиск"],
                     ["Вход", LockIcon, "Пароль при запуске"],
                     ["Резервная копия", Archive, "Копия, восстановление, экспорт чата"],
-                    ["Режим", Layers, simple() ? "Личные чаты" : "Пространства"],
+                    ["Другие способы", Layers, "Режим пространств, свой сервер"],
                     [simple() ? "Данные" : "Пространство", Database, "Хранение, удаление"],
                   ] as [string, typeof Mic, string][]}>
                     {([t, Icon, hint]) => (
@@ -1619,10 +1657,10 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                       }} />
                       Публичные серверы связи n0 (Европа, США, Азия)
                     </label>
-                    <p class="muted">Помогают устройствам из разных сетей найти друг друга. Сами сообщения после этого идут напрямую, а через сервер — только если напрямую не получилось. Когда в пространстве есть якорь или добавлен резервный сервер, связь идёт только через них, а n0 нужен лишь чтобы находить адреса.</p>
+                    <p class="muted">Помогают устройствам из разных сетей найти друг друга. Сами сообщения после этого идут напрямую, а через сервер — только если напрямую не получилось. Когда {simple() ? "" : "в пространстве есть якорь или "}добавлен резервный сервер, связь идёт только через них, а n0 нужен лишь чтобы находить адреса.</p>
                     <RelaySettings space={p.space} />
                     <MailboxSettings space={p.space} />
-                    <Show when={!android}>
+                    <Show when={!android && !simple()}>
                       <AnchorSettings space={p.space} />
                     </Show>
                   </Match>
@@ -1641,7 +1679,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   <Match when={sub() === "Резервная копия"}>
                     <BackupSettings chats={rows().map((r) => r.id)} />
                   </Match>
-                  <Match when={sub() === "Режим"}>
+                  <Match when={sub() === "Другие способы"}>
                     <ModeSettings />
                   </Match>
                   <Match when={true}>
@@ -1663,7 +1701,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         </Switch>
       </section>
 
-      <Show when={!(simple() && !chat()) && { c: chat() }} keyed
+      <Show when={!(personal() && !chat()) && { c: chat() }} keyed
         fallback={<section class="chat"><div class="msgs"><p class="empty muted">Выберите чат или контакт</p></div></section>}>
         {(k) => (
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
@@ -1698,7 +1736,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   );
 }
 
-/** A person's profile, like Telegram's: opened from the chat header and from «Люди». */
+/** A person's profile, like Telegram's: opened from the chat header and from «Контакты». */
 function Profile(p: { id: string; inCall: boolean; onClose: () => void; onWrite: () => void; onCall: (video: boolean) => void; onDelete: (contact: boolean) => void }) {
   const m = () => memberOf(p.id);
   const [code, setCode] = createSignal<{ link: string; svg: string }>();
@@ -1719,7 +1757,7 @@ function Profile(p: { id: string; inCall: boolean; onClose: () => void; onWrite:
             <>
               <div class="qr" innerHTML={c().svg} />
               <code class="path">{c().link}</code>
-              <p class="muted small">Сверьте код с собеседником лично; отметить проверенным можно в «Люди»</p>
+              <p class="muted small">Сверьте код с собеседником лично; отметить проверенным можно в «Контактах»</p>
             </>
           )}
         </Show>
@@ -1825,7 +1863,7 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
     <div class="scroll">
       <div class="pad">
         <button class="primary" disabled={!(p.simple || amAdmin()) || busy()} onClick={invite}>
-          <UserPlus size={18} /> {busy() ? "Готовим ссылку…" : p.simple ? "Добавить контакт" : "Пригласить"}
+          <UserPlus size={18} /> {busy() ? "Готовим ссылку…" : p.simple ? "Добавить контакт" : simple() ? "Пригласить в группу" : "Пригласить"}
         </button>
         <Show when={!p.simple && !amAdmin()}>
           <p class="muted small">Приглашать может только администратор</p>
@@ -1869,7 +1907,7 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
             <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onProfile(m.id)} />
             <div class="grow">
               <b class="ellipsis">{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small" classList={{ online: m.online }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={p.simple}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !p.simple}> · админ</Show>
+              <div class="muted small" classList={{ online: m.online }} title={simple() ? undefined : m.id}>{m.me ? (simple() ? "в сети" : m.id) : presence(m)}<Show when={simple()}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !simple()}> · админ</Show>
                 <Show when={status(m) === "ok"}> · проверен</Show></div>
               <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
@@ -2338,9 +2376,9 @@ function Chat(p: {
     <section class="chat">
       <Show when={sel().length} fallback={<header class="bar">
         <button class="icon back" onClick={p.back} title="Назад"><ArrowLeft size={20} /></button>
-        {p.chat ? <Avatar id={p.chat} dot onClick={p.onProfile} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
+        {p.chat ? <Avatar id={p.chat} dot onClick={p.onProfile} /> : <div class="avatar group small-av"><Users size={18} /></div>}
         <div class="grow ellipsis" classList={{ link: !!p.chat }} onClick={() => p.chat && p.onProfile()}>
-          <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
+          <b>{p.chat ? nameOf(p.chat) : groupName()}</b>
           <div class="muted small ellipsis" classList={{ typing: !!typingText(p.chat), online: !!memberOf(p.chat)?.online }} title={p.chat ? linkText(memberOf(p.chat)) : ""}>
             {typingText(p.chat) || (p.chat ? presence(memberOf(p.chat)) : `${p.members} участн.`)}
           </div>
@@ -2707,7 +2745,7 @@ function Calls(p: { calls: CallView[]; onCall: (video: boolean, to: string) => v
             <div class="row">
               {c.chat || !c.mine ? <Avatar id={who()} /> : <div class="avatar group"><Hash size={20} /></div>}
               <div class="grow">
-                <b class="ellipsis">{c.chat ? nameOf(c.chat) : c.mine ? "Общий чат" : `${nameOf(c.author)} · общий чат`}</b>
+                <b class="ellipsis">{c.chat ? nameOf(c.chat) : c.mine ? groupName() : `${nameOf(c.author)} · ${groupName()}`}</b>
                 <div class="muted small ellipsis" classList={{ error: c.missed && !c.mine }}>
                   {c.mine ? "↗ " : "↙ "}{callLabel(c)} · {when(c.ts) === time(c.ts) ? time(c.ts) : `${when(c.ts)}, ${time(c.ts)}`}
                 </div>
@@ -2729,7 +2767,7 @@ function Incoming(p: { c: CallSignal; onAccept: () => void; onReject: () => void
     <div class="call-screen incoming">
       <Avatar id={p.c.author} />
       <h2>{nameOf(p.c.author)}</h2>
-      <p class="muted">{p.c.video ? "Входящий видеозвонок" : "Входящий звонок"}{p.c.chat ? "" : " · общий чат"}</p>
+      <p class="muted">{p.c.video ? "Входящий видеозвонок" : "Входящий звонок"}{p.c.chat ? "" : ` · ${groupName()}`}</p>
       <div class="call-buttons">
         <button class="round hang" onClick={p.onReject} title="Отклонить"><PhoneOff size={26} /></button>
         <button class="round accept" onClick={p.onAccept} title="Принять">{p.c.video ? <Video size={26} /> : <Phone size={26} />}</button>
@@ -2784,7 +2822,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
       <div class="callbar">
         <button class="icon" onClick={toggleMic} title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={20} /> : <MicOff size={20} />}</button>
         <button class="callbar-info" onClick={() => (setGear(false), setMini(false))} title="Развернуть звонок">
-          <b class="ellipsis">{p.a.chat ? nameOf(p.a.chat) : `Общий чат · ${p.tiles.length + 1}`}</b>
+          <b class="ellipsis">{p.a.chat ? nameOf(p.a.chat) : `${groupName()} · ${p.tiles.length + 1}`}</b>
           <span>{dur()}</span>
         </button>
         <button class="icon hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={20} /></button>

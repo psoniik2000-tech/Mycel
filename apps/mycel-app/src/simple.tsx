@@ -12,10 +12,10 @@ const read = (): Mode | null => {
     return null;
   }
 };
-// null: not chosen yet (first start shows the choice; existing installs behave as "spaces").
+// null: not chosen yet (first start shows the choice). Spaces mode is only ever an explicit choice.
 const [mode, setModeSig] = createSignal<Mode | null>(read());
 export { mode };
-export const simple = () => mode() === "simple";
+export const simple = () => mode() !== "spaces";
 export const setMode = (m: Mode | null) => {
   try {
     m ? localStorage.setItem("mode", m) : localStorage.removeItem("mode");
@@ -26,6 +26,9 @@ export const setMode = (m: Mode | null) => {
 };
 /** Name of the space simple mode creates (seen only in spaces mode). */
 export const SIMPLE_NAME = "Личные чаты";
+/** A space's name as a group's: outside spaces mode the default names lose the word «пространство». */
+export const groupTitle = (name: string) =>
+  simple() ? name.replace(/^Моё пространство$/, "Моя группа").replace(/^Пространство (\d+)$/, "Группа $1") : name;
 
 export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void; onRestore: () => void }) {
   const [other, setOther] = createSignal(false);
@@ -49,12 +52,12 @@ export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void; onRe
 export function ModeSettings() {
   return (
     <>
-      <h3>Режим</h3>
+      <h3>Режим пространств</h3>
       <label class="check">
         <input type="checkbox" checked={!simple()} onChange={(e) => setMode(e.currentTarget.checked ? "spaces" : "simple")} />
-        Пространства: общий чат, участники, несколько сообществ
+        Пространства: управление сообществами, свой сервер (якорь)
       </label>
-      <p class="muted">Выключено — обычный мессенджер: только контакты и личные чаты. Переписка и данные от режима не меняются.</p>
+      <p class="muted">Выключено — обычный мессенджер: чаты, контакты и группы. Переписка и данные от режима не меняются.</p>
     </>
   );
 }

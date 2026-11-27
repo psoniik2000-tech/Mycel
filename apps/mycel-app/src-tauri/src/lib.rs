@@ -547,8 +547,6 @@ struct Status {
     /// Its data folder.
     dir: String,
     in_space: bool,
-    /// Anchor URL of the last unlock.
-    anchor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -947,7 +945,6 @@ fn status(app: AppHandle, st: State<App>) -> R<Status> {
             })
             .collect(),
         last: list.last,
-        anchor: list.anchor,
         dir: spaces::dir(&root, current.as_deref().unwrap_or(""))
             .display()
             .to_string(),
@@ -1019,7 +1016,6 @@ async fn unlock(
     // Listed before the node creates its folder, so List::load never takes it for an orphan.
     list.last = Some(id.clone());
     (list.n0, list.relays, list.mailbox) = (n0, relays.clone(), mailbox.clone());
-    list.anchor = anchor.clone();
     list.save(&root).map_err(|e| e.to_string())?;
     st.close().await;
     #[cfg(not(target_os = "android"))]
@@ -1306,16 +1302,24 @@ async fn check_servers(urls: Vec<String>, mailbox: bool) -> Vec<(String, Option<
     out
 }
 
-/// The router can open ports (UPnP) and has a public address: this PC can be an anchor on its own.
+/// Fails if another program (say a `mycel-server`) holds the anchor's `port`.
 #[tauri::command]
-async fn upnp_ok() -> bool {
+fn anchor_port_free(port: u16) -> R<()> {
     #[cfg(not(target_os = "android"))]
-    if let Ok(gw) = gateway().await
-        && let Ok(std::net::IpAddr::V4(ip)) = gw.get_external_ip().await
+    if RELAY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|r| port_of(&r.url) == port && r.up.load(Ordering::Relaxed))
     {
-        return public_v4(ip);
+        return Ok(()); // our own relay listens there
     }
-    false
+    match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(format!("Порт {port} занят (уже работает сервер Mycel?)"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Not private and not CGNAT (100.64/10): reachable from outside.
@@ -2530,7 +2534,7 @@ pub fn run() {
             export_chat,
             public_ip,
             anchor_check,
-            upnp_ok,
+            anchor_port_free,
             home_relay,
             check_servers,
             sync_now,
