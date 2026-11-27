@@ -10,6 +10,38 @@ export type Shot = { id: string; author: string; ts: number; text: string; media
 const FIT = { s: 1, x: 0, y: 0 };
 type Point = { x: number; y: number };
 
+// Open full-screen layers, the top one last. One listener, added at import: window listeners run in
+// the order added (capture or not), so only the first can keep Back from what lies under a layer.
+const layers: (() => void)[] = [];
+let silent = 0; // history entries still to take back for layers already gone
+addEventListener("popstate", (e) => {
+  const top = silent ? (silent--, () => {}) : layers.pop();
+  if (top) e.stopImmediatePropagation(), top();
+}, true);
+
+/** For a full-screen layer: Android's Back (history) closes it. Returns close(). */
+export function useBack(onClose: () => void): () => void {
+  let closing = false;
+  const close = () => {
+    if (!closing) history.back();
+    closing = true;
+  };
+  onMount(() => {
+    (document.activeElement as HTMLElement | null)?.blur(); // Enter must not reach the field underneath
+    history.pushState(null, "");
+    layers.push(onClose);
+  });
+  onCleanup(() => {
+    const i = layers.indexOf(onClose);
+    if (i < 0) return; // Back closed it
+    // Removed some other way (the chat changed, the call ended): still take our history entry back, silently.
+    layers.splice(i, 1);
+    silent++;
+    close();
+  });
+  return close;
+}
+
 export function Viewer(p: { shots: Shot[]; at: string; onAt: (id: string) => void; onClose: () => void; name: (author: string) => string }) {
   const ix = () => p.shots.findIndex((s) => s.id === p.at);
   const cur = () => p.shots[ix()];
@@ -28,14 +60,7 @@ export function Viewer(p: { shots: Shot[]; at: string; onAt: (id: string) => voi
   const [err, setErr] = createSignal("");
   let stage!: HTMLDivElement;
 
-  // Closing goes through history: Android's back button closes the viewer, not the chat under it.
-  let popped = false, closing = false;
-  const swallow = (e: Event) => e.stopImmediatePropagation();
-  const onPop = (e: Event) => (swallow(e), (popped = true), p.onClose());
-  const close = () => {
-    if (!closing) history.back();
-    closing = true;
-  };
+  const close = useBack(() => p.onClose());
 
   const go = (d: number) => {
     const s = p.shots[ix() + d];
@@ -120,20 +145,8 @@ export function Viewer(p: { shots: Shot[]; at: string; onAt: (id: string) => voi
     else return;
     e.preventDefault();
   };
-  onMount(() => {
-    (document.activeElement as HTMLElement | null)?.blur(); // Enter must not reach the message field
-    history.pushState(null, "");
-    addEventListener("popstate", onPop, { capture: true, once: true });
-    addEventListener("keydown", key);
-  });
-  onCleanup(() => {
-    removeEventListener("keydown", key);
-    if (popped) return;
-    // Removed some other way (the chat changed): still take our history entry back, silently.
-    removeEventListener("popstate", onPop, true);
-    addEventListener("popstate", swallow, { capture: true, once: true });
-    if (!closing) history.back();
-  });
+  onMount(() => addEventListener("keydown", key));
+  onCleanup(() => removeEventListener("keydown", key));
   // The message was deleted meanwhile.
   createEffect(() => ix() < 0 && close());
 

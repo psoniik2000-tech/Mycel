@@ -13,7 +13,7 @@ import {
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
 import { Album, albums } from "./album";
-import { Shot, Viewer } from "./viewer";
+import { Shot, useBack, Viewer } from "./viewer";
 import { EMOJI, recentEmoji, useEmoji } from "./emoji";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
@@ -1253,6 +1253,15 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     await invoke("call_end").catch(() => {});
     reload();
   };
+  // Another space closes this one's node, and the call with it: ask, then hang up while it can still be told.
+  const afterCall = async (go: () => void) => {
+    if (active()) {
+      if (!(await ask("Звонок завершится. Продолжить?", { title: "Звонок", okLabel: "Завершить звонок", cancelLabel: "Отмена" }))) return;
+      await endCall();
+    }
+    go();
+  };
+  const enterSpace = (id: string) => afterCall(() => p.onEnter(id));
   const openMedia = async (video: boolean) => {
     media = new CallMedia(setTiles);
     await media.start(video);
@@ -1437,7 +1446,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 </button>
               </Show>
               <Show when={!arch() && !find()?.trim()}>
-                <SpaceRows current={p.space.id} personal={SIMPLE_NAME} onEnter={p.onEnter} />
+                <SpaceRows current={p.space.id} personal={SIMPLE_NAME} onEnter={enterSpace} />
               </Show>
               <For each={sortedRows()}>
                 {(r) => {
@@ -1516,7 +1525,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
           </Match>
           <Match when={tab() === "people"}>
-            <NewGroup people={members()} onEnter={p.onEnter} />
+            <NewGroup people={members()} onEnter={enterSpace} />
             <People members={members()} simple={simple()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
@@ -1607,7 +1616,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                     <p class="muted">Зашифрованная база хранится здесь:</p>
                     <code class="path">{p.dir}</code>
                     <div class="actions">
-                      <Show when={!simple()}><button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button></Show>
+                      <Show when={!simple()}><button onClick={() => afterCall(p.onLeave)}><LogOut size={18} /> Сменить пространство</button></Show>
                       <button class="danger" onClick={() => setDel(true)}><Trash2 size={18} /> Удалить с этого устройства</button>
                     </div>
                     <Show when={del()}>
@@ -2627,7 +2636,19 @@ function Incoming(p: { c: CallSignal; onAccept: () => void; onReject: () => void
   );
 }
 
+/** Mounted while the call is full screen: Back (and the arrow) folds it into the bar. */
+function CallTop(p: { onMini: () => void; label: string }) {
+  const close = useBack(() => p.onMini());
+  return (
+    <div class="call-top">
+      <button class="icon" onClick={close} title="Свернуть"><ChevronDown size={26} /></button>
+      <span class="muted">{p.label}</span>
+    </div>
+  );
+}
+
 function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () => void }) {
+  const [mini, setMini] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
   const [mic, setMic] = createSignal(true);
   const [cam, setCam] = createSignal(p.a.video);
@@ -2639,7 +2660,10 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
   createEffect(() => {
     if (!p.a.started) onCleanup(ring("out"));
   });
+  const toggleMic = () => (p.media.setMic(!mic()), setMic(!mic()));
+  const dur = () => (p.a.started ? clock(now() - p.a.started) : "Вызов…");
   const toggleCam = async () => {
+    setCamErr("");
     try {
       await p.media.setCam(!cam());
       setCam(!cam());
@@ -2648,8 +2672,18 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
     }
   };
   return (
+    <Show when={!mini()} fallback={
+      <div class="callbar">
+        <button class="icon" onClick={toggleMic} title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={20} /> : <MicOff size={20} />}</button>
+        <button class="callbar-info" onClick={() => (setGear(false), setMini(false))} title="Развернуть звонок">
+          <b class="ellipsis">{p.a.chat ? nameOf(p.a.chat) : "Общий чат"}</b>
+          <span>{dur()}</span>
+        </button>
+        <button class="icon hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={20} /></button>
+      </div>
+    }>
     <div class="call-screen">
-      <div class="muted">{p.a.started ? clock(now() - p.a.started) : "Вызов…"}</div>
+      <CallTop onMini={() => setMini(true)} label={dur()} />
       <div class="call-grid">
         <For each={p.tiles}>
           {(t) => (
@@ -2668,9 +2702,9 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
       <Show when={cam()}>
         <video class="self" autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
       </Show>
-      <Show when={camErr()}><p class="error">{camErr()}</p></Show>
+      <Show when={camErr()}><p class="error call-err">{camErr()}</p></Show>
       <div class="call-buttons">
-        <button class="round" classList={{ off: !mic() }} onClick={() => { p.media.setMic(!mic()); setMic(!mic()); }}
+        <button class="round" classList={{ off: !mic() }} onClick={toggleMic}
           title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={24} /> : <MicOff size={24} />}</button>
         <button class="round" classList={{ off: !cam() }} onClick={toggleCam}
           title={cam() ? "Выключить камеру" : "Включить камеру"}>{cam() ? <Video size={24} /> : <VideoOff size={24} />}</button>
@@ -2681,5 +2715,6 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
         <div class="call-settings scroll pad"><VoiceSettings /></div>
       </Show>
     </div>
+    </Show>
   );
 }
