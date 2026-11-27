@@ -19,6 +19,7 @@ import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
+import { Appearance, msgSize } from "./look";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
@@ -1276,7 +1277,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 </button>
                 <div class="list">
                   <For each={[
-                    ["Оформление", Palette, "Тема"],
+                    ["Оформление", Palette, "Тема, обои, размер текста"],
                     ["Голос и видео", Mic, "Микрофон, камера, громкость"],
                     ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
                     ...(android ? [] : [["Приложение", Monitor, "Автозапуск, трей"]]),
@@ -1311,6 +1312,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                         )}
                       </For>
                     </div>
+                    <Appearance theme={p.theme} />
                   </Match>
                   <Match when={sub() === "Голос и видео"}>
                     <VoiceSettings />
@@ -1783,14 +1785,15 @@ function Chat(p: {
     list.addEventListener("load", bottom, true);
     list.addEventListener("loadedmetadata", bottom, true);
     // The reply bar or a growing input shrinks the list: keep the last message in view.
-    // A restored draft gets its height once the chat is visible (hidden on a phone until opened).
-    let sized = false;
-    const ro = new ResizeObserver(() => {
-      if (!sized && list.clientHeight) (sized = true), grow();
-      bottom();
-    });
+    // A restored draft (or a new text size) gets its height once the chat is visible (hidden on a phone until opened).
+    let sized = 0;
+    const fit = () => {
+      if (list.clientHeight && sized !== msgSize()) (sized = msgSize()), grow();
+    };
+    const ro = new ResizeObserver(() => (fit(), bottom()));
     ro.observe(list);
     onCleanup(() => ro.disconnect());
+    createEffect(() => (msgSize(), queueMicrotask(() => (fit(), bottom()))));
     const un = await getCurrentWebview().onDragDropEvent((e) => {
       if (e.payload.type === "drop") {
         setDrag(false);
