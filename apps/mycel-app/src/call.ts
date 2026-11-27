@@ -92,7 +92,15 @@ export class Mic {
 
 /** Connection quality to a participant (the signal icon). */
 export type Net = { rtt: number; loss: number; kbps: number; relay: boolean };
-export type Peer = { id: string; canvas: HTMLCanvasElement; videoAt: number; net: Accessor<Net | undefined> };
+export type Peer = { id: string; canvas: HTMLCanvasElement; videoAt: number; talkAt: number; net: Accessor<Net | undefined> };
+
+/** A getUserMedia / encoder failure in words; no camera at all is not an error, the call goes on by voice. */
+export const camError = (e: unknown) => {
+  const n = (e as DOMException)?.name;
+  if (n === "NotFoundError" || n === "OverconstrainedError" || n === "NotReadableError") return "Камера не найдена — звонок продолжается голосом";
+  if (n === "NotAllowedError") return "Нет доступа к камере — разрешите его в настройках";
+  return "Камера не включилась: " + ((e as Error)?.message ?? String(e));
+};
 
 type Rx = Peer & {
   setNet: Setter<Net | undefined>;
@@ -112,6 +120,8 @@ export class CallMedia {
   local = new MediaStream();
   mic = true;
   cam = false;
+  facing: "user" | "environment" = "user";
+  camErr = ""; // why the camera asked for at start did not turn on
   private ctx = new AudioContext({ sampleRate: 48000 });
   private v = loadVoice();
   private input = new Mic(this.ctx);
@@ -155,7 +165,7 @@ export class CallMedia {
       this.unlistenPtt = await listen<boolean>("ptt", (e) => (this.ptt = e.payload)).catch(() => undefined);
       await invoke("ptt_key", { key: this.v.pttKey }).catch(() => {});
     }
-    if (video) await this.setCam(true).catch(() => {});
+    if (video) await this.setCam(true).catch((e) => (this.camErr = camError(e)));
     this.timer = window.setInterval(() => this.poll(), 2000);
   }
 
@@ -203,16 +213,44 @@ export class CallMedia {
 
   /** Camera on/off; the camera is opened on first use (an audio call can turn it on). */
   async setCam(on: boolean) {
-    this.cam = on;
     let t = this.local.getVideoTracks()[0];
     if (on && !t) {
-      const s = await navigator.mediaDevices.getUserMedia({ video: { deviceId: this.v.cam || undefined, width: 640, height: 480, frameRate: 24 } });
+      // A chosen device wins; otherwise the front / back camera (phones).
+      const pick = this.v.cam ? { deviceId: this.v.cam } : { facingMode: this.facing };
+      const s = await navigator.mediaDevices.getUserMedia({ video: { ...pick, width: 640, height: 480, frameRate: 24 } });
       t = s.getVideoTracks()[0];
       this.local.addTrack(t);
       this.pumpVideo(t);
     }
+    this.cam = on;
     if (t) t.enabled = on;
     this.forceKey = on;
+  }
+
+  /** Front ⇄ back camera: the old track is stopped (its pump ends) and the other one opened. */
+  async flipCam() {
+    const old = this.local.getVideoTracks()[0];
+    this.facing = this.facing === "user" ? "environment" : "user";
+    this.v = { ...this.v, cam: "" }; // this call only: by facing, not the chosen device
+    old?.stop();
+    if (old) this.local.removeTrack(old);
+    try {
+      await this.setCam(true);
+    } catch (e) {
+      this.facing = this.facing === "user" ? "environment" : "user";
+      await this.setCam(true).catch(() => {});
+      throw e;
+    }
+  }
+
+  /** A participant hung up: drop its tile and decoders. */
+  drop(id: string) {
+    const p = this.rx.get(id);
+    if (!p) return;
+    p.adec.state !== "closed" && p.adec.close();
+    p.vdec?.state !== "closed" && p.vdec?.close();
+    this.rx.delete(id);
+    this.onPeers([...this.rx.values()]);
   }
 
   /** Voice gate: push-to-talk key held, or the level above the threshold (+ hangover). */
@@ -258,27 +296,55 @@ export class CallMedia {
     enc.state !== "closed" && enc.close();
   }
 
+  // Phones: frames come rotated by metadata (portrait) and the hardware VP8 encoder may refuse the
+  // stream, so the encoder is sized by the actual frames and falls back to software on an error.
   private async pumpVideo(track: MediaStreamTrack) {
-    const st = track.getSettings();
-    this.vcfg = { codec: "vp8", width: st.width ?? 640, height: st.height ?? 480, bitrate: this.bitrate, framerate: 24, latencyMode: "realtime" };
-    const enc = (this.venc = new VideoEncoder({
-      output: (c) => send(c.type === "key" ? VIDEO_KEY : VIDEO_DELTA, bytes(c)),
-      error: () => {},
-    }));
-    enc.configure(this.vcfg);
+    let soft = false;
+    let fails = 0;
+    let enc: VideoEncoder | undefined;
+    const open = (w: number, h: number) => {
+      enc?.state !== "closed" && enc?.close();
+      this.vcfg = { codec: "vp8", width: w, height: h, bitrate: this.bitrate, framerate: 24, latencyMode: "realtime", hardwareAcceleration: soft ? "prefer-software" : "no-preference" };
+      enc = this.venc = new VideoEncoder({
+        output: (c) => send(c.type === "key" ? VIDEO_KEY : VIDEO_DELTA, bytes(c)),
+        error: (e) => {
+          console.warn("video encoder", e);
+          soft = true; // the next frame reopens it in software
+          fails++;
+        },
+      });
+      enc.configure(this.vcfg);
+      this.forceKey = true;
+    };
     const r = frames<VideoFrame>(track);
+    let rot: OffscreenCanvasRenderingContext2D | undefined;
     let n = 0;
     while (!this.stopped) {
       const { value, done } = await r.read();
       if (done) break;
+      let f = value;
+      // Rotated by metadata: draw upright (drawImage applies the rotation), the receiver gets plain pixels.
+      if ((value as any).rotation) {
+        if (rot?.canvas.width !== value.displayWidth || rot.canvas.height !== value.displayHeight)
+          rot = new OffscreenCanvas(value.displayWidth, value.displayHeight).getContext("2d")!;
+        rot.drawImage(value, 0, 0, value.displayWidth, value.displayHeight);
+        f = new VideoFrame(rot.canvas, { timestamp: value.timestamp });
+        value.close();
+      }
+      if (fails > 2) {
+        f.close();
+        continue; // no working encoder here: the call goes on without our video
+      }
+      if (!enc || enc.state === "closed" || this.vcfg?.width !== f.displayWidth || this.vcfg?.height !== f.displayHeight || (soft && this.vcfg.hardwareAcceleration !== "prefer-software"))
+        open(f.displayWidth, f.displayHeight);
       // Busy encoder (slow PC): skip a frame rather than build up delay.
-      if (this.cam && enc.state === "configured" && enc.encodeQueueSize < 2) {
-        enc.encode(value, { keyFrame: this.forceKey || n++ % KEY_EVERY === 0 });
+      if (this.cam && enc!.state === "configured" && enc!.encodeQueueSize < 2) {
+        enc!.encode(f, { keyFrame: this.forceKey || n++ % KEY_EVERY === 0 });
         this.forceKey = false;
       }
-      value.close();
+      f.close();
     }
-    enc.state !== "closed" && enc.close();
+    enc?.state !== "closed" && enc?.close();
   }
 
   /** Every 2 s: link stats per participant, then bitrate adaptation by the worst loss. */
@@ -312,7 +378,7 @@ export class CallMedia {
     const adec = new AudioDecoder({ output: (d) => this.play(p!, d), error: () => {} });
     adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
     const [net, setNet] = createSignal<Net>();
-    p = { id, canvas, videoAt: 0, net, setNet, adec, key: false, lastN: -1, next: 0, lastTs: -1, jitter: 0, transit: NaN, rxBytes: 0 };
+    p = { id, canvas, videoAt: 0, talkAt: 0, net, setNet, adec, key: false, lastN: -1, next: 0, lastTs: -1, jitter: 0, transit: NaN, rxBytes: 0 };
     this.rx.set(id, p);
     this.onPeers([...this.rx.values()]);
     return p;
@@ -354,6 +420,7 @@ export class CallMedia {
     const n = dv.getUint32(0);
     const len = dv.getUint16(4);
     if (n <= p.lastN) return; // late or duplicate: its slot has been played already
+    p.talkAt = Date.now(); // the sender's voice gate sends audio only while they speak
     // Jitter from frame numbers (the sender's clock) vs arrival time.
     const transit = performance.now() - (n * FRAME_US) / 1000;
     const dd = Math.abs(transit - p.transit);

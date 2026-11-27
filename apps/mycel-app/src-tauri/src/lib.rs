@@ -483,7 +483,7 @@ struct CallView {
     duration_ms: Option<u64>,
     /// Nobody answered.
     missed: bool,
-    /// No hang-up yet.
+    /// Someone is still in it.
     active: bool,
 }
 
@@ -495,6 +495,8 @@ struct CallSignal {
     action: &'static str,
     video: bool,
     author: String,
+    /// The author's device (short id), as call frames name it.
+    device: String,
     chat: String,
     ts: u64,
 }
@@ -758,13 +760,21 @@ fn call_id(s: &str) -> R<[u8; 16]> {
 fn calls(n: &Node, hist: &[Event], chat: &str) -> HashMap<String, CallView> {
     let me = n.account();
     let mut out: HashMap<String, CallView> = HashMap::new();
-    // shortcut: a group call counts as ended at its last hang-up event seen so far; track per-member presence if that misleads.
     let mut answered: HashMap<String, u64> = HashMap::new();
+    // Devices in each call: a group call is active until the last one hangs up.
+    let mut inside: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
     for e in hist {
         let EventBody::Call { call_id, action } = &e.body else {
             continue;
         };
         let id = hex(call_id);
+        let devs = inside.entry(id.clone()).or_default();
+        if matches!(action, CallAction::Offer { .. } | CallAction::Accept) {
+            devs.insert(e.author_device);
+        } else {
+            devs.remove(&e.author_device);
+        }
+        let active = !devs.is_empty();
         match action {
             CallAction::Offer { video } => {
                 out.insert(
@@ -778,24 +788,26 @@ fn calls(n: &Node, hist: &[Event], chat: &str) -> HashMap<String, CallView> {
                         ts: e.timestamp_ms,
                         duration_ms: None,
                         missed: true,
-                        active: true,
+                        active,
                     },
                 );
             }
             CallAction::Accept => {
                 if let Some(c) = out.get_mut(&id) {
                     c.missed = false;
-                    c.active = true;
+                    c.active = active;
                     answered.entry(id).or_insert(e.timestamp_ms);
                 }
             }
-            CallAction::End => {
+            CallAction::End | CallAction::Reject => {
                 if let Some(c) = out.get_mut(&id) {
-                    c.active = false;
-                    c.duration_ms = answered.get(&id).map(|t| e.timestamp_ms.saturating_sub(*t));
+                    c.active = active;
+                    if !active {
+                        c.duration_ms =
+                            answered.get(&id).map(|t| e.timestamp_ms.saturating_sub(*t));
+                    }
                 }
             }
-            CallAction::Reject => {}
         }
     }
     out
@@ -1099,6 +1111,7 @@ async fn unlock(
                         action,
                         video,
                         author: who(&node, &ev.author_device),
+                        device: short(&ev.author_device),
                         chat: chat_id(&chat),
                         ts: ev.timestamp_ms,
                     },

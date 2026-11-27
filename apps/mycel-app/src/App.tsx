@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer, SwitchCamera,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -17,7 +17,7 @@ import { Shot, useBack, Viewer } from "./viewer";
 import { EMOJI, emojiOnly, recentEmoji, useEmoji } from "./emoji";
 import { Emoji, rich } from "./rich";
 import { record, Recording, waveform } from "./capture";
-import { CallMedia, Peer, ring } from "./call";
+import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
@@ -31,7 +31,7 @@ type Msg = { id: string; author: string; mine: boolean; text: string; ts: number
   ttl: number; fwd: string | null; service: boolean };
 type CallView = { id: string; video: boolean; author: string; chat: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
-type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
+type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; device: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null; removed: boolean };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
@@ -1306,9 +1306,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       endCall();
     }
   };
-  const acceptCall = async () => {
-    const c = incoming()!;
-    setIncoming(undefined);
+  // Answers the ring, or joins a call still going on from its line in the chat.
+  const acceptCall = async (c: Pick<CallSignal, "id" | "video" | "chat"> = incoming()!) => {
+    if (incoming()?.id === c.id) setIncoming(undefined);
     if (active()) await endCall();
     setCallErr("");
     try {
@@ -1338,6 +1338,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       if (c.action === "end" || c.action === "reject") {
         const peers = a.peers.filter((p) => p !== c.author);
         setActive({ ...a, peers });
+        media?.drop(c.device);
         // Everyone left (or the only other person declined): hang up.
         if ((a.started && !peers.length) || (c.action === "reject" && (a.chat || members().length <= 2))) endCall();
       }
@@ -1658,7 +1659,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         {(k) => (
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
             peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
-            openChat={openChat} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute}
+            openChat={openChat} onJoin={acceptCall} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute}
             onProfile={() => setProfile(k.c)} onDelete={() => deleteChat(k.c, false)} />
         )}
       </Show>
@@ -1899,7 +1900,7 @@ const isVideo = (path: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(path);
 
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
-  inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void;
+  inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void; onJoin: (c: CallView) => void;
   muted: boolean; onMute: (on: boolean) => void; onProfile: () => void; onDelete: () => void;
 }) {
   const key = draftKey(p.chat);
@@ -2408,6 +2409,7 @@ function Chat(p: {
                     <div class="call-line" classList={{ missed: m.call.missed }}>
                       {m.call.missed ? <PhoneMissed size={14} /> : m.call.video ? <Video size={14} /> : <Phone size={14} />}
                       {m.mine || p.chat ? "" : `${nameOf(m.author)} · `}{callLabel(m.call)} · {time(m.ts)}
+                      <Show when={m.call.active && !p.inCall}><button class="link" onClick={() => p.onJoin(m.call!)}>Присоединиться</button></Show>
                     </div>
                   ) : (
                     <div class="msg" data-id={items().map((x) => x.id).join(" ")}
@@ -2736,10 +2738,11 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
   const [mini, setMini] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
   const [mic, setMic] = createSignal(true);
-  const [cam, setCam] = createSignal(p.a.video);
+  const [cam, setCam] = createSignal(p.media.cam);
   const [gear, setGear] = createSignal(false);
-  const [camErr, setCamErr] = createSignal("");
-  const t = setInterval(() => setNow(Date.now()), 500);
+  const [camErr, setCamErr] = createSignal(p.media.camErr);
+  const [front, setFront] = createSignal(true);
+  const t = setInterval(() => setNow(Date.now()), 250);
   onCleanup(() => clearInterval(t));
   // Ringback until someone answers.
   createEffect(() => {
@@ -2753,15 +2756,20 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
       await p.media.setCam(!cam());
       setCam(!cam());
     } catch (e) {
-      setCamErr("Камера не включилась: " + errText(e));
+      setCamErr(camError(e));
     }
+  };
+  const flip = async () => {
+    setCamErr("");
+    await p.media.flipCam().catch((e) => setCamErr(camError(e)));
+    setFront(p.media.facing === "user");
   };
   return (
     <Show when={!mini()} fallback={
       <div class="callbar">
         <button class="icon" onClick={toggleMic} title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={20} /> : <MicOff size={20} />}</button>
         <button class="callbar-info" onClick={() => (setGear(false), setMini(false))} title="Развернуть звонок">
-          <b class="ellipsis">{p.a.chat ? nameOf(p.a.chat) : "Общий чат"}</b>
+          <b class="ellipsis">{p.a.chat ? nameOf(p.a.chat) : `Общий чат · ${p.tiles.length + 1}`}</b>
           <span>{dur()}</span>
         </button>
         <button class="icon hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={20} /></button>
@@ -2772,7 +2780,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
       <div class="call-grid">
         <For each={p.tiles}>
           {(t) => (
-            <div class="tile">
+            <div class="tile" classList={{ talking: now() - t.talkAt < 400 }}>
               {/* Video shows while frames come; otherwise the avatar. */}
               <div style={{ display: now() - t.videoAt < 1500 ? "contents" : "none" }}>{t.canvas}</div>
               <Show when={now() - t.videoAt >= 1500}><Avatar id={t.id} /></Show>
@@ -2785,7 +2793,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
         </Show>
       </div>
       <Show when={cam()}>
-        <video class="self" autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
+        <video class="self" classList={{ back: !front() }} autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
       </Show>
       <Show when={camErr()}><p class="error call-err">{camErr()}</p></Show>
       <div class="call-buttons">
@@ -2793,6 +2801,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
           title={mic() ? "Выключить микрофон" : "Включить микрофон"}>{mic() ? <Mic size={24} /> : <MicOff size={24} />}</button>
         <button class="round" classList={{ off: !cam() }} onClick={toggleCam}
           title={cam() ? "Выключить камеру" : "Включить камеру"}>{cam() ? <Video size={24} /> : <VideoOff size={24} />}</button>
+        <Show when={android && cam()}><button class="round" onClick={flip} title="Сменить камеру"><SwitchCamera size={24} /></button></Show>
         <button class="round" classList={{ off: gear() }} onClick={() => setGear(!gear())} title="Голос и видео"><Settings size={24} /></button>
         <button class="round hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={24} /></button>
       </div>
