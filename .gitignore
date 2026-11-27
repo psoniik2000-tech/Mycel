@@ -2,6 +2,7 @@
 **/target/
 node_modules/
 dist/
+apps/mycel-app/public/emoji/
 *.db
 *.db-*
 .env

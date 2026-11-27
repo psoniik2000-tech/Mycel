@@ -9,6 +9,8 @@
 
 Статус: работает на ПК (текст, медиа, звонки); Android в разработке. Текущее состояние и задачи — [docs/STATUS.md](docs/STATUS.md), описание — [docs/DESIGN.md](docs/DESIGN.md).
 
+Эмодзи — [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc и участники), графика под [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
 ## Якорь (ПК или сервер, включённый 24/7)
 
 Якорь — обычный участник, который хранит сообщения для тех, кто офлайн (30 дней), и держит relay для тех, кто за NAT.
