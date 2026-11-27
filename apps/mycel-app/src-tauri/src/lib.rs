@@ -184,6 +184,7 @@ fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
             action: CallAction::Offer { .. },
             ..
         } => return Some((who, "Входящий звонок".into())),
+        EventBody::Text { text, .. } if ev.body.sticker().is_some() => format!("{text} Стикер"),
         EventBody::Text { text, .. } => text.clone(),
         EventBody::Media { .. } => "Медиа".into(),
         _ => return None,
@@ -417,6 +418,8 @@ struct Msg {
     author: String,
     mine: bool,
     text: String,
+    /// The sticker's id (`<set>/<name>`); `text` is then its emoji.
+    sticker: Option<String>,
     ts: u64,
     /// Own messages: 0 ⏱, 1 ✓, 2 ✓✓ (§7.4).
     status: u8,
@@ -650,6 +653,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
             author: who(n, &ev.author_device),
             mine: c.mine,
             text: String::new(),
+            sticker: None,
             ts: ev.timestamp_ms,
             status: 2,
             media: None,
@@ -677,6 +681,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
             author: who(n, &ev.author_device),
             mine: n.account_of(&ev.author_device) == n.account(),
             text,
+            sticker: None,
             ts: ev.timestamp_ms,
             status: 2,
             media: None,
@@ -720,6 +725,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
         author: who(n, &ev.author_device),
         mine: n.account_of(&ev.author_device) == n.account(),
         text: cx.text(ev),
+        sticker: ev.body.sticker().map(Into::into),
         ts: ev.timestamp_ms,
         status: 0,
         media: mv,
@@ -1576,9 +1582,14 @@ async fn send(
     text: String,
     reply_to: Option<String>,
     mentions: Option<Vec<String>>,
+    sticker: Option<String>,
 ) -> R<String> {
     let n = &st.node()?;
     let r = reply_to.map(|r| unhex(&r)).transpose()?;
+    let chat = chat_of(n, &chat)?;
+    if let Some(id) = sticker {
+        return Ok(hex(&n.send_sticker(&chat, &id, &text, r).map_err(err)?.id));
+    }
     // Members who left since are simply not mentioned.
     let m = mentions.unwrap_or_default();
     let m = m
@@ -1586,9 +1597,7 @@ async fn send(
         .filter_map(|m| chat_of(n, m).ok()?)
         .map(|k| n.account_of(&k))
         .collect();
-    let ev = n
-        .send_mention(&chat_of(n, &chat)?, &text, r, m)
-        .map_err(err)?;
+    let ev = n.send_mention(&chat, &text, r, m).map_err(err)?;
     Ok(hex(&ev.id))
 }
 

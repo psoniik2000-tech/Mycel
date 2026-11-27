@@ -292,6 +292,11 @@ input, textarea {
 .msg.big .author { width: fit-content; padding: 1px 8px; border-radius: 10px; background: var(--theirs); }
 .msg.big .reacts button { background: var(--theirs); }
 .msg.big .reacts button.on { background: var(--mine); }
+/* A sticker: a large picture without a bubble (.big); its emoji when the picture is missing. */
+.sticker-art { display: grid; place-items: center; width: 160px; height: 160px; font-size: 96px; line-height: 1; }
+.sticker-art > img { width: 100%; height: 100%; object-fit: contain; }
+.sticker-art .emoji { width: 1em; height: 1em; }
+.msg.sticker .fwd, .msg.sticker .quote { width: fit-content; padding: 2px 8px; border-radius: 10px; background: var(--theirs); }
 /* The voice row is taller than its time and rate: the message time tucks in under them. */
 .media:has(.voice) + .meta { margin-top: -8px; }
 .down {
@@ -597,6 +602,11 @@ details.muted summary { cursor: pointer; margin: 8px 0; }
 .emoji-tabs button.active { background: var(--hover); }
 .emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); height: 260px; overflow-y: auto; padding: 4px; align-content: start; }
 .emoji-grid button { border: 0; background: none; padding: 4px; font-size: 24px; line-height: 1; border-radius: 8px; height: 40px; }
+.picker-modes { justify-content: center; border-bottom: 0; border-top: 1px solid var(--line); }
+.emoji-tabs.picker-modes button { font-size: 14px; padding: 6px 16px; }
+.emoji-grid.sticker-grid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); }
+.emoji-grid.sticker-grid button { height: auto; aspect-ratio: 1; }
+.sticker-grid img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .pad > .row { padding-left: 0; padding-right: 0; }
 
 /* Settings → Appearance (look.tsx) */
