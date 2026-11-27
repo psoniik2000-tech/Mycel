@@ -256,6 +256,7 @@ input, textarea {
 .msg.flash .bubble { animation: flash 1.6s ease-out; }
 @keyframes flash { 0%, 50% { box-shadow: 0 0 0 3px var(--accent); } }
 .author { font-size: calc(var(--msg-size) - 2px); font-weight: 600; margin-bottom: 2px; }
+.fwd { font-size: calc(var(--msg-size) - 2px); color: var(--accent); margin-bottom: 2px; }
 .quote {
   margin: 2px 0 4px; padding: 2px 8px; border-left: 3px solid var(--accent); border-radius: 4px;
   background: color-mix(in srgb, var(--accent) 12%, transparent); font-size: calc(var(--msg-size) - 2px); line-height: 1.3; cursor: pointer; min-width: 0;

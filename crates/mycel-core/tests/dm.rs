@@ -16,8 +16,8 @@ fn texts(n: &Node, chat: &Option<[u8; 32]>) -> Vec<String> {
     n.history(chat)
         .unwrap()
         .into_iter()
-        .filter_map(|e| match e.body {
-            EventBody::Text { text, .. } => Some(text),
+        .filter_map(|e| match e.body.msg() {
+            EventBody::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()

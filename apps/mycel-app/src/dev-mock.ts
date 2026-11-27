@@ -20,7 +20,7 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
   let n = 0;
   const m = (author: string, text: string, ts: number, extra: any = {}) => ({
     id: `m${++n}`, author, mine: author === ME, text, ts, status: author === ME ? 2 : 0, media: null, call: null, reply: null,
-    edited: false, pinned: false, reactions: [], ...extra,
+    edited: false, pinned: false, reactions: [], ttl: 0, fwd: null, service: false, ...extra,
   });
   const media = (kind: string, more: any) => ({ kind, name: null, mime: "", size: 120_000, blurhash: null, wave: null, duration_ms: null, dims: null, path: null, ...more });
   const hist: Record<string, any[]> = {

@@ -81,7 +81,7 @@ fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
         return None;
     }
     let mut who = name_of(n, &ev.author_device);
-    let text = match &ev.body {
+    let text = match ev.body.msg() {
         EventBody::Call {
             action: CallAction::Offer { .. },
             ..
@@ -328,6 +328,12 @@ struct Msg {
     pinned: bool,
     /// (emoji, short ids of who set it).
     reactions: Vec<(String, Vec<String>)>,
+    /// Disappears this many seconds after `ts` (0 = never).
+    ttl: u32,
+    /// «Переслано от …»: the original author's name.
+    fwd: Option<String>,
+    /// A service line: `text` follows the author's name («включил(а) автоудаление: 1 день»).
+    service: bool,
 }
 
 /// The quoted message above a reply.
@@ -364,7 +370,7 @@ impl<'a> Ctx<'a> {
         if let Some(t) = self.edits.get(&ev.id) {
             return t.clone();
         }
-        match &ev.body {
+        match ev.body.msg() {
             EventBody::Text { text, .. } => text.clone(),
             EventBody::Media { caption, .. } => caption.clone().unwrap_or_default(),
             _ => String::new(),
@@ -544,9 +550,39 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
             edited: false,
             pinned: false,
             reactions: vec![],
+            ttl: 0,
+            fwd: None,
+            service: false,
         });
     }
-    let (mv, reply_to) = match &ev.body {
+    if let EventBody::ChatMeta {
+        disappearing: Some(d),
+        ..
+    } = &ev.body
+    {
+        let text = match d.as_secs() {
+            0 => "выключил(а) автоудаление".into(),
+            s => format!("включил(а) автоудаление: {}", ttl_label(s)),
+        };
+        return Some(Msg {
+            id: hex(&ev.id),
+            author: who(n, &ev.author_device),
+            mine: n.account_of(&ev.author_device) == n.account(),
+            text,
+            ts: ev.timestamp_ms,
+            status: 2,
+            media: None,
+            call: None,
+            reply: None,
+            edited: false,
+            pinned: false,
+            reactions: vec![],
+            ttl: 0,
+            fwd: None,
+            service: true,
+        });
+    }
+    let (mv, reply_to) = match ev.body.msg() {
         EventBody::Text { reply_to, .. } => (None, reply_to),
         EventBody::Media {
             kind,
@@ -589,7 +625,23 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
                 .map(|(e, who)| (e.clone(), who.iter().map(short).collect()));
             r.collect()
         }),
+        ttl: ev.body.ttl_secs(),
+        fwd: ev.body.forwarded().map(|f| match f.name.as_str() {
+            "" => name_of(n, &f.device),
+            s => s.into(),
+        }),
+        service: false,
     })
+}
+
+/// «1 день» for a timer of `s` seconds (the menu's choices; others in seconds).
+fn ttl_label(s: u64) -> String {
+    match s {
+        86_400 => "1 день".into(),
+        604_800 => "1 неделя".into(),
+        2_592_000 => "1 месяц".into(),
+        s => format!("{s} с"),
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -966,7 +1018,10 @@ async fn unlock(
                 );
                 continue;
             }
-            if matches!(ev.body, EventBody::Text { .. } | EventBody::Media { .. }) {
+            if matches!(
+                ev.body.msg(),
+                EventBody::Text { .. } | EventBody::Media { .. }
+            ) {
                 let _ = app.emit(
                     "typing",
                     TypingSignal {
@@ -978,7 +1033,7 @@ async fn unlock(
                 );
             }
             // The UI reloads on `message` / `changed` (payload: the chat); receipts only move the ticks.
-            let _ = match &ev.body {
+            let _ = match ev.body.msg() {
                 EventBody::Text { .. } | EventBody::Media { .. } => {
                     app.emit("message", chat_id(&chat))
                 }
@@ -1374,6 +1429,20 @@ async fn forward(st: State<'_, App>, ids: Vec<String>, to: String) -> R<()> {
     }
     let ids: Vec<_> = ids.iter().map(|i| unhex(i)).collect::<R<_>>()?;
     n.forward(&ids, &to).map_err(err)
+}
+
+/// «Автоудаление»: the chat's timer in seconds (0 = off).
+#[tauri::command]
+async fn timer(st: State<'_, App>, chat: String) -> R<u32> {
+    let n = &st.node()?;
+    n.timer(&chat_of(n, &chat)?).map_err(err)
+}
+
+#[tauri::command]
+async fn set_timer(st: State<'_, App>, chat: String, secs: u32) -> R<()> {
+    let n = &st.node()?;
+    n.set_timer(&chat_of(n, &chat)?, secs).map_err(err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2161,6 +2230,8 @@ pub fn run() {
             edit,
             delete,
             forward,
+            timer,
+            set_timer,
             pin,
             react,
             send_files,

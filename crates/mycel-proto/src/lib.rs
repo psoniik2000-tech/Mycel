@@ -132,6 +132,53 @@ pub enum EventBody {
         account: UserId,
         devices: Vec<DeviceId>,
     },
+    /// A Text or Media message with what older clients cannot read (a new variant: they skip
+    /// it). It disappears `ttl_secs` after its `timestamp_ms` (0 = never) and/or was forwarded.
+    /// A chat's timer is set by `ChatMeta { disappearing: Some(d) }` (zero = off).
+    Extra {
+        body: Box<EventBody>,
+        ttl_secs: u32,
+        forwarded: Option<Forwarded>,
+    },
+}
+
+/// The original author of a forwarded message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forwarded {
+    pub name: String,
+    pub device: DeviceId,
+}
+
+impl EventBody {
+    /// The message inside `Extra`, else itself.
+    pub fn msg(&self) -> &EventBody {
+        match self {
+            EventBody::Extra { body, .. } => body,
+            b => b,
+        }
+    }
+
+    pub fn ttl_secs(&self) -> u32 {
+        match self {
+            EventBody::Extra { ttl_secs, .. } => *ttl_secs,
+            _ => 0,
+        }
+    }
+
+    pub fn forwarded(&self) -> Option<&Forwarded> {
+        match self {
+            EventBody::Extra { forwarded, .. } => forwarded.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl Event {
+    /// Unix ms when a disappearing message is gone.
+    pub fn expires_ms(&self) -> Option<u64> {
+        let t = self.body.ttl_secs();
+        (t > 0).then(|| self.timestamp_ms.saturating_add(t as u64 * 1000))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

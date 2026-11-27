@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -24,7 +24,9 @@ import { Appearance, msgSize } from "./look";
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
   reply: { id: string; author: string; text: string } | null; edited: boolean; pinned: boolean;
-  reactions: [string, string[]][] };
+  reactions: [string, string[]][];
+  // ttl: seconds after ts it disappears (0 = never); fwd: «Переслано от …»; service: a line like «X включил(а) автоудаление».
+  ttl: number; fwd: string | null; service: boolean };
 type CallView = { id: string; video: boolean; author: string; chat: string; mine: boolean; ts: number; duration_ms: number | null; missed: boolean; active: boolean };
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
@@ -1347,6 +1349,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
 
   const preview = (r: ChatRow) => {
     const l = r.last;
+    if (l?.service) return serviceText(l);
     return l ? (l.mine ? "Вы: " : !r.id && !l.call ? `${nameOf(l.author)}: ` : "") + (l.call ? callLabel(l.call) : l.media ? label(l.media) : l.text) : "Сообщений пока нет";
   };
   const sortedRows = () => {
@@ -1785,8 +1788,11 @@ const dayLabel = (ts: number) => {
 };
 // One bubble group: same sender, same day, within 10 minutes.
 const same = (a?: Msg, b?: Msg) =>
-  !!a && !!b && !a.call && !b.call && a.mine === b.mine && (a.mine || a.author === b.author)
+  !!a && !!b && !a.call && !b.call && !a.service && !b.service && a.mine === b.mine && (a.mine || a.author === b.author)
   && dayKey(a.ts) === dayKey(b.ts) && Math.abs(b.ts - a.ts) < 600_000;
+// The node writes «включил(а) …»; own lines read «Вы включили …».
+const serviceText = (m: Msg) => (m.mine ? `Вы ${m.text.replace("ил(а)", "или")}` : `${nameOf(m.author)} ${m.text}`);
+const TTLS: [number, string][] = [[0, "Выкл"], [86_400, "1 день"], [604_800, "1 неделя"], [2_592_000, "1 месяц"]];
 const plain = (m: Msg) => m.text || (m.media ? label(m.media) : "");
 type Dialog = { kind: "delete" | "forward"; ids: string[] };
 const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
@@ -1806,6 +1812,11 @@ function Chat(p: {
   const [editing, setEditing] = createSignal<Msg>();
   const [menu, setMenu] = createSignal<{ m: Msg; x: number; y: number }>();
   const [more, setMore] = createSignal(false); // the chat header's ⋮ menu
+  const [ttl, setTtl] = createSignal(0), [ttlPick, setTtlPick] = createSignal(false); // «Автоудаление»
+  // Disappearing messages go from the feed the moment they expire.
+  const [clock, setClock] = createSignal(Date.now());
+  const clockT = setInterval(() => p.msgs.some((m) => m.ttl) && setClock(Date.now()), 1000);
+  onCleanup(() => clearInterval(clockT));
   const [sel, setSel] = createSignal<string[]>([]);
   const [dlg, setDlg] = createSignal<Dialog>();
   const [atBottom, setAtBottom] = createSignal(true);
@@ -1814,7 +1825,8 @@ function Chat(p: {
   const name = (id: string) => (id === p.me ? "Вы" : nameOf(id));
   const shown = () => {
     const ids = new Set(p.msgs.map((m) => m.id));
-    return [...p.msgs, ...pending().filter((x) => !x.real || !ids.has(x.real))];
+    const live = p.msgs.filter((m) => !m.ttl || m.ts + m.ttl * 1000 > clock());
+    return [...live, ...pending().filter((x) => !x.real || !ids.has(x.real))];
   };
   // Bubbles: an album is one, shown at its first message.
   const grouped = createMemo(() => albums(shown()));
@@ -1840,7 +1852,7 @@ function Chat(p: {
   let chain: Promise<unknown> = Promise.resolve();
   const queue = async (m: Partial<Msg>, run: () => Promise<string>, undo?: () => void) => {
     const id = `tmp-${++tmp}`;
-    setPending((ps) => [...ps, { id, author: p.me, mine: true, text: "", ts: Date.now(), status: 0, media: null, call: null, reply: null, edited: false, pinned: false, reactions: [], ...m }]);
+    setPending((ps) => [...ps, { id, author: p.me, mine: true, text: "", ts: Date.now(), status: 0, media: null, call: null, reply: null, edited: false, pinned: false, reactions: [], ttl: 0, fwd: null, service: false, ...m }]);
     try {
       const job = chain.then(run);
       chain = job.catch(() => {});
@@ -2211,14 +2223,24 @@ function Chat(p: {
         </div>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
           title={p.chat ? "Звонок" : "Групповой звонок"}><Phone size={20} /></button>
-        <button class="icon" onClick={() => setMore(true)} title="Ещё"><EllipsisVertical size={20} /></button>
+        <button class="icon" onClick={() => (setTtlPick(false), setMore(true), invoke<number>("timer", { chat: p.chat }).then(setTtl, () => {}))}
+          title="Ещё"><EllipsisVertical size={20} /></button>
         <Show when={more()}>
           <div class="overlay" onClick={() => setMore(false)}>
             <div class="menu more">
+              <Show when={!ttlPick()} fallback={
+                <For each={TTLS}>
+                  {([secs, l]) => <button onClick={() => secs !== ttl() && act(invoke("set_timer", { chat: p.chat, secs }))}>
+                    <Timer size={18} /> <span class="grow">{l}</span>{secs === ttl() && <Check size={16} />}</button>}
+                </For>
+              }>
               <button disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}><Video size={18} /> {p.chat ? "Видеозвонок" : "Групповой видеозвонок"}</button>
               <button onClick={() => setQuery(query() === undefined ? "" : undefined)}><Search size={18} /> Поиск</button>
               <button onClick={() => p.onMute(!p.muted)}>{p.muted ? <><Bell size={18} /> Включить уведомления</> : <><BellOff size={18} /> Без звука</>}</button>
+              <button onClick={(e) => (e.stopPropagation(), setTtlPick(true))}>
+                <Timer size={18} /> <span class="grow">Автоудаление</span><span class="muted">{TTLS.find(([s]) => s === ttl())?.[1] ?? `${ttl()} с`}</span></button>
               <div class="muted small more-net"><NetDot n={p.peers} /><Show when={p.chat}><div>{linkText(memberOf(p.chat))}</div></Show></div>
+              </Show>
             </div>
           </div>
         </Show>
@@ -2267,7 +2289,7 @@ function Chat(p: {
               return (
                 <>
                   <Show when={!prev() || dayKey(prev()!.ts) !== dayKey(m.ts)}><div class="day"><span>{dayLabel(m.ts)}</span></div></Show>
-                  {m.call ? (
+                  {m.service ? <div class="call-line"><Timer size={14} />{serviceText(m)}</div> : m.call ? (
                     <div class="call-line" classList={{ missed: m.call.missed }}>
                       {m.call.missed ? <PhoneMissed size={14} /> : m.call.video ? <Video size={14} /> : <Phone size={14} />}
                       {m.mine || p.chat ? "" : `${nameOf(m.author)} · `}{callLabel(m.call)} · {time(m.ts)}
@@ -2276,7 +2298,7 @@ function Chat(p: {
                     <div class="msg" data-id={items().map((x) => x.id).join(" ")}
                       classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: items().some((x) => x.id === hit()),
                         // Photo/video alone: edge to edge with the time over it; a video note has no bubble at all.
-                        bare: items().length === 1 && !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.reactions.length,
+                        bare: items().length === 1 && !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.fwd && !m.reactions.length,
                         note: m.media?.kind === "videonote" && !m.text && !m.reply }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
@@ -2299,6 +2321,7 @@ function Chat(p: {
                           <div class="author link" style={{ color: `hsl(${colorOf(m.author)} 50% 50%)` }} title="Написать лично"
                             onClick={(e) => (e.stopPropagation(), p.openChat(m.author))}>{nameOf(m.author)}</div>
                         </Show>
+                        <Show when={m.fwd}><div class="fwd">Переслано от <b>{m.fwd}</b></div></Show>
                         <Show when={m.reply}>
                           {(r) => (
                             <div class="quote" onClick={(e) => (e.stopPropagation(), jump(r().id))}>
@@ -2328,6 +2351,7 @@ function Chat(p: {
                           </div>
                         </Show>
                         <span class="meta">
+                          <Show when={m.ttl}><span title="Автоудаление"><Timer size={11} /></span></Show>
                           <Show when={items().some((x) => x.pinned)}><Pin size={11} /></Show>
                           <Show when={items().some((x) => x.edited)}><span>изменено</span></Show>
                           {time(m.ts)}

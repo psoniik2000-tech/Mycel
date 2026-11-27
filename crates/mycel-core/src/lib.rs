@@ -13,8 +13,8 @@ use mycel_net::{
     BLOBS_ALPN, CALL_ALPN, ConnInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net,
 };
 use mycel_proto::{
-    BlobRef, DeviceId, Envelope, Event, EventBody, EventId, JoinReq, JoinResp, MediaKind,
-    ReceiptKind, SignedAddr, SyncMsg,
+    BlobRef, DeviceId, Envelope, Event, EventBody, EventId, Forwarded, JoinReq, JoinResp,
+    MediaKind, ReceiptKind, SignedAddr, SyncMsg,
 };
 use mycel_store::Store;
 use n0_future::StreamExt;
@@ -665,6 +665,9 @@ impl Node {
                     if let Err(e) = n.sync() {
                         eprintln!("mycel: resync failed: {e}");
                     }
+                    if let Err(e) = n.expire() {
+                        eprintln!("mycel: expire failed: {e}");
+                    }
                 }
                 if due || n.awaiting_receipt() {
                     n.poll_box().await;
@@ -1186,9 +1189,75 @@ impl Node {
     }
 
     /// Events of a chat ordered by (lamport, ts, id).
+    /// Expired disappearing messages are left out (`expire` erases them).
     pub fn history(&self, chat: &Chat) -> Result<Vec<Event>> {
         let rows = self.st.lock().unwrap().store.events(chat_key(chat))?;
-        rows.iter().map(|b| Ok(postcard::from_bytes(b)?)).collect()
+        let now = now_ms()?;
+        let mut out = vec![];
+        for b in rows {
+            let e: Event = postcard::from_bytes(&b)?;
+            if e.expires_ms().is_none_or(|t| t > now) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The chat's disappearing-message timer in seconds (0 = off): its latest setting.
+    // shortcut: the setting is an event, so `prune` past retention turns the timer off; keep it in chat state if that bites.
+    pub fn timer(&self, chat: &Chat) -> Result<u32> {
+        Ok(self
+            .history(chat)?
+            .iter()
+            .rev()
+            .find_map(|e| match e.body {
+                EventBody::ChatMeta {
+                    disappearing: Some(d),
+                    ..
+                } => Some(d.as_secs() as u32),
+                _ => None,
+            })
+            .unwrap_or(0))
+    }
+
+    /// Sets the chat's timer for everyone in it (0 = off); later messages carry it.
+    pub fn set_timer(&self, chat: &Chat, secs: u32) -> Result<Event> {
+        self.send_event(
+            chat,
+            EventBody::ChatMeta {
+                name: None,
+                avatar: None,
+                disappearing: Some(std::time::Duration::from_secs(secs.into())),
+            },
+        )
+    }
+
+    /// Erases expired disappearing messages from this device; returns how many.
+    pub fn expire(&self) -> Result<usize> {
+        let now = now_ms()?;
+        let ids: Vec<_> = self
+            .all_events()?
+            .iter()
+            .filter(|(_, e)| e.expires_ms().is_some_and(|t| t <= now))
+            .map(|(_, e)| e.id)
+            .collect();
+        self.wipe(&ids)?;
+        Ok(ids.len())
+    }
+
+    /// Sends a message with the chat's timer, marked as forwarded from `fwd`.
+    fn send_msg(&self, chat: &Chat, body: EventBody, fwd: Option<Forwarded>) -> Result<Event> {
+        let ttl_secs = self.timer(chat)?;
+        let body = if ttl_secs == 0 && fwd.is_none() {
+            body
+        } else {
+            EventBody::Extra {
+                body: Box::new(body),
+                ttl_secs,
+                forwarded: fwd,
+            }
+        };
+        self.send_event(chat, body)
     }
 
     /// Events of every chat, with their chat, ordered by (lamport, ts, id).
@@ -1344,13 +1413,14 @@ impl Node {
 
     /// Signs, encrypts (MLS), stores and sends a text event to every known peer.
     pub fn send_text(&self, chat: &Chat, text: &str, reply_to: Option<EventId>) -> Result<Event> {
-        self.send_event(
+        self.send_msg(
             chat,
             EventBody::Text {
                 text: text.into(),
                 reply_to,
                 mentions: vec![],
             },
+            None,
         )
     }
 
@@ -1420,11 +1490,20 @@ impl Node {
     }
 
     /// Sends copies of text or media messages as new own messages to chat `to`. Albums among them
-    /// get new ids, so a copy never joins the original.
+    /// get new ids, so a copy never joins the original. Each names its original author.
     pub fn forward(&self, targets: &[EventId], to: &Chat) -> Result<()> {
         let mut albums = HashMap::new();
+        let names = self.profiles()?;
         for target in targets {
-            let body = match self.event(target)?.1.body {
+            let ev = self.event(target)?.1;
+            let fwd = ev.body.forwarded().cloned().unwrap_or_else(|| Forwarded {
+                name: names
+                    .get(&ev.author_device)
+                    .map(|p| p.0.clone())
+                    .unwrap_or_default(),
+                device: ev.author_device,
+            });
+            let body = match ev.body.msg().clone() {
                 EventBody::Text { text, .. } => EventBody::Text {
                     text,
                     reply_to: None,
@@ -1452,7 +1531,7 @@ impl Node {
                 }
                 _ => bail!("not a message"),
             };
-            self.send_event(to, body)?;
+            self.send_msg(to, body, Some(fwd))?;
         }
         Ok(())
     }
@@ -1468,8 +1547,19 @@ impl Node {
                 }
             }
         }
+        if !gone.iter().any(|e| media(e).is_some()) {
+            return Ok(());
+        }
+        // A forwarded copy shares the blob: keep it while another message still shows it.
+        let kept: HashSet<_> = self
+            .all_events()?
+            .iter()
+            .filter_map(|(_, e)| media(e).map(|(_, b)| b.hash))
+            .collect();
         for ev in &gone {
-            if let Some((_, b)) = media(ev) {
+            if let Some((_, b)) = media(ev)
+                && !kept.contains(&b.hash)
+            {
                 let _ = std::fs::remove_file(self.media_file(b));
                 let (blobs, tag) = (self.blobs.clone(), hex(&b.hash));
                 tokio::spawn(async move { blobs.tags().delete(tag).await });
@@ -1479,9 +1569,10 @@ impl Node {
     }
 
     /// Wipes the targets of valid Delete events still here (a Delete may arrive before its
-    /// target); returns their ids.
+    /// target) and expired disappearing messages; returns their ids.
     fn apply_deletes(&self) -> Result<HashSet<EventId>> {
         let hist: Vec<_> = self.all_events()?.into_iter().map(|(_, e)| e).collect();
+        let now = now_ms()?;
         let admin = self.admin()?;
         let author: HashMap<_, _> = hist.iter().map(|e| (e.id, e.author_device)).collect();
         let ids: HashSet<_> = hist
@@ -1494,6 +1585,7 @@ impl Node {
                 {
                     Some(target)
                 }
+                _ if e.expires_ms().is_some_and(|t| t <= now) => Some(e.id),
                 _ => None,
             })
             .collect();
@@ -1657,7 +1749,7 @@ impl Node {
         let out = self.media_file(&meta);
         std::fs::create_dir_all(out.parent().context("media dir")?)?;
         std::fs::copy(src, &out)?;
-        self.send_event(
+        self.send_msg(
             chat,
             EventBody::Media {
                 kind,
@@ -1665,6 +1757,7 @@ impl Node {
                 caption,
                 reply_to: None,
             },
+            None,
         )
     }
 
@@ -2529,7 +2622,7 @@ pub fn reactions(hist: &[Event]) -> HashMap<EventId, Reactions> {
 }
 
 fn is_msg(b: &EventBody) -> bool {
-    matches!(b, EventBody::Text { .. } | EventBody::Media { .. })
+    matches!(b.msg(), EventBody::Text { .. } | EventBody::Media { .. })
 }
 
 /// What counts as unread from someone else: a message or a call.
@@ -2553,7 +2646,7 @@ pub fn new_album() -> Result<String> {
 
 /// The media kind and blob of a Media event.
 pub fn media(ev: &Event) -> Option<(MediaKind, &BlobRef)> {
-    match &ev.body {
+    match ev.body.msg() {
         EventBody::Media { kind, blob, .. } => Some((*kind, blob)),
         _ => None,
     }
