@@ -1647,6 +1647,182 @@ fn change_password(app: AppHandle, st: State<App>, old: String, new: String) -> 
     Ok(())
 }
 
+/// A file the user saves: the picked path, else (Android: the save dialog gives no path) Downloads.
+// shortcut: a direct path into Download works on Android 11+ only; MediaStore if 10 matters.
+fn out_path(to: Option<String>, name: &str) -> PathBuf {
+    to.map_or_else(
+        || PathBuf::from("/storage/emulated/0/Download").join(name),
+        PathBuf::from,
+    )
+}
+
+/// Settings → Резервная копия: every space whose password is known (open or remembered) into one
+/// `.mycelbak` sealed by `password`. Returns the file and the names of spaces left out.
+#[tauri::command]
+async fn backup(
+    app: AppHandle,
+    st: State<'_, App>,
+    to: Option<String>,
+    password: String,
+    media: bool,
+) -> R<(String, Vec<String>)> {
+    if password.is_empty() {
+        return Err("Введите пароль".into());
+    }
+    let root = data_dir(&app)?;
+    let list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    let open =
+        st.0.lock()
+            .unwrap()
+            .as_ref()
+            .map(|o| (o.id.clone(), o.password.clone()));
+    let (mut with, mut without) = (vec![], vec![]);
+    for s in list.spaces {
+        let pw = match &open {
+            Some((id, pw)) if *id == s.id => Some(pw.clone()),
+            _ => vault::load(&root, &s.id),
+        };
+        match pw {
+            Some(pw) => with.push((s.name, spaces::dir(&root, &s.id), pw)),
+            None => without.push(s.name),
+        }
+    }
+    let out = out_path(to, &format!("mycel-{}.mycelbak", spaces::new_id()));
+    let o = out.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let refs: Vec<_> = with
+            .iter()
+            .map(|(n, d, p)| (n.as_str(), d.as_path(), p.as_str()))
+            .collect();
+        mycel_core::backup::write(&o, &password, &refs, media)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(err)?;
+    Ok((out.display().to_string(), without))
+}
+
+/// Restores a backup as new spaces of a new device (DESIGN §10), their password the backup's,
+/// remembered; the first one opens next. Nothing is left behind on failure.
+#[tauri::command]
+async fn restore_backup(app: AppHandle, path: String, password: String) -> R<()> {
+    let root = data_dir(&app)?;
+    let r = root.clone();
+    let pw = password.clone();
+    let made = Arc::new(Mutex::new(Vec::<String>::new()));
+    let m = made.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        mycel_core::backup::restore(Path::new(&path), &pw, &pw, |name| {
+            let mut list = spaces::List::load(&r)?;
+            let id = spaces::new_id();
+            list.spaces.push(spaces::Space {
+                id: id.clone(),
+                name: name.into(),
+                muted: vec![],
+            });
+            if m.lock().unwrap().is_empty() {
+                list.last = Some(id.clone());
+            }
+            // Listed before the folder exists, so List::load never takes it for an orphan.
+            list.save(&r)?;
+            m.lock().unwrap().push(id.clone());
+            Ok(spaces::dir(&r, &id))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let made = made.lock().unwrap().clone();
+    if let Err(e) = res {
+        let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+        list.spaces.retain(|s| !made.contains(&s.id));
+        if list.last.as_ref().is_some_and(|l| made.contains(l)) {
+            list.last = None;
+        }
+        list.save(&root).map_err(|e| e.to_string())?;
+        for id in &made {
+            let _ = std::fs::remove_dir_all(spaces::dir(&root, id));
+        }
+        return Err(if e.to_string() == mycel_core::backup::BAD_PASSWORD {
+            "Неверный пароль или файл повреждён".into()
+        } else {
+            err(e)
+        });
+    }
+    for id in &made {
+        vault::save(&root, id, &password)?;
+    }
+    Ok(())
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A chat as a readable HTML page, unencrypted, its downloaded media in `<name>_files` beside it.
+/// Returns the page's path.
+#[tauri::command]
+async fn export_chat(st: State<'_, App>, chat: String, to: Option<String>) -> R<String> {
+    let n = &st.node()?;
+    let c = chat_of(n, &chat)?;
+    let title = match &c {
+        None => "Общий чат".to_string(),
+        Some(d) => name_of(n, d),
+    };
+    let out = out_path(to, &format!("mycel-chat-{}.html", spaces::new_id()));
+    let stem = out
+        .file_stem()
+        .ok_or("bad name")?
+        .to_string_lossy()
+        .into_owned();
+    let files = out.with_file_name(format!("{stem}_files"));
+    let mut html = format!(
+        "<!doctype html><meta charset=utf-8><title>{t}</title>\
+         <style>body{{font:15px sans-serif;max-width:46em;margin:auto;padding:1em}}\
+         p{{margin:.6em 0}}small{{color:#888}}img,video{{max-width:100%}}</style><h1>{t}</h1>",
+        t = esc(&title)
+    );
+    for m in chat_msgs(n, &c)? {
+        html += &format!(
+            "<p><b>{}</b> <small data-ts={}></small><br>",
+            esc(&m.author),
+            m.ts
+        );
+        if let Some(md) = &m.media {
+            let name = md.name.clone().unwrap_or_else(|| md.kind.into());
+            match &md.path {
+                Some(p) => {
+                    let src = Path::new(p);
+                    let file = src.file_name().ok_or("bad media")?;
+                    std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
+                    std::fs::copy(src, files.join(file)).map_err(|e| e.to_string())?;
+                    let enc = |s: &str| {
+                        percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC)
+                            .to_string()
+                    };
+                    let href = format!("{}/{}", enc(&stem), enc(&file.to_string_lossy()));
+                    html += &match md.kind {
+                        "photo" => format!("<img src=\"{href}\"><br>"),
+                        "video" | "videonote" => {
+                            format!("<video controls src=\"{href}\"></video><br>")
+                        }
+                        "voice" => format!("<audio controls src=\"{href}\"></audio><br>"),
+                        _ => format!("📎 <a href=\"{href}\">{}</a><br>", esc(&name)),
+                    };
+                }
+                None => html += &format!("📎 {} <small>(не скачано)</small><br>", esc(&name)),
+            }
+        }
+        html += &esc(&m.text).replace('\n', "<br>");
+        html += "</p>";
+    }
+    html += "<script>for(const e of document.querySelectorAll('[data-ts]'))e.textContent=new Date(+e.dataset.ts).toLocaleString()</script>";
+    std::fs::write(&out, html).map_err(|e| e.to_string())?;
+    Ok(out.display().to_string())
+}
+
 /// Brings the window back from the tray.
 #[cfg(desktop)]
 fn show_main(app: &AppHandle) {
@@ -1741,6 +1917,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             status,
             unlock,
+            backup,
+            restore_backup,
+            export_chat,
             public_ip,
             anchor_check,
             upnp_ok,

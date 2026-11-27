@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+pub mod backup;
 mod call;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
 #[cfg(not(target_os = "android"))]
@@ -770,11 +771,13 @@ impl Node {
             .collect()
     }
 
-    /// Partners of our 1:1 chats.
+    /// Partners of our 1:1 chats; also chats only in the history (restored from a backup,
+    /// read-only until the pair group is made again).
     pub fn dms(&self) -> Result<Vec<[u8; 32]>> {
-        let mut v: Vec<_> = self.st.lock().unwrap().dms()?;
-        v.sort_by_key(|(_, p)| *p);
-        let mut p: Vec<_> = v.into_iter().map(|(_, p)| p).collect();
+        let st = self.st.lock().unwrap();
+        let mut p: Vec<_> = st.dms()?.into_iter().map(|(_, p)| p).collect();
+        p.extend(st.store.chats()?.iter().filter_map(|c| chat_from(c)));
+        p.sort();
         p.dedup();
         Ok(p)
     }
@@ -2075,6 +2078,49 @@ mod tests {
         }
         assert!(!a.awaiting_receipt(), "the receipt did not stop the wait");
         a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_restores_history_as_a_new_device() {
+        let (src, dst) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, _rx) = Node::open(src.path(), "pa", &Opts::default())
+            .await
+            .unwrap();
+        a.create_space().unwrap();
+        let ev = a.send_text(&None, "hi", None).unwrap();
+        let mut dm = ev.clone();
+        dm.id = [9; 32];
+        a.st.lock()
+            .unwrap()
+            .store_event(&dm, &Some([7; 32]))
+            .unwrap();
+        let media = src.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        // Over one segment: the stream has a next and a last part.
+        std::fs::write(media.join("x.jpg"), vec![5u8; 1_500_000]).unwrap();
+        let old = a.device_id();
+        a.close().await;
+
+        let file = dst.path().join("b.mycelbak");
+        backup::write(&file, "bk", &[("Моё", src.path(), "pa")], true).unwrap();
+        let to = dst.path().join("s");
+        let err = backup::restore(&file, "bad", "pw", |_| Ok(to.clone())).unwrap_err();
+        assert_eq!(err.to_string(), backup::BAD_PASSWORD);
+        assert!(!to.exists());
+        let names = backup::restore(&file, "bk", "pw", |_| Ok(to.clone())).unwrap();
+        assert_eq!(names, ["Моё"]);
+        assert_eq!(
+            std::fs::read(to.join("media").join("x.jpg")).unwrap().len(),
+            1_500_000
+        );
+
+        let (b, _rx) = Node::open(&to, "pw", &Opts::default()).await.unwrap();
+        assert_ne!(b.device_id(), old, "a restored device has a new key");
+        assert!(b.admin().is_err(), "and joins its space again");
+        assert!(b.history(&None).unwrap().contains(&ev));
+        assert_eq!(b.dms().unwrap(), vec![[7; 32]]);
+        assert_eq!(b.history(&Some([7; 32])).unwrap(), vec![dm]);
         b.close().await;
     }
 

@@ -3,7 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { ask, message, open } from "@tauri-apps/plugin-dialog";
+import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
@@ -229,6 +229,7 @@ export default function App() {
   const [space, setSpace] = createSignal<Space>();
   const [how, setHow] = createSignal<How>();
   const [invite, setInvite] = createSignal("");
+  const [restoring, setRestoring] = createSignal(false);
   const [theme, setTheme] = createSignal(localStorage.getItem("theme") ?? "system");
   createEffect(() => {
     document.documentElement.dataset.theme = theme();
@@ -303,7 +304,8 @@ export default function App() {
       {(s) => (
         <Switch>
           <Match when={stage() === "spaces" && !s().spaces.length && !mode()}>
-            <ModeChoice onSimple={() => enter()} onSpaces={() => setStage("spaces")} />
+            <ModeChoice onSimple={() => enter()} onSpaces={() => setStage("spaces")} onRestore={() => setRestoring(true)} />
+            <Show when={restoring()}><Restore onClose={() => setRestoring(false)} /></Show>
           </Match>
           <Match when={stage() === "spaces"}>
             <Spaces spaces={s().spaces} onOpen={enter} onNew={(h) => enter(undefined, h)} onRemoved={refresh} />
@@ -388,6 +390,7 @@ function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: bo
 
 function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: (how: How) => void; onRemoved: () => void }) {
   const [del, setDel] = createSignal<Space>();
+  const [restore, setRestore] = createSignal(false);
   return (
     <div class="center">
       <div class="card intro">
@@ -407,7 +410,9 @@ function Spaces(p: { spaces: Space[]; onOpen: (s: Space) => void; onNew: (how: H
         <Show when={p.spaces.length}><div class="or"><span>или</span></div></Show>
         <button class="primary" onClick={() => p.onNew("create")}><Plus size={18} /> {p.spaces.length ? "Создать новое" : "Создать пространство"}</button>
         <button onClick={() => p.onNew("join")}><Link size={18} /> Вступить по ссылке</button>
+        <button class="link" onClick={() => setRestore(true)}>Восстановить из копии</button>
       </div>
+      <Show when={restore()}><Restore onClose={() => setRestore(false)} /></Show>
       <Show when={del()}>
         {(s) => <RemoveSpace space={s()} onClose={() => setDel()} onDone={() => (setDel(), p.onRemoved())} />}
       </Show>
@@ -723,6 +728,117 @@ function LoginSettings(p: { space: Space; refresh: () => void }) {
         <Show when={msg()}><p class="muted small">{msg()}</p></Show>
       </form>
     </>
+  );
+}
+
+// Settings → Резервная копия: a sealed `.mycelbak` of every space, restore, a chat as readable HTML.
+function BackupSettings(p: { chats: string[] }) {
+  const [pw, setPw] = createSignal("");
+  const [pw2, setPw2] = createSignal("");
+  const [media, setMedia] = createSignal(true);
+  const [chat, setChat] = createSignal("");
+  const [msg, setMsg] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [restoring, setRestoring] = createSignal(false);
+  // Android: no save dialog paths, the file goes to Downloads.
+  const target = async (name: string, ext: string) =>
+    android ? null : save({ defaultPath: name, filters: [{ name: ext, extensions: [ext] }] });
+  const make = async (e: Event) => {
+    e.preventDefault();
+    if (!pw()) return setMsg("Придумайте пароль для копии");
+    if (pw() !== pw2()) return setMsg("Пароли не совпадают");
+    const to = await target("mycel.mycelbak", "mycelbak");
+    if (!to && !android) return;
+    setBusy(true);
+    setMsg("Создаём копию…");
+    try {
+      const [path, left] = await invoke<[string, string[]]>("backup", { to, password: pw(), media: media() });
+      setPw("");
+      setPw2("");
+      setMsg(`Сохранено: ${path}` + (left.length ? `. Без пароля на этом устройстве не вошли: ${left.join(", ")}` : ""));
+    } catch (e) {
+      setMsg(errText(e));
+    }
+    setBusy(false);
+  };
+  const exportChat = async () => {
+    if (!(await ask("В файле переписка будет НЕ зашифрована: её прочитает любой, у кого окажется файл. Продолжить?", { title: "Экспорт переписки", okLabel: "Экспортировать", cancelLabel: "Отмена" }))) return;
+    const to = await target("chat.html", "html");
+    if (!to && !android) return;
+    invoke<string>("export_chat", { chat: chat(), to }).then((path) => setMsg(`Сохранено: ${path}`), (e) => setMsg(errText(e)));
+  };
+  return (
+    <>
+      <h3>Резервная копия</h3>
+      <p class="muted">Один файл с историей, чатами и пространствами для нового устройства или после переустановки. Ключи шифрования в копию не входят: после восстановления это новое устройство, в пространства и к контактам нужно войти заново по приглашению — история останется.</p>
+      <form class="section" onSubmit={make}>
+        <input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
+        <input type="password" placeholder="Повторите пароль" value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} />
+        <label class="check">
+          <input type="checkbox" checked={media()} onChange={(e) => setMedia(e.currentTarget.checked)} />
+          С фото, видео и файлами (скачанными на это устройство)
+        </label>
+        <div class="actions">
+          <button disabled={busy()}>Создать копию</button>
+          <button type="button" onClick={() => setRestoring(true)}>Восстановить из копии</button>
+        </div>
+      </form>
+      <div class="actions">
+        <select value={chat()} onChange={(e) => setChat(e.currentTarget.value)}>
+          <For each={p.chats}>{(c) => <option value={c}>{c ? nameOf(c) : "Общий чат"}</option>}</For>
+        </select>
+        <button onClick={exportChat}>Экспорт переписки</button>
+      </div>
+      <Show when={msg()}><p class="muted small">{msg()}</p></Show>
+      <Show when={restoring()}><Restore onClose={() => setRestoring(false)} /></Show>
+    </>
+  );
+}
+
+// Restore from a `.mycelbak`: new spaces with the backup's password, then the app starts over in them.
+function Restore(p: { onClose: () => void }) {
+  const [path, setPath] = createSignal("");
+  const [pw, setPw] = createSignal("");
+  const [err, setErr] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  // Android pickers give content:// URIs: the file is read here and stashed (as for attachments).
+  let picker!: HTMLInputElement;
+  const pick = async () => {
+    if (!android) return setPath(((await open({ filters: [{ name: "Mycel", extensions: ["mycelbak"] }] })) as string | null) ?? "");
+    picker.click();
+  };
+  const stash = async () => {
+    const f = picker.files?.[0];
+    if (f) setPath(await invoke<string>("stash", new Uint8Array(await f.arrayBuffer()), { headers: { name: encodeURIComponent(f.name) } }));
+  };
+  const run = async (e: Event) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr("");
+    try {
+      await invoke("restore_backup", { path: path(), password: pw() });
+      await invoke("close_space");
+      location.reload();
+    } catch (e) {
+      setErr(errText(e));
+      setBusy(false);
+    }
+  };
+  return (
+    <div class="modal" onClick={(e) => e.target === e.currentTarget && p.onClose()}>
+      <form class="card dialog" onSubmit={run}>
+        <h3>Восстановить из копии</h3>
+        <input ref={picker} type="file" hidden onChange={stash} />
+        <button type="button" onClick={pick}>{path() ? baseName(path()) : "Выбрать файл .mycelbak"}</button>
+        <input type="password" placeholder="Пароль копии" value={pw()} onInput={(e) => setPw(e.currentTarget.value)} />
+        <p class="muted small">Пространства из копии добавятся на это устройство, их пароль — пароль копии. Затем войдите в них заново по приглашению: история уже будет на месте.</p>
+        <Show when={err()}><p class="error">{err()}</p></Show>
+        <div class="actions">
+          <button class="primary" disabled={busy() || !path() || !pw()}>{busy() ? "Восстанавливаем…" : "Восстановить"}</button>
+          <button type="button" onClick={p.onClose}>Отмена</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -1084,6 +1200,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 <AppSettings />
               </Show>
               <LoginSettings space={p.space} refresh={p.refresh} />
+              <BackupSettings chats={rows().map((r) => r.id)} />
               <ModeSettings />
               <h3>{simple() ? "Данные" : `Пространство «${p.space.name}»`}</h3>
               <p class="muted">Зашифрованная база хранится здесь:</p>

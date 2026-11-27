@@ -146,6 +146,13 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Chats that have events.
+    pub fn chats(&self) -> Result<Vec<Vec<u8>>> {
+        let mut st = self.db.prepare("SELECT DISTINCT chat FROM events")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// (id, lamport) of the latest event of a chat.
     pub fn head(&self, chat: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         Ok(self
