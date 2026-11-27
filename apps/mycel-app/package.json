@@ -15,6 +15,7 @@
     "@tauri-apps/plugin-deep-link": "^2.6.3",
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-notification": "^2.8.0",
+    "@twemoji/svg": "^15.0.0",
     "blurhash": "^2.0.5",
     "lucide-solid": "^1.70.0",
     "solid-js": "^1.9.18"

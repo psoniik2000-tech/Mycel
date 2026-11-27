@@ -4,6 +4,7 @@ import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, ChevronLeft, ChevronRight, ExternalLink, Save } from "lucide-solid";
 import { Media, saveAs, useMedia } from "./media";
+import { rich } from "./rich";
 
 export type Shot = { id: string; author: string; ts: number; text: string; media: Media };
 
@@ -170,7 +171,7 @@ export function Viewer(p: { shots: Shot[]; at: string; onAt: (id: string) => voi
             </header>
             <Show when={ix() > 0}><button class="icon nav-btn prev" onClick={() => go(-1)} title="Раньше (←)"><ChevronLeft size={28} /></button></Show>
             <Show when={ix() < p.shots.length - 1}><button class="icon nav-btn next" onClick={() => go(1)} title="Позже (→)"><ChevronRight size={28} /></button></Show>
-            <Show when={err() || caption()}><footer>{err() || caption()}</footer></Show>
+            <Show when={err() || caption()}><footer>{err() || rich(caption()!)}</footer></Show>
           </>
         )}
       </Show>

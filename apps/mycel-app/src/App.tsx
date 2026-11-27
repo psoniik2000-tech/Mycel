@@ -14,7 +14,8 @@ import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
 import { Album, albums } from "./album";
 import { Shot, Viewer } from "./viewer";
-import { EMOJI, recentEmoji, useEmoji } from "./emoji";
+import { EMOJI, emojiOnly, recentEmoji, useEmoji } from "./emoji";
+import { Emoji, rich } from "./rich";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
@@ -750,6 +751,7 @@ function MailboxSettings(p: { space: Space }) {
         <p>Пустое поле выключает ящик: тогда сообщения доходят, только когда отправитель или якорь в сети.</p>
       </details>
       <p class="muted small">Mycel {ver()}</p>
+      <p class="muted small">Эмодзи: Twemoji © Twitter и участники jdecked/twemoji, лицензия CC-BY 4.0</p>
     </>
   );
 }
@@ -1466,7 +1468,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                           </small>
                         </div>
                         <div class="row-bottom">
-                          <span class="muted ellipsis">{draft() ? <><span class="draft">Черновик:</span> {draft()}</> : preview(r)}</span>
+                          <span class="muted ellipsis">{draft() ? <><span class="draft">Черновик:</span> {rich(draft()!)}</> : rich(preview(r))}</span>
                           <Show when={r.pin !== null}><Pin size={15} class="muted pin-mark" aria-label="Закреплён" /></Show>
                           <Show when={r.unread}><b class="badge" classList={{ off: r.muted }}>{r.unread}</b></Show>
                         </div>
@@ -2297,7 +2299,7 @@ function Chat(p: {
             <Pin size={16} />
             <div class="grow">
               <b>Закреплённое{pinned().length > 1 ? ` · ${(pinIx() % pinned().length) + 1} из ${pinned().length}` : ""}</b>
-              <div class="ellipsis small">{plain(m())}</div>
+              <div class="ellipsis small">{rich(plain(m()))}</div>
             </div>
             <button class="icon" title="Открепить" onClick={(e) => (e.stopPropagation(), act(invoke("pin", { id: m().id, pinned: false })))}><X size={16} /></button>
           </div>
@@ -2311,6 +2313,8 @@ function Chat(p: {
               const prev = () => grouped().list[i() - 1], next = () => grouped().list[i() + 1];
               const items = () => itemsOf(m), head = () => headOf(m);
               const status = () => Math.min(...items().map((x) => x.status));
+              // 1–3 emoji and nothing else: large, without a bubble.
+              const big = () => (items().length === 1 && !m.media && !m.reply && !m.fwd ? emojiOnly(head().text ?? "") : 0);
               return (
                 <>
                   <Show when={!prev() || dayKey(prev()!.ts) !== dayKey(m.ts)}><div class="day"><span>{dayLabel(m.ts)}</span></div></Show>
@@ -2324,7 +2328,7 @@ function Chat(p: {
                       classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: items().some((x) => x.id === hit()),
                         // Photo/video alone: edge to edge with the time over it; a video note has no bubble at all.
                         bare: items().length === 1 && !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.fwd && !m.reactions.length,
-                        note: m.media?.kind === "videonote" && !m.text && !m.reply }}
+                        note: m.media?.kind === "videonote" && !m.text && !m.reply, big: !!big() }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
                       // Lifting the finger after a hold must not click the menu's backdrop and close it.
@@ -2351,7 +2355,7 @@ function Chat(p: {
                           {(r) => (
                             <div class="quote" onClick={(e) => (e.stopPropagation(), jump(r().id))}>
                               <Show when={r().author}><b>{name(r().author)}</b></Show>
-                              <span>{r().text}</span>
+                              <span>{rich(r().text)}</span>
                             </div>
                           )}
                         </Show>
@@ -2361,7 +2365,9 @@ function Chat(p: {
                           <Album items={items()} onView={openView} />
                         </Show>
                         <Show when={head().text}>
-                          <span class="text">{re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{s}</mark> : s)) : head().text}</span>
+                          <span class="text" style={big() ? { "font-size": `${112 - 16 * big()}px` } : undefined}>
+                            {re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{rich(s)}</mark> : rich(s))) : rich(head().text)}
+                          </span>
                         </Show>
                         <Show when={joinLink(head().text ?? "")}><JoinGroup text={head().text} mine={m.mine} /></Show>
                         <Show when={reactionsOf(m).length}>
@@ -2370,7 +2376,7 @@ function Chat(p: {
                               {([e, { who, id }]) => (
                                 <button classList={{ on: who.includes(p.me) }} title={who.map(name).join(", ")}
                                   onClick={(ev) => (ev.stopPropagation(), act(invoke("react", { id, emoji: e })))}>
-                                  {e} {who.length}
+                                  {rich(e)} {who.length}
                                 </button>
                               )}
                             </For>
@@ -2413,7 +2419,7 @@ function Chat(p: {
             <div class="menu" style={{ left: `${Math.min(mn().x, innerWidth - 210)}px`, top: `${Math.min(mn().y, innerHeight - 350)}px` }}>
               <div class="emojis">
                 <For each={["👍", "❤️", "😂", "😮", "😢", "🔥"]}>
-                  {(e) => <button onClick={() => act(invoke("react", { id: head().id, emoji: e }))}>{e}</button>}
+                  {(e) => <button onClick={() => act(invoke("react", { id: head().id, emoji: e }))}><Emoji e={e} /></button>}
                 </For>
               </div>
               <button onClick={() => startReply(head())}><Reply size={16} /> Ответить</button>
@@ -2510,7 +2516,7 @@ function Chat(p: {
           {editing() ? <Pencil size={18} /> : <Reply size={18} />}
           <div class="grow" onClick={() => jump((editing() ?? reply())!.id)}>
             <b>{editing() ? "Редактирование" : `Ответ: ${name(reply()!.author)}`}</b>
-            <div class="ellipsis small">{plain((editing() ?? reply())!)}</div>
+            <div class="ellipsis small">{rich(plain((editing() ?? reply())!))}</div>
           </div>
           <button class="icon" onClick={cancelCompose} title="Отмена (Esc)"><X size={18} /></button>
         </div>
@@ -2557,11 +2563,11 @@ function Chat(p: {
               <Show when={recentEmoji().length}>
                 <button classList={{ active: emo() === -1 }} onClick={() => setEmo(-1)} title="Недавние"><Clock size={18} /></button>
               </Show>
-              <For each={EMOJI}>{([icon], i) => <button classList={{ active: emo() === i() }} onClick={() => setEmo(i())}>{icon}</button>}</For>
+              <For each={EMOJI}>{([icon], i) => <button classList={{ active: emo() === i() }} onClick={() => setEmo(i())}><Emoji e={icon} /></button>}</For>
             </div>
             <div class="emoji-grid">
               <For each={emo() === -1 ? recentEmoji() : EMOJI[emo()!][1].split(" ")}>
-                {(e) => <button onClick={() => (insertEmoji(e), input.focus())}>{e}</button>}
+                {(e) => <button onClick={() => (insertEmoji(e), input.focus())}><Emoji e={e} /></button>}
               </For>
             </div>
           </div>
