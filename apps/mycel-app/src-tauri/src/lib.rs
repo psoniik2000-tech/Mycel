@@ -1045,23 +1045,10 @@ async fn public_ip() -> R<String> {
         let t = std::time::Duration::from_secs(10);
         let mut s = std::net::TcpStream::connect_timeout(&addr, t)?;
         s.set_read_timeout(Some(t))?;
-        s.write_all(
-            b"GET / HTTP/1.0
-Host: api.ipify.org
-
-",
-        )?;
+        s.write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")?;
         let mut r = String::new();
         s.read_to_string(&mut r)?;
-        Ok(r.rsplit(
-            "
-
-",
-        )
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string())
+        Ok(r.rsplit("\r\n\r\n").next().unwrap_or("").trim().to_string())
     })
     .await
     .map_err(|e| e.to_string())?
