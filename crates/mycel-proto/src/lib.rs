@@ -140,6 +140,25 @@ pub struct BlobRef {
     pub dims: Option<(u32, u32)>,
 }
 
+/// Ties the media sent together into an album. It rides in `mime` as a parameter, so the wire
+/// format stays and older clients show each item on its own.
+const ALBUM: &str = ";album=";
+
+impl BlobRef {
+    pub fn album(&self) -> Option<&str> {
+        self.mime.split_once(ALBUM).map(|(_, id)| id)
+    }
+
+    /// The mime type without the album parameter.
+    pub fn mime_type(&self) -> &str {
+        self.mime.split_once(ALBUM).map_or(&self.mime, |(m, _)| m)
+    }
+
+    pub fn set_album(&mut self, id: &str) {
+        self.mime = format!("{}{ALBUM}{id}", self.mime_type());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Preview {
     Blurhash(String),
@@ -186,6 +205,16 @@ mod tests {
             duration_ms: None,
             dims: Some((640, 480)),
         };
+        // The album tag changes no field of the wire format and replaces an older one.
+        let mut tagged = blob.clone();
+        assert_eq!(tagged.album(), None);
+        tagged.set_album("a1");
+        tagged.set_album("b2");
+        assert_eq!(tagged.mime, "image/jpeg;album=b2");
+        assert_eq!(
+            (tagged.mime_type(), tagged.album()),
+            ("image/jpeg", Some("b2"))
+        );
         let ev = Event {
             id: [3; 32],
             author_device: [4; 32],
@@ -194,7 +223,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             body: EventBody::Media {
                 kind: MediaKind::Photo,
-                blob,
+                blob: tagged,
                 caption: None,
                 reply_to: Some([6; 32]),
             },

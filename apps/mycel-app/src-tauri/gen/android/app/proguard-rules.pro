@@ -24,3 +24,4 @@
 -keep class com.google.android.gms.internal.mlkit_** { *; }
 # Called only from Rust over JNI.
 -keep class org.mycel.app.Vault { *; }
+-keep class org.mycel.app.Save { *; }

@@ -105,7 +105,7 @@ async fn names_and_private_chat_closed_to_third() {
     .await;
     let open = a.send_text(&None, "всем", None).unwrap();
     until(|| texts(c, &None) == ["всем"]).await;
-    a.forward(open.id, &kb).unwrap();
+    a.forward(&[open.id], &kb).unwrap();
     until(|| texts(b, &ka).len() == 3).await;
     assert_eq!(texts(a, &None), ["всем"]);
 

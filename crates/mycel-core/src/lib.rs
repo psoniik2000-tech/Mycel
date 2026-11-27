@@ -18,6 +18,7 @@ use mycel_proto::{
 };
 use mycel_store::Store;
 use n0_future::StreamExt;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -963,28 +964,42 @@ impl Node {
         )
     }
 
-    /// Sends a copy of a text or media message as a new own message to chat `to`.
-    pub fn forward(&self, target: EventId, to: &Chat) -> Result<Event> {
-        let body = match self.event(&target)?.1.body {
-            EventBody::Text { text, .. } => EventBody::Text {
-                text,
-                reply_to: None,
-                mentions: vec![],
-            },
-            EventBody::Media {
-                kind,
-                blob,
-                caption,
-                ..
-            } => EventBody::Media {
-                kind,
-                blob,
-                caption,
-                reply_to: None,
-            },
-            _ => bail!("not a message"),
-        };
-        self.send_event(to, body)
+    /// Sends copies of text or media messages as new own messages to chat `to`. Albums among them
+    /// get new ids, so a copy never joins the original.
+    pub fn forward(&self, targets: &[EventId], to: &Chat) -> Result<()> {
+        let mut albums = HashMap::new();
+        for target in targets {
+            let body = match self.event(target)?.1.body {
+                EventBody::Text { text, .. } => EventBody::Text {
+                    text,
+                    reply_to: None,
+                    mentions: vec![],
+                },
+                EventBody::Media {
+                    kind,
+                    mut blob,
+                    caption,
+                    ..
+                } => {
+                    if let Some(old) = blob.album().map(str::to_owned) {
+                        let id = match albums.entry(old) {
+                            Entry::Occupied(e) => e.into_mut(),
+                            Entry::Vacant(e) => e.insert(new_album()?),
+                        };
+                        blob.set_album(id);
+                    }
+                    EventBody::Media {
+                        kind,
+                        blob,
+                        caption,
+                        reply_to: None,
+                    }
+                }
+                _ => bail!("not a message"),
+            };
+            self.send_event(to, body)?;
+        }
+        Ok(())
     }
 
     /// Erases events with their decrypted media and blobs from this device.
@@ -1150,6 +1165,17 @@ impl Node {
         Ok(n)
     }
 
+    /// Size of a file that can be sent.
+    pub fn check_size(&self, src: &Path) -> Result<u64> {
+        let size = std::fs::metadata(src)?.len();
+        ensure!(
+            size <= self.max_blob,
+            "file is over {} bytes",
+            self.max_blob
+        );
+        Ok(size)
+    }
+
     /// Encrypts `src`, stores the ciphertext as a blob and sends a Media event (§8.1).
     /// `meta` carries mime, name, preview, duration and dims; hash, size and key are filled here.
     pub async fn send_media(
@@ -1160,12 +1186,7 @@ impl Node {
         mut meta: BlobRef,
         caption: Option<String>,
     ) -> Result<Event> {
-        let size = std::fs::metadata(src)?.len();
-        ensure!(
-            size <= self.max_blob,
-            "file is over {} bytes",
-            self.max_blob
-        );
+        let size = self.check_size(src)?;
         let tmp = self.temp()?;
         let (s, t) = (src.to_owned(), tmp.clone());
         let key = tokio::task::spawn_blocking(move || mycel_media::encrypt(&s, &t)).await??;
@@ -1997,6 +2018,13 @@ fn is_incoming(b: &EventBody) -> bool {
                 ..
             }
         )
+}
+
+/// A fresh album id for `BlobRef::set_album`.
+pub fn new_album() -> Result<String> {
+    let mut id = [0; 8];
+    getrandom::fill(&mut id)?;
+    Ok(hex(&id))
 }
 
 /// The media kind and blob of a Media event.

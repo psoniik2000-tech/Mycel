@@ -326,7 +326,20 @@ button.del { color: var(--danger); }
 .photo .over { position: absolute; inset: 0; display: grid; place-items: center; }
 .photo .over .dl { background: rgb(0 0 0 / 45%); color: #fff; border-radius: 999px; padding: 4px 10px 4px 4px; }
 .photo .over .muted { color: #fff; }
-.video { display: block; width: 320px; max-width: 100%; border-radius: 10px; background: #000; }
+/* A video in the chat: its first frame; a click opens the viewer. */
+button.video { position: relative; display: grid; width: 320px; max-width: 100%; min-height: 120px; padding: 0; border: 0; border-radius: 10px; overflow: hidden; background: #000; }
+button.video:hover:not(:disabled) { background: #000; }
+button.video video { display: block; width: 100%; max-height: 420px; pointer-events: none; }
+.playbtn { position: absolute; inset: 0; margin: auto; width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; background: rgb(0 0 0 / 50%); color: #fff; }
+/* Albums: rows of tiles on a 12-column grid. */
+.album { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 2px; width: 320px; max-width: 100%; margin: 2px 0; border-radius: 10px; overflow: hidden; }
+.album > div { position: relative; overflow: hidden; background: var(--hover); }
+.album .media { position: absolute; inset: 0; margin: 0; max-width: none; }
+.album .photo, .album button.video { width: 100%; height: 100%; min-height: 0; border-radius: 0; }
+.album button.video video { position: absolute; inset: 0; height: 100%; max-height: none; object-fit: cover; }
+.album .error { position: absolute; inset: auto 0 0; margin: 0; padding: 2px 4px; background: rgb(0 0 0 / 65%); }
+.album .dl .muted { display: none; }
+.album + .meta { margin-top: 2px; }
 .file { display: flex; gap: 10px; align-items: center; min-width: 220px; }
 .dl { display: flex; align-items: center; gap: 8px; }
 .ring { width: 32px; height: 32px; border-radius: 50%; background: conic-gradient(var(--accent) calc(var(--p) * 1%), var(--line) 0); }
@@ -343,8 +356,28 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .circle.empty { display: grid; place-items: center; background: var(--hover); }
 .circle.live { position: absolute; right: 24px; bottom: 80px; width: 240px; height: 240px; box-shadow: 0 4px 24px rgb(0 0 0 / 35%); z-index: 5; transform: scaleX(-1); }
 .chat { position: relative; }
-.viewer { position: fixed; inset: 0; background: rgb(0 0 0 / 88%); display: grid; place-items: center; z-index: 50; cursor: zoom-out; }
-.viewer img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
+/* Full-screen viewer: always dark; below calls (z 50). */
+.viewer { position: fixed; inset: 0; z-index: 45; color: #fff; user-select: none; -webkit-touch-callout: none; }
+.stage { position: absolute; inset: 0; overflow: hidden; touch-action: none; }
+.slide { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: transform .22s ease-out; }
+.slide img, .slide video { max-width: 100%; max-height: 100%; min-height: 0; object-fit: contain; }
+.slide img { -webkit-user-drag: none; transition: transform .15s; }
+.slide.moving, .slide img.moving { transition: none; }
+.slide .muted { color: #fff; }
+.viewer header, .viewer footer { position: absolute; left: 0; right: 0; background: rgb(0 0 0 / 45%); }
+.viewer header { top: 0; display: flex; align-items: center; gap: 10px; padding: max(6px, env(safe-area-inset-top)) 8px 6px; }
+.viewer header .grow { display: flex; flex-direction: column; min-width: 0; }
+.viewer header small { opacity: .7; }
+.viewer header span { white-space: nowrap; font-size: 14px; }
+.viewer footer { bottom: 0; max-height: 30%; overflow-y: auto; padding: 10px 16px max(10px, env(safe-area-inset-bottom)); text-align: center; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A video's controls sit at the bottom: the caption stays clear of them. */
+.viewer:has(.current video) footer { bottom: 70px; }
+.viewer button.icon { color: #fff; background: none; border: 0; }
+.viewer button.icon:hover:not(:disabled) { background: rgb(255 255 255 / 15%); }
+.viewer button.nav-btn { position: absolute; top: calc(50% - 24px); background: rgb(0 0 0 / 35%); border-radius: 50%; }
+.viewer .prev { left: 10px; }
+.viewer .next { right: 10px; }
+@media (hover: none) { .viewer button.nav-btn { display: none; } }
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
 .recording { display: flex; align-items: center; align-self: stretch; gap: 10px; padding: 0 44px 0 8px; font-variant-numeric: tabular-nums; }
 .recording.cancel { color: var(--danger); }
@@ -426,8 +459,8 @@ label.check input { width: auto; }
 .anchor-status { display: grid; gap: 4px; padding: 10px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .anchor-status code { word-break: break-all; }
 .send-previews { display: flex; flex-wrap: wrap; gap: 6px; max-height: 50vh; overflow: auto; }
-.send-previews img { max-width: 100%; max-height: 240px; border-radius: 8px; object-fit: cover; }
-.send-previews:has(img + img) img { width: 110px; height: 110px; }
+.send-previews img, .send-previews video { max-width: 100%; max-height: 240px; border-radius: 8px; object-fit: cover; }
+.send-previews:has(> :is(img, video) ~ :is(img, video)) :is(img, video) { width: 110px; height: 110px; }
 .file-chip { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; max-width: 100%; }
 .relay-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; min-width: 0; }
 .relay-row input { min-width: 0; }
