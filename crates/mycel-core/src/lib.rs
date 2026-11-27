@@ -2912,6 +2912,7 @@ mod tests {
         b.close().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn simultaneous_dms_converge_on_one_sending_group() {
         let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
         let opts = Opts::default();
