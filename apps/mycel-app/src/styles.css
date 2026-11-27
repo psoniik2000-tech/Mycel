@@ -151,6 +151,12 @@ input, textarea {
 .chat-row { min-height: 72px; padding: 9px 12px 9px 10px; gap: 12px; }
 .chat-row .avatar { width: 54px; height: 54px; font-size: 18px; }
 .chat-row.active { background: var(--hover); }
+.chat-row { position: relative; touch-action: pan-y; user-select: none; -webkit-touch-callout: none; }
+/* Sits right of the row, so it slides into view with the swipe. */
+.swipe-archive { position: absolute; left: 100%; width: 70px; display: flex; justify-content: center; color: var(--accent); }
+.avatar.archive { background: color-mix(in srgb, var(--muted) 70%, transparent); color: var(--panel); }
+.row-bottom .pin-mark { flex: none; margin-left: auto; }
+.pin-mark + .badge { margin-left: -2px; }
 .row-top, .row-bottom { display: flex; align-items: center; gap: 4px; }
 .row-top b { font-size: 16px; font-weight: 600; }
 .row-top > svg { flex: none; }
