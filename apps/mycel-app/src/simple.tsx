@@ -1,5 +1,5 @@
 // "Simple messenger" mode (DESIGN.md §4.2): a hidden space plus pairwise contacts, shown as a contact list. A UI setting of this device.
-import { createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 import { Hash, MessageCircle } from "lucide-solid";
 import logo from "../app-icon.svg";
 
@@ -28,17 +28,19 @@ export const setMode = (m: Mode | null) => {
 export const SIMPLE_NAME = "Личные чаты";
 
 export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void; onRestore: () => void }) {
+  const [other, setOther] = createSignal(false);
   return (
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
         <h1>Mycel</h1>
-        <p class="muted">Как будете пользоваться? Поменять можно в Настройках</p>
-        <button class="primary" onClick={() => (setMode("simple"), p.onSimple())}><MessageCircle size={18} /> Как обычный мессенджер</button>
-        <p class="muted small">Контакты и личные чаты</p>
-        <button onClick={() => (setMode("spaces"), p.onSpaces())}><Hash size={18} /> Пространства</button>
-        <p class="muted small">Сообщества с общим чатом, администратором и приглашениями</p>
-        <button class="link" onClick={p.onRestore}>Восстановить из копии</button>
+        <p class="muted">Мессенджер со сквозным шифрованием: регистрация по имени пользователя, писать можно любому по @имени</p>
+        <button class="primary" onClick={() => (setMode("simple"), p.onSimple())}><MessageCircle size={18} /> Начать</button>
+        <Show when={other()} fallback={<button class="link" onClick={() => setOther(true)}>Другие способы</button>}>
+          <button onClick={() => (setMode("spaces"), p.onSpaces())}><Hash size={18} /> Пространства и свой сервер</button>
+          <p class="muted small">Сообщества с общим чатом, администратором и приглашениями, свой якорь вместо главного сервера</p>
+          <button class="link" onClick={p.onRestore}>Восстановить из копии</button>
+        </Show>
       </div>
     </div>
   );

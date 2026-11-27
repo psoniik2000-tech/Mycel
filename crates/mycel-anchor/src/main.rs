@@ -11,7 +11,8 @@ const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] 
                     <init | id | members | chat | invite | join <link> | serve <relay-url>>
   init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat
   serve http://PUBLIC-IP:PORT: run 24/7 as an anchor: an iroh-relay on PORT (TCP) for the members,
-        store-and-forward for offline members, events kept --keep-days (default 30)
+        store-and-forward for offline members, events kept --keep-days (default 30),
+        and the username directory (mycel/dir/1, data in DIR)
   --n0-relay: also use the public n0 relays (off by default)";
 
 #[tokio::main]
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
         ["serve", url] => {
             opts.own_relay = Some(url.to_string());
             opts.keep_blobs = true;
-            Some(mycel_core::spawn_relay(url).await?)
+            Some(mycel_core::spawn_anchor(url, &dir).await?)
         }
         _ => None,
     };
@@ -70,6 +71,9 @@ async fn main() -> Result<()> {
             node.admin()
                 .context("join a space first: mycel-anchor join <link>")?;
             println!("anchor up, relay {url}, keeping {keep_days} days");
+            if let Some(id) = _relay.as_ref().and_then(|r| r.dir_id()) {
+                println!("main server (usernames): {url}#{id}");
+            }
             // The anchor reaches its own relay through the public URL, like everyone else.
             if !node.relay_connected().await {
                 eprintln!(

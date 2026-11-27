@@ -11,6 +11,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
+mod directory;
 mod spaces;
 mod vault;
 
@@ -852,7 +853,7 @@ async fn unlock(
             #[cfg(windows)]
             allow_firewall(port_of(u));
             (
-                Some(mycel_core::spawn_relay(u).await.map_err(err)?),
+                Some(mycel_core::spawn_anchor(u, &root).await.map_err(err)?),
                 upnp(port_of(u), true).await.is_ok(),
             )
         }
@@ -2100,6 +2101,12 @@ pub fn run() {
             allow_preview,
             create_space,
             join,
+            directory::dir_register,
+            directory::dir_search,
+            directory::dir_add,
+            directory::dir_name_of,
+            directory::create_group,
+            directory::join_group,
             invite,
             contact_invite,
             device_invite,
