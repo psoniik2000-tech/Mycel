@@ -42,6 +42,8 @@ pub const JOIN_BAD_LINK: &str = "not a mycel invite link";
 pub const JOIN_UNREACHABLE: &str = "inviter unreachable";
 pub const JOIN_USED: &str = "invite already used or unknown";
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+/// How long a used invite answers its own device again (a joiner that lost the answer), ms.
+const INVITE_RETRY: u64 = 24 * 3_600_000;
 /// Periodic address exchange and catch-up with every known peer.
 const RESYNC: std::time::Duration = std::time::Duration::from_secs(60);
 /// The mailbox is pulled this often while an own message awaits its first receipt (receipts
@@ -2410,11 +2412,20 @@ impl Node {
             return Ok(postcard::to_allocvec(&JoinResp { welcome, peers })?);
         }
         ensure!(st.admin()? == self.device_id(), "not the admin");
-        if !st
-            .store
-            .take_meta(&format!("invite:{}", hex(&req.secret)))?
-        {
-            bail!("unknown or used invite");
+        // `invite:` is empty while unused, else holds the joiner's device, its answer and the time:
+        // that same device may ask again within INVITE_RETRY (a dropped last step).
+        let key = format!("invite:{}", hex(&req.secret));
+        match st.store.meta(&key)? {
+            None => bail!("unknown or used invite"),
+            Some(v) if !v.is_empty() => {
+                let (at, dev, resp): (u64, [u8; 32], Vec<u8>) = postcard::from_bytes(&v)?;
+                ensure!(
+                    dev == *from.as_bytes() && now_ms()? < at + INVITE_RETRY,
+                    "unknown or used invite"
+                );
+                return Ok(resp);
+            }
+            Some(_) => {}
         }
         let gid = st.group()?;
         let epoch = st.mls.epoch(&gid);
@@ -2436,10 +2447,15 @@ impl Node {
         self.post_box(&env, false, None);
         self.broadcast(peers.clone(), SyncMsg::Envs(vec![env]));
         self.broadcast(peers, SyncMsg::Peers(vec![req.addr]));
-        Ok(postcard::to_allocvec(&JoinResp {
+        let resp = postcard::to_allocvec(&JoinResp {
             welcome,
             peers: list,
-        })?)
+        })?;
+        st.store.set_meta(
+            &key,
+            &postcard::to_allocvec(&(now_ms()?, *from.as_bytes(), resp.clone()))?,
+        )?;
+        Ok(resp)
     }
 }
 
@@ -2667,6 +2683,113 @@ mod tests {
         assert_eq!(b.dms().unwrap(), vec![[7; 32]]);
         assert_eq!(b.history(&Some([7; 32])).unwrap(), vec![dm]);
         b.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simultaneous_dms_converge_on_one_sending_group() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let opts = Opts::default();
+        let (a, _ra) = Node::open(dirs[0].path(), "pa", &opts).await.unwrap();
+        let (b, _rb) = Node::open(dirs[1].path(), "pb", &opts).await.unwrap();
+        a.create_space().unwrap();
+        b.join(&a.invite().await.unwrap()).await.unwrap();
+        let (ida, idb) = (a.device_id(), b.device_id());
+        a.set_profile("A", "", 1).unwrap();
+        b.set_profile("B", "", 2).unwrap();
+        for _ in 0..200 {
+            if a.profiles().unwrap().contains_key(&idb) && b.profiles().unwrap().contains_key(&ida)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Both sides create their 1:1 group before either Welcome arrives (what open_dm does
+        // when the two open a chat at once), then each applies the other's Welcome.
+        let kp = |n: &Node| n.st.lock().unwrap().mls.key_package(false).unwrap();
+        let (kp_a, kp_b) = (kp(&a), kp(&b));
+        let open = |n: &Node, kp: Vec<u8>, peer: [u8; 32]| {
+            let mut st = n.st.lock().unwrap();
+            let mut gid = [0u8; 32];
+            getrandom::fill(&mut gid).unwrap();
+            st.mls.create_group(&gid).unwrap();
+            let (_, _, welcome) = st.mls.add_members(&gid, &[kp]).unwrap();
+            st.add_dm(gid, peer).unwrap();
+            st.save_mls().unwrap();
+            st.envelope(gid, welcome, 0).unwrap()
+        };
+        let w_a = open(&a, kp_b, idb);
+        let w_b = open(&b, kp_a, ida);
+        b.st.lock().unwrap().receive(&w_a, idb).unwrap();
+        a.st.lock().unwrap().receive(&w_b, ida).unwrap();
+        let gid = |n: &Node, p: [u8; 32]| n.st.lock().unwrap().gid(&Some(p)).unwrap();
+        let groups = |n: &Node, p: [u8; 32]| {
+            n.st.lock()
+                .unwrap()
+                .dms()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, q)| *q == p)
+                .count()
+        };
+        assert_eq!((groups(&a, idb), groups(&b, ida)), (2, 2));
+        // Both send into the smaller group id; the other group is only read.
+        let smaller = [w_a.group_id, w_b.group_id].into_iter().min().unwrap();
+        assert_eq!(gid(&a, idb), smaller);
+        assert_eq!(gid(&b, ida), smaller);
+        let ev = a.send_text(&Some(idb), "hi", None).unwrap();
+        let ev2 = b.send_text(&Some(ida), "там", None).unwrap();
+        for _ in 0..200 {
+            if b.history(&Some(ida)).unwrap().contains(&ev)
+                && a.history(&Some(idb)).unwrap().contains(&ev2)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(b.history(&Some(ida)).unwrap().contains(&ev));
+        assert!(a.history(&Some(idb)).unwrap().contains(&ev2));
+        a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invite_answer_is_repeated_for_the_same_device_only() {
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let opts = Opts::default();
+        let (a, _ra) = Node::open(dirs[0].path(), "pa", &opts).await.unwrap();
+        let (b, _rb) = Node::open(dirs[1].path(), "pb", &opts).await.unwrap();
+        let (c, _rc) = Node::open(dirs[2].path(), "pc", &opts).await.unwrap();
+        a.create_space().unwrap();
+        let link = a.invite().await.unwrap();
+        let b32 = link.strip_prefix(LINK).unwrap();
+        let (_, secret, _, _): ([u8; 32], [u8; 16], String, Vec<String>) =
+            postcard::from_bytes(&BASE32_NOPAD.decode(b32.as_bytes()).unwrap()).unwrap();
+        let req = |n: &Node| {
+            let key_package = n.st.lock().unwrap().mls.key_package(false).unwrap();
+            let addr = n.my_addr().unwrap();
+            postcard::to_allocvec(&JoinReq {
+                secret,
+                key_package,
+                addr,
+            })
+            .unwrap()
+        };
+        let id = |n: &Node| EndpointId::from_bytes(&n.device_id()).unwrap();
+
+        let first = a.accept_join(id(&b), &req(&b)).unwrap();
+        assert!(!first.is_empty());
+        // The joiner lost the answer and asks again with a new KeyPackage: same Welcome back.
+        let again = a.accept_join(id(&b), &req(&b)).unwrap();
+        assert_eq!(first, again);
+        // Another device with the same link is refused.
+        assert!(a.accept_join(id(&c), &req(&c)).is_err());
+        a.close().await;
+        b.close().await;
+        c.close().await;
     }
 
     #[tokio::test]
