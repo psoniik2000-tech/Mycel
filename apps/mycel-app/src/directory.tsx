@@ -1,7 +1,7 @@
 // Usernames on the main server and Telegram-style groups (DESIGN.md §4.6).
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { AtSign, Check, Hash, LogIn, Users } from "lucide-solid";
+import { AtSign, Camera, Check, CircleUser, Hash, LogIn, Plus, QrCode, Users } from "lucide-solid";
 
 /** The main server: an anchor that also keeps the username directory. `url#id` once pinned. */
 export const DEFAULT_SERVER = "http://5.130.50.199:3340";
@@ -44,8 +44,50 @@ export function Username(p: { id: string; me?: boolean }) {
   return <Show when={u()}> · @{u()}</Show>;
 }
 
+/** Another device of an account: a `mycel://device/` link (QR or pasted) brings the account,
+ *  its name, chats and history; the @username is the account's (§4.4, §4.6). */
+function DeviceLogin(p: { space: string; onDone: () => void; onBack: () => void; scan?: () => Promise<string> }) {
+  const [link, setLink] = createSignal("");
+  const [err, setErr] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const go = async (e: Event) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr("");
+    try {
+      await invoke("join", { link: link().trim() });
+      const u = await invoke<string | null>("dir_name_of", { server: server(), id: "" }).catch(() => null);
+      if (u) localStorage.setItem(userKey(p.space), u), names.set("", Promise.resolve(u));
+      p.onDone();
+    } catch (e) {
+      setErr(errText(e));
+    }
+    setBusy(false);
+  };
+  return (
+    <form class="card intro" onSubmit={go}>
+      <h1>Вход по QR или ссылке</h1>
+      <p class="muted">На устройстве, где вы уже вошли: Настройки → Устройства → Добавить устройство. Отсканируйте QR или вставьте ссылку</p>
+      <textarea rows={3} placeholder="mycel://device/…" value={link()} onInput={(e) => setLink(e.currentTarget.value)} autofocus />
+      <Show when={p.scan}>
+        <button type="button" disabled={busy()} onClick={async () => {
+          try {
+            setLink(await p.scan!());
+          } catch (e) {
+            if (errText(e) !== "cancelled") setErr(errText(e));
+          }
+        }}><Camera size={18} /> Сканировать QR</button>
+      </Show>
+      <Show when={err()}><p class="error">{err()}</p></Show>
+      <button class="primary" disabled={busy() || !link().trim()}>{busy() ? "Входим… Mycel на том устройстве должен быть открыт" : "Войти"}</button>
+      <button type="button" class="link" disabled={busy()} onClick={p.onBack}>Назад</button>
+    </form>
+  );
+}
+
 /** First start: name and @username, a personal space made silently. `onOther`: the old ways. */
-export function QuickStart(p: { space: string; onDone: () => void; onOther: () => void; color: number }) {
+export function QuickStart(p: { space: string; onDone: () => void; onOther: () => void; color: number; scan?: () => Promise<string> }) {
+  const [device, setDevice] = createSignal(false);
   const [name, setName] = createSignal("");
   const [user, setUser] = createSignal("");
   const [err, setErr] = createSignal("");
@@ -69,6 +111,7 @@ export function QuickStart(p: { space: string; onDone: () => void; onOther: () =
     setBusy(false);
   };
   return (
+    <Show when={!device()} fallback={<DeviceLogin space={p.space} onDone={p.onDone} onBack={() => setDevice(false)} scan={p.scan} />}>
     <form class="card intro" onSubmit={go}>
       <h1>Добро пожаловать</h1>
       <p class="muted">Имя видят ваши собеседники, а по имени пользователя вас можно найти в поиске</p>
@@ -81,9 +124,11 @@ export function QuickStart(p: { space: string; onDone: () => void; onOther: () =
         <button type="button" onClick={p.onDone}>Продолжить без имени пользователя</button>
       </Show>
       <Show when={!made()}>
+        <button type="button" onClick={() => setDevice(true)}><QrCode size={18} /> Войти по QR или ссылке</button>
         <button type="button" class="link" onClick={p.onOther}>Другие способы</button>
       </Show>
     </form>
+    </Show>
   );
 }
 
@@ -174,7 +219,11 @@ const spacesChanged = () => window.dispatchEvent(new Event("mycel-spaces"));
 /** Groups (other spaces) as rows in the chat list: a tap switches to one. */
 export function SpaceRows(p: { current: string; personal: string; onEnter: (id: string) => void }) {
   const [list, setList] = createSignal<SpaceRow[]>([]);
-  const load = () => invoke<{ spaces: SpaceRow[] }>("status").then((s) => setList(s.spaces.filter((x) => x.id !== p.current)));
+  // Other accounts (personal spaces) are switched in Settings, not from the personal chat list.
+  const load = () => invoke<{ spaces: SpaceRow[] }>("status").then((s) => {
+    const inPersonal = s.spaces.some((x) => x.id === p.current && x.name === p.personal);
+    setList(s.spaces.filter((x) => x.id !== p.current && !(inPersonal && x.name === p.personal)));
+  });
   onMount(() => {
     load();
     window.addEventListener("mycel-spaces", load);
@@ -192,6 +241,36 @@ export function SpaceRows(p: { current: string; personal: string; onEnter: (id: 
         </button>
       )}
     </For>
+  );
+}
+
+/** Settings top, like Telegram: this device's accounts (personal spaces, each with its own
+ *  @username and chats), a tap switches; «Добавить аккаунт» starts a new one. */
+// shortcut: only the open account runs, others catch up from the mailbox when opened; groups are listed for every account.
+export function Accounts(p: { current: string; personal: string; myName?: string | null; onEnter: (id: string) => void; onAdd: () => void }) {
+  const [list, setList] = createSignal<SpaceRow[]>([]);
+  createEffect(() => p.myName && localStorage.setItem(`acct_name:${p.current}`, p.myName));
+  onMount(() => invoke<{ spaces: SpaceRow[] }>("status").then((s) => setList(s.spaces.filter((x) => x.name === p.personal))));
+  const label = (id: string, i: number) => localStorage.getItem(`acct_name:${id}`) || `Аккаунт ${i + 1}`;
+  return (
+    <div class="list">
+      <For each={list()}>
+        {(a, i) => (
+          <button class="row item" disabled={a.id === p.current} onClick={() => p.onEnter(a.id)}>
+            <CircleUser size={22} />
+            <div class="grow">
+              <div>{label(a.id, i())}</div>
+              <div class="muted small ellipsis">{localStorage.getItem(userKey(a.id)) ? `@${localStorage.getItem(userKey(a.id))}` : "без имени пользователя"}</div>
+            </div>
+            <Show when={a.id === p.current}><Check size={18} /></Show>
+          </button>
+        )}
+      </For>
+      <button class="row item" onClick={p.onAdd}>
+        <Plus size={22} />
+        <div class="grow"><div>Добавить аккаунт</div></div>
+      </button>
+    </div>
   );
 }
 

@@ -31,6 +31,18 @@ pub struct DirRecord {
     /// Unix ms; an update must be newer.
     pub ts: u64,
     pub sig: Vec<u8>,
+    /// Account that owns the name (§4.4: its first device); zero = `key` (older records).
+    #[serde(default)]
+    pub account: [u8; 32],
+    /// The account's signature over [`device_cert_msg`] of `key`; empty when `key` is the account.
+    #[serde(default)]
+    pub cert: Vec<u8>,
+}
+
+/// What an account root signs to let a linked device update the account's username.
+// shortcut: an unlinked device keeps a valid cert; add a revocation list if that matters.
+pub(crate) fn device_cert_msg(dev: &[u8; 32]) -> Vec<u8> {
+    postcard::to_allocvec(&(b"mycel-device", dev)).expect("cert serializes")
 }
 
 impl DirRecord {
@@ -44,6 +56,15 @@ impl DirRecord {
             self.ts,
         ))
         .expect("record serializes")
+    }
+
+    /// The account that owns this name.
+    pub fn owner(&self) -> [u8; 32] {
+        if self.account == [0; 32] {
+            self.key
+        } else {
+            self.account
+        }
     }
 
     pub fn sign(mut self, key: &SecretKey) -> Self {
@@ -64,6 +85,11 @@ impl DirRecord {
             "bad signature"
         );
         ensure!(link_owner(&self.link)? == self.key, "link of another key");
+        ensure!(
+            self.owner() == self.key
+                || verify_bytes(&self.account, &device_cert_msg(&self.key), &self.cert),
+            "device of another account"
+        );
         Ok(())
     }
 }
@@ -114,7 +140,8 @@ pub const DIR_TAKEN: &str = "username taken";
 struct Db {
     file: PathBuf,
     names: BTreeMap<String, DirRecord>,
-    by_key: HashMap<[u8; 32], String>,
+    /// Account → its username.
+    by_acct: HashMap<[u8; 32], String>,
 }
 
 impl Db {
@@ -124,11 +151,11 @@ impl Db {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
-        let by_key = names.iter().map(|(n, r)| (r.key, n.clone())).collect();
+        let by_acct = names.iter().map(|(n, r)| (r.owner(), n.clone())).collect();
         Ok(Self {
             file,
             names,
-            by_key,
+            by_acct,
         })
     }
 
@@ -162,20 +189,27 @@ impl Db {
                         .collect(),
                 )
             }
-            DirReq::NameOf(k) => {
-                DirResp::Found(self.by_key.get(&k).and_then(|n| self.names.get(n).cloned()))
-            }
+            // An account, or the device that wrote the record.
+            DirReq::NameOf(k) => DirResp::Found(
+                self.by_acct
+                    .get(&k)
+                    .and_then(|n| self.names.get(n))
+                    .or_else(|| self.names.values().find(|r| r.key == k))
+                    .cloned(),
+            ),
         }
     }
 
-    /// First come first served; the owner key may update its record or move to a free name.
+    /// First come first served; any device of the owner account may update its record or move
+    /// it to a free name.
     fn register(&mut self, r: DirRecord) -> Result<()> {
         r.check()?;
+        let acct = r.owner();
         if let Some(old) = self.names.get(&r.username) {
-            ensure!(old.key == r.key, DIR_TAKEN);
+            ensure!(old.owner() == acct, DIR_TAKEN);
             ensure!(r.ts > old.ts, "stale record");
         }
-        if let Some(prev) = self.by_key.get(&r.key)
+        if let Some(prev) = self.by_acct.get(&acct)
             && *prev != r.username
         {
             ensure!(
@@ -184,7 +218,7 @@ impl Db {
             );
             self.names.remove(prev);
         }
-        self.by_key.insert(r.key, r.username.clone());
+        self.by_acct.insert(acct, r.username.clone());
         self.names.insert(r.username.clone(), r);
         self.save()
     }
@@ -347,12 +381,18 @@ impl Node {
     /// contact link. Returns the pinned server address.
     pub async fn dir_register(&self, server: &str, name: &str) -> Result<String> {
         let username = username(name).context("username: 5–32 of a-z, 0-9, _")?;
-        let me = self.device_id();
+        let (me, account) = (self.device_id(), self.account());
         let display = self
             .profiles()?
             .get(&me)
             .map(|p| p.0.clone())
             .unwrap_or_default();
+        let cert = if account == me {
+            vec![]
+        } else {
+            let c = self.st.lock().unwrap().store.meta("devcert")?;
+            c.context("this device was linked by an older app: link it again to use the username")?
+        };
         let rec = DirRecord {
             username,
             name: display,
@@ -360,6 +400,8 @@ impl Node {
             key: me,
             ts: crate::now_ms()?,
             sig: vec![],
+            account,
+            cert,
         }
         .sign(self.net.secret_key());
         Ok(self.dir_call(server, &DirReq::Register(rec)).await?.0)
@@ -399,12 +441,16 @@ impl Node {
             .await?
             .context("no such username")?;
         rec.check()?;
-        let peer = self.account_of(&rec.key);
+        let (peer, owner) = (self.account_of(&rec.key), rec.owner());
         ensure!(
-            peer != self.account() && rec.key != self.device_id(),
+            peer != self.account() && owner != self.account() && rec.key != self.device_id(),
             "this is you"
         );
-        if self.st.lock().unwrap().gid(&Some(peer)).is_err() {
+        let known = {
+            let st = self.st.lock().unwrap();
+            st.gid(&Some(peer)).is_ok() || st.gid(&Some(owner)).is_ok()
+        };
+        if !known {
             self.join(&rec.link).await?;
         }
         Ok(self.account_of(&rec.key))
@@ -430,6 +476,8 @@ mod tests {
             key: [0; 32],
             ts,
             sig: vec![],
+            account: [0; 32],
+            cert: vec![],
         }
         .sign(key)
     }

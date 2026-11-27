@@ -83,11 +83,13 @@ pub type Profile = (String, String, u8, Vec<u8>);
 type Accounts = HashMap<[u8; 32], (u64, [u8; 32], Vec<[u8; 32]>)>;
 
 /// What a linked device gets from the account root in its join answer: the space Welcome,
-/// (group, partner, is a contact group, Welcome) of every 1:1 group, and the history.
+/// (group, partner, is a contact group, Welcome) of every 1:1 group, the history and the root's
+/// device cert for the username (§4.6; absent from older roots).
 type LinkPack = (
     Vec<u8>,
     Vec<([u8; 32], [u8; 32], bool, Vec<u8>)>,
     Vec<(Vec<u8>, Event)>,
+    Vec<u8>,
 );
 /// Largest history a linked device gets at once (the join answer is at most 16 MiB).
 const LINK_HISTORY: usize = 8 << 20;
@@ -998,7 +1000,8 @@ impl Node {
             l.push(self.my_addr()?);
             l
         };
-        let pack: LinkPack = (space_w, groups, history);
+        let cert = mycel_crypto::sign_bytes(self.net.secret_key(), &dir::device_cert_msg(&dev));
+        let pack: LinkPack = (space_w, groups, history, cert);
         Ok(postcard::to_allocvec(&JoinResp {
             welcome: postcard::to_allocvec(&pack)?,
             peers,
@@ -1025,13 +1028,19 @@ impl Node {
         }
         // Last resort: one KeyPackage joins every group.
         let resp = self.ask_join(to, secret, true).await?;
-        let (space_w, groups, history): LinkPack = postcard::from_bytes(&resp.welcome)?;
+        let (space_w, groups, history, cert): LinkPack = postcard::from_bytes(&resp.welcome)
+            .or_else(|_| {
+                postcard::from_bytes(&resp.welcome).map(|(w, g, h): (_, _, _)| (w, g, h, vec![]))
+            })?;
         {
             let mut st = self.st.lock().unwrap();
             let gid = st.mls.join(&space_w)?;
             st.store.set_meta("group", &gid)?;
             st.store.set_meta("admin", &root)?;
             st.store.set_meta("account", &root)?;
+            if !cert.is_empty() {
+                st.store.set_meta("devcert", &cert)?;
+            }
             for (g, partner, contact, w) in groups {
                 ensure!(st.mls.join(&w)? == g, "welcome for another group");
                 if contact {
