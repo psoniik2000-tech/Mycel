@@ -47,9 +47,9 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     pin: pinned.includes(id) ? pinned.indexOf(id) : null, archived: archived.has(id) }));
   const calls = [{ id: "c1", video: false, author: MAMA, chat: MAMA, mine: false, ts: now - day, duration_ms: 320_000, missed: false, active: false },
     { id: "c2", video: true, author: OLEG, chat: OLEG, mine: false, ts: now - 2 * day, duration_ms: null, missed: true, active: false }];
-  const space = { id: "s1", name: "Личные чаты", remembered: true };
+  const spaces = [{ id: "s1", name: "Личные чаты", remembered: true }, { id: "s2", name: "Пространство 3", remembered: true }];
   const handlers: Record<string, (a: any) => unknown> = {
-    status: () => ({ spaces: [space], last: "s1", current: "s1", dir: "C:\\Users\\me\\AppData\\Roaming\\mycel\\s1", in_space: true }),
+    status: () => ({ spaces, last: "s1", current: "s1", dir: "C:\\Users\\me\\AppData\\Roaming\\mycel\\s1", in_space: true }),
     members: () => members,
     chats,
     history: (a) => hist[a.chat] ?? [],
@@ -62,7 +62,7 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     send: (a) => (hist[a.chat].push(m(ME, a.text, Date.now(), a.replyTo ? { reply: { id: a.replyTo, author: ANNA, text: "…" } } : {})), "x"),
     react: () => null,
     safety_code: () => ({ link: "mycel://safety/123", svg: "" }),
-    upnp_ok: () => false,
+    anchor_port_free: () => null,
     autostart: () => false,
     home_relay: () => null,
     "plugin:deep-link|get_current": () => null,

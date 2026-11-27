@@ -1,7 +1,9 @@
 // Usernames on the main server and Telegram-style groups (DESIGN.md §4.6).
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { AtSign, Check, Hash, LogIn, Users } from "lucide-solid";
+import { AtSign, Check, LogIn, MessageCircle, UserPlus, Users, X } from "lucide-solid";
+import { rich } from "./rich";
+import { groupTitle } from "./simple";
 
 /** The main server: an anchor that also keeps the username directory. `url#id` once pinned. */
 export const DEFAULT_SERVER = "http://5.130.50.199:3340";
@@ -87,6 +89,26 @@ export function QuickStart(p: { space: string; onDone: () => void; onOther: () =
   );
 }
 
+/** Chat list: asks an account without @username to set one; the cross closes it for good. */
+export function UsernameBanner(p: { onOpen: () => void }) {
+  const [show, setShow] = createSignal(false);
+  onMount(() => {
+    if (localStorage.getItem("username_hint") === "0" || Object.keys(localStorage).some((k) => k.startsWith(userKey("")))) return;
+    // An unreachable server says nothing about the name: stay quiet then.
+    invoke<string | null>("dir_name_of", { server: server(), id: "" }).then((u) => setShow(!u), () => {});
+  });
+  return (
+    <Show when={show()}>
+      <div class="update-banner">
+        <span class="grow" style={{ cursor: "pointer" }} role="button" tabIndex={0} onClick={p.onOpen} onKeyDown={(e) => e.key === "Enter" && p.onOpen()}>
+          Задайте имя пользователя, чтобы вас находили
+        </span>
+        <button class="icon" title="Закрыть" onClick={() => (localStorage.setItem("username_hint", "0"), setShow(false))}><X size={18} /></button>
+      </div>
+    </Show>
+  );
+}
+
 /** Chats search: people on the main server by @username, like Telegram's global search. */
 export function DirSearch(p: { q: string; onOpen: (chat: string) => void }) {
   const [rows, setRows] = createSignal<[string, string][]>([]);
@@ -157,7 +179,7 @@ export function UsernameSettings(p: { space: string }) {
       <Show when={msg()}><p class="muted small">{msg()}</p></Show>
       <button class="primary" disabled={busy() || !validUsername(user())}>{cur() ? "Сменить" : "Сохранить"}</button>
       <h3>Сервер имён</h3>
-      <p class="muted small">Адрес главного сервера (якоря), который хранит имена пользователей. Переписка через него не идёт.</p>
+      <p class="muted small">Адрес главного сервера, который хранит имена пользователей. Переписка через него не идёт.</p>
       <input value={srv()} onInput={(e) => setSrv(e.currentTarget.value)} />
       <button type="button" disabled={srv().trim() === server()} onClick={() => {
         srv().trim() && srv().trim() !== DEFAULT_SERVER ? localStorage.setItem("server", srv().trim()) : localStorage.removeItem("server");
@@ -172,9 +194,10 @@ type SpaceRow = { id: string; name: string };
 const spacesChanged = () => window.dispatchEvent(new Event("mycel-spaces"));
 
 /** Groups (other spaces) as rows in the chat list: a tap switches to one. */
-export function SpaceRows(p: { current: string; personal: string; onEnter: (id: string) => void }) {
+export function SpaceRows(p: { current: string; personal: string; groupsOnly?: boolean; last: (id: string) => { text: string; time: string } | undefined; onEnter: (id: string) => void }) {
   const [list, setList] = createSignal<SpaceRow[]>([]);
-  const load = () => invoke<{ spaces: SpaceRow[] }>("status").then((s) => setList(s.spaces.filter((x) => x.id !== p.current)));
+  const load = () => invoke<{ spaces: SpaceRow[] }>("status").then((s) =>
+    setList(s.spaces.filter((x) => x.id !== p.current && !(p.groupsOnly && x.name === p.personal))));
   onMount(() => {
     load();
     window.addEventListener("mycel-spaces", load);
@@ -184,10 +207,10 @@ export function SpaceRows(p: { current: string; personal: string; onEnter: (id: 
     <For each={list()}>
       {(s) => (
         <button class="row chat-row" onClick={() => p.onEnter(s.id)}>
-          <div class="avatar group">{s.name === p.personal ? <Users size={20} /> : <Hash size={20} />}</div>
+          <div class="avatar group">{s.name === p.personal ? <MessageCircle size={20} /> : <Users size={20} />}</div>
           <div class="grow">
-            <div class="row-top"><b class="ellipsis">{s.name}</b></div>
-            <div class="row-bottom"><span class="muted ellipsis">{s.name === p.personal ? "Личные чаты" : "Группа · открыть"}</span></div>
+            <div class="row-top"><b class="ellipsis">{groupTitle(s.name)}</b><small class="when">{p.last(s.id)?.time}</small></div>
+            <div class="row-bottom"><span class="muted ellipsis">{rich(p.last(s.id)?.text ?? (s.name === p.personal ? "Контакты и переписка" : "Группа"))}</span></div>
           </div>
         </button>
       )}
@@ -219,7 +242,7 @@ export function NewGroup(p: { people: { id: string; me: boolean; name: string | 
   return (
     <>
       <button class="row chat-row" onClick={() => (setOpen(true), setPicked([]), setName(""), setErr(""))}>
-        <div class="avatar group"><Users size={20} /></div>
+        <div class="avatar group"><UserPlus size={20} /></div>
         <div class="grow"><div class="row-top"><b>Новая группа</b></div></div>
       </button>
       <Show when={open()}>
@@ -233,7 +256,7 @@ export function NewGroup(p: { people: { id: string; me: boolean; name: string | 
                 {(m) => (
                   <label class="check">
                     <input type="checkbox" checked={picked().includes(m.id)} onChange={() => toggle(m.id)} />
-                    {m.name ?? m.id}
+                    {m.name ?? "Без имени"}
                   </label>
                 )}
               </For>
