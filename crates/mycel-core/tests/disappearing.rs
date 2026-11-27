@@ -31,6 +31,16 @@ async fn disappearing_and_forwarded() {
     assert_eq!((f.name.as_str(), f.device), ("Боб", b.device_id()));
     assert_eq!(fwd.body.ttl_secs(), 0);
 
+    // A sticker arrives as one (its emoji as the text), stays one when forwarded, cannot be edited.
+    assert!(b.send_sticker(&None, "../x", "🐱", None).is_err());
+    let s = b.send_sticker(&None, "f3d/1f431", "🐱", None).unwrap();
+    until(|| has(&a, s.id)).await;
+    assert_eq!(a.event(&s.id).unwrap().1.body.sticker(), Some("f3d/1f431"));
+    assert!(b.edit(s.id, "text").is_err());
+    a.forward(&[s.id], &None).unwrap();
+    let copy = a.history(&None).unwrap().pop().unwrap();
+    assert_eq!(copy.body.sticker(), Some("f3d/1f431"));
+
     // The timer reaches both sides; messages sent then carry it, on either side.
     a.set_timer(&None, 2).unwrap();
     until(|| b.timer(&None).unwrap() == 2).await;

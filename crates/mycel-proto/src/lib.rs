@@ -142,6 +142,24 @@ pub enum EventBody {
     },
 }
 
+/// A sticker is a `Text` whose text is its emoji and whose first mention is this tag plus the id
+/// of a picture shipped with the app (`<set>/<name>`), zero-padded: the wire format stays, and
+/// older clients (or ones without that set) show the emoji.
+const STICKER: &[u8] = b"sticker:";
+
+/// The mention that makes a `Text` a sticker; `None` for an id that does not fit or is unsafe.
+pub fn sticker_tag(id: &str) -> Option<UserId> {
+    let safe = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit() || b"-/".contains(&c);
+    let mut tag = [0; 32];
+    let end = STICKER.len() + id.len();
+    if id.is_empty() || end > tag.len() || !id.bytes().all(safe) {
+        return None;
+    }
+    tag[..STICKER.len()].copy_from_slice(STICKER);
+    tag[STICKER.len()..end].copy_from_slice(id.as_bytes());
+    Some(tag)
+}
+
 /// The original author of a forwarded message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forwarded {
@@ -156,6 +174,18 @@ impl EventBody {
             EventBody::Extra { body, .. } => body,
             b => b,
         }
+    }
+
+    /// The sticker id, when this message is one.
+    pub fn sticker(&self) -> Option<&str> {
+        let EventBody::Text { text, mentions, .. } = self.msg() else {
+            return None;
+        };
+        let tag = mentions.first()?;
+        let id = tag.strip_prefix(STICKER)?.split(|&c| c == 0).next()?;
+        let id = std::str::from_utf8(id).ok()?;
+        // The text comes from a peer: only an emoji-sized one may hide behind a picture.
+        (text.len() <= 32 && sticker_tag(id).as_ref() == Some(tag)).then_some(id)
     }
 
     pub fn ttl_secs(&self) -> u32 {
@@ -245,6 +275,27 @@ pub enum CallAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sticker_tags() {
+        let body = |text: &str, tag: Option<UserId>| EventBody::Text {
+            text: text.into(),
+            reply_to: None,
+            mentions: tag.into_iter().collect(),
+        };
+        let tag = sticker_tag("f3d/2764-200d-1f525");
+        assert_eq!(body("❤️", tag).sticker(), Some("f3d/2764-200d-1f525"));
+        assert_eq!(body(&"x".repeat(33), tag).sticker(), None);
+        assert_eq!(body("❤️", None).sticker(), None);
+        assert_eq!(body("❤️", Some([7; 32])).sticker(), None);
+        for bad in ["", "../x", "A", "f3d/0123456789012345678901"] {
+            assert_eq!(sticker_tag(bad), None, "{bad}");
+        }
+        // Junk after the zero padding is not a sticker either.
+        let mut junk = tag.unwrap();
+        junk[31] = 1;
+        assert_eq!(body("❤️", Some(junk)).sticker(), None);
+    }
 
     #[test]
     fn event_roundtrip() {

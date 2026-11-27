@@ -16,6 +16,7 @@ import { Album, albums } from "./album";
 import { Shot, useBack, Viewer } from "./viewer";
 import { EMOJI, emojiOnly, recentEmoji, useEmoji } from "./emoji";
 import { Emoji, rich } from "./rich";
+import { Picker, Sticker } from "./stickers";
 import { record, Recording, waveform } from "./capture";
 import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
@@ -24,7 +25,7 @@ import { Appearance, msgSize } from "./look";
 import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameSettings, withBox, withServer } from "./directory";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
-type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
+type Msg = { id: string; author: string; mine: boolean; text: string; sticker?: string | null; ts: number; status: number; media: Media | null; call: CallView | null;
   reply: { id: string; author: string; text: string } | null; edited: boolean; pinned: boolean;
   reactions: [string, string[]][];
   // ttl: seconds after ts it disappears (0 = never); fwd: «Переслано от …»; service: a line like «X включил(а) автоудаление».
@@ -752,6 +753,7 @@ function MailboxSettings(p: { space: Space }) {
       </details>
       <p class="muted small">Mycel {ver()}</p>
       <p class="muted small">Эмодзи: Twemoji © Twitter и участники jdecked/twemoji, лицензия CC-BY 4.0</p>
+      <p class="muted small">Стикеры: Fluent Emoji © Microsoft Corporation, лицензия MIT</p>
     </>
   );
 }
@@ -1399,7 +1401,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const preview = (r: ChatRow) => {
     const l = r.last;
     if (l?.service) return serviceText(l);
-    return l ? (l.mine ? "Вы: " : !r.id && !l.call ? `${nameOf(l.author)}: ` : "") + (l.call ? callLabel(l.call) : l.media ? label(l.media) : l.text) : "Сообщений пока нет";
+    return l ? (l.mine ? "Вы: " : !r.id && !l.call ? `${nameOf(l.author)}: ` : "") + (l.call ? callLabel(l.call) : l.media ? label(l.media) : l.sticker ? `${l.text} Стикер` : l.text) : "Сообщений пока нет";
   };
   const sortedRows = () => {
     const q = find()?.trim().toLowerCase();
@@ -2055,7 +2057,7 @@ function Chat(p: {
       e.preventDefault();
       return toggle(m);
     }
-    if (m.id.startsWith("tmp-") || (e.target as Element).closest("button, a, img, video, .wave")) return;
+    if (m.id.startsWith("tmp-") || (e.target as Element).closest("button, a, img:not(.sticker-img), video, .wave")) return;
     const double = tap.id === m.id && e.timeStamp - tap.at < 350;
     tap = { id: double ? "" : m.id, at: e.timeStamp };
     if (double) act(invoke("react", { id: headOf(m).id, emoji: "❤️" }));
@@ -2313,6 +2315,15 @@ function Chat(p: {
       // The chat may be closed by now: keep the unsent text as its draft unless a newer one exists.
       () => (getDraft(key) || setDraft(key, t), setText(t), setReply(r), queueMicrotask(grow)));
   };
+  // One tap sends; the typed text stays in the field.
+  const sendSticker = (sticker: string, emoji: string) => {
+    const r = reply();
+    setEmo(undefined);
+    setReply(undefined);
+    queue({ text: emoji, sticker, reply: r ? { id: r.id, author: r.author, text: plain(r) } : null },
+      () => invoke<string>("send", { chat: p.chat, text: emoji, replyTo: r?.id ?? null, sticker }),
+      () => reply() || setReply(r));
+  };
   // While editing, the field holds the old message, not the draft.
   createEffect(() => {
     const t = text();
@@ -2414,7 +2425,7 @@ function Chat(p: {
                       classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: items().some((x) => x.id === hit()),
                         // Photo/video alone: edge to edge with the time over it; a video note has no bubble at all.
                         bare: items().length === 1 && !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.fwd && !m.reactions.length,
-                        note: m.media?.kind === "videonote" && !m.text && !m.reply, big: !!big() }}
+                        note: m.media?.kind === "videonote" && !m.text && !m.reply, big: !!big() || !!m.sticker, sticker: !!m.sticker }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
                       // Lifting the finger after a hold must not click the menu's backdrop and close it.
@@ -2450,7 +2461,8 @@ function Chat(p: {
                         }>
                           <Album items={items()} onView={openView} />
                         </Show>
-                        <Show when={head().text}>
+                        <Show when={head().sticker}>{(id) => <Sticker id={id()} emoji={head().text} />}</Show>
+                        <Show when={!head().sticker && head().text}>
                           <span class="text" style={big() ? { "font-size": `${112 - 16 * big()}px` } : undefined}>
                             {re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{rich(s)}</mark> : rich(s))) : rich(head().text)}
                           </span>
@@ -2510,7 +2522,7 @@ function Chat(p: {
               </div>
               <button onClick={() => startReply(head())}><Reply size={16} /> Ответить</button>
               <Show when={plain(head())}><button onClick={() => copy([head()])}><Copy size={16} /> Копировать</button></Show>
-              <Show when={mn().m.mine}><button onClick={() => startEdit(head())}><Pencil size={16} /> Редактировать</button></Show>
+              <Show when={mn().m.mine && !head().sticker}><button onClick={() => startEdit(head())}><Pencil size={16} /> Редактировать</button></Show>
               <button onClick={() => act(invoke("pin", { id: (pinnedOne() ?? head()).id, pinned: !pinnedOne() }))}>
                 {pinnedOne() ? <PinOff size={16} /> : <Pin size={16} />} {pinnedOne() ? "Открепить" : "Закрепить"}
               </button>
@@ -2646,17 +2658,19 @@ function Chat(p: {
         <Show when={emo() !== undefined}>
           <div class="overlay" onClick={() => setEmo(undefined)} />
           <div class="emoji-panel card">
-            <div class="emoji-tabs">
-              <Show when={recentEmoji().length}>
-                <button classList={{ active: emo() === -1 }} onClick={() => setEmo(-1)} title="Недавние"><Clock size={18} /></button>
-              </Show>
-              <For each={EMOJI}>{([icon], i) => <button classList={{ active: emo() === i() }} onClick={() => setEmo(i())}><Emoji e={icon} /></button>}</For>
-            </div>
-            <div class="emoji-grid">
-              <For each={emo() === -1 ? recentEmoji() : EMOJI[emo()!][1].split(" ")}>
-                {(e) => <button onClick={() => (insertEmoji(e), input.focus())}><Emoji e={e} /></button>}
-              </For>
-            </div>
+            <Picker send={sendSticker}>
+              <div class="emoji-tabs">
+                <Show when={recentEmoji().length}>
+                  <button classList={{ active: emo() === -1 }} onClick={() => setEmo(-1)} title="Недавние"><Clock size={18} /></button>
+                </Show>
+                <For each={EMOJI}>{([icon], i) => <button classList={{ active: emo() === i() }} onClick={() => setEmo(i())}><Emoji e={icon} /></button>}</For>
+              </div>
+              <div class="emoji-grid">
+                <For each={emo() === -1 ? recentEmoji() : EMOJI[emo()!][1].split(" ")}>
+                  {(e) => <button onClick={() => (insertEmoji(e), input.focus())}><Emoji e={e} /></button>}
+                </For>
+              </div>
+            </Picker>
           </div>
         </Show>
         <Show when={!rec() && (text().trim() || editing())} fallback={

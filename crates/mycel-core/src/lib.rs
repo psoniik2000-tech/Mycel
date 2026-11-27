@@ -15,7 +15,7 @@ use mycel_net::{
 };
 use mycel_proto::{
     BlobRef, DeviceId, Envelope, Event, EventBody, EventId, Forwarded, JoinReq, JoinResp,
-    MediaKind, ReceiptKind, SignedAddr, SyncMsg,
+    MediaKind, ReceiptKind, SignedAddr, SyncMsg, sticker_tag,
 };
 use mycel_store::Store;
 use n0_future::StreamExt;
@@ -1462,6 +1462,23 @@ impl Node {
         )
     }
 
+    /// Sends sticker `id` (a picture shipped with the app); `emoji` stands in where it is missing.
+    pub fn send_sticker(
+        &self,
+        chat: &Chat,
+        id: &str,
+        emoji: &str,
+        reply_to: Option<EventId>,
+    ) -> Result<Event> {
+        let body = EventBody::Text {
+            text: emoji.into(),
+            reply_to,
+            mentions: vec![sticker_tag(id).context("bad sticker id")?],
+        };
+        ensure!(body.sticker().is_some(), "bad sticker emoji");
+        self.send_msg(chat, body, None)
+    }
+
     /// An event of any chat, with its chat.
     pub fn event(&self, id: &EventId) -> Result<(Chat, Event)> {
         let (c, b) = self
@@ -1478,7 +1495,7 @@ impl Node {
     pub fn edit(&self, target: EventId, text: &str) -> Result<Event> {
         let (chat, t) = self.event(&target)?;
         ensure!(
-            t.author_device == self.device_id() && is_msg(&t.body),
+            t.author_device == self.device_id() && is_msg(&t.body) && t.body.sticker().is_none(),
             "only own messages can be edited"
         );
         self.send_event(
@@ -1552,10 +1569,11 @@ impl Node {
                 device: ev.author_device,
             });
             let body = match ev.body.msg().clone() {
-                EventBody::Text { text, .. } => EventBody::Text {
+                // `mentions` carries the sticker tag.
+                EventBody::Text { text, mentions, .. } => EventBody::Text {
                     text,
                     reply_to: None,
-                    mentions: vec![],
+                    mentions,
                 },
                 EventBody::Media {
                     kind,
