@@ -9,9 +9,15 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  companion object {
+    /** Intent extra: started by NodeService after a restart; the window goes to the back at once. */
+    const val BACKGROUND = "background"
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    if (intent?.getBooleanExtra(BACKGROUND, false) == true) moveTaskToBack(true)
     // Edge-to-edge: keep the WebView clear of the bars, the notch and the keyboard (no adjustResize here).
     ViewCompat.setOnApplyWindowInsetsListener(findViewById<View>(android.R.id.content)) { v, insets ->
       val i = insets.getInsets(

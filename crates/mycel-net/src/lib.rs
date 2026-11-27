@@ -209,6 +209,16 @@ impl Net {
     pub async fn add_relay(&self, url: &str) -> Result<()> {
         let url: RelayUrl = url.parse()?;
         let cfg = Arc::new(RelayConfig::new(url.clone(), None));
+        // n0's public relays (also the staging ones in the default backup list) are a fallback,
+        // never a space relay: they must not win the home relay over the anchor.
+        if url.host_str().is_some_and(|h| h.ends_with(".n0.iroh.link")) {
+            self.fallback.lock().unwrap().push(url.clone());
+            let ours = !self.relays.lock().unwrap().is_empty();
+            if !ours || self.fallback_on.load(Ordering::Relaxed) {
+                self.ep.insert_relay(url, cfg).await;
+            }
+            return Ok(());
+        }
         self.relays.lock().unwrap().push(url.clone());
         self.ep.insert_relay(url, cfg).await;
         self.drop_fallback().await;

@@ -30,8 +30,15 @@ const got: Record<string, string | undefined> = {};
 const download = (id: string) =>
   (running[id] ??= invoke<string>("fetch_media", { id }).then((p) => (got[id] = p)).finally(() => delete running[id]));
 
-/** "Save as" through the system dialog. */
+const android = /Android/.test(navigator.userAgent);
+
+/** "Save": on Android into Pictures/Movies/Downloads (MediaStore); on desktop through the save dialog. */
 export async function saveAs(id: string, m: Media) {
+  if (android) {
+    const where = await invoke<string>("save_download", { id });
+    alert(`Сохранено в «${where}»`);
+    return;
+  }
   // Photos from a phone gallery may come without a name; Android needs one with an extension.
   const to = await save({ defaultPath: m.name ?? `mycel.${m.mime.split(/[/;]/)[1] ?? "bin"}` });
   if (to) await invoke("save_media", { id, to });
@@ -141,7 +148,7 @@ export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: 
                 <div class="actions">
                   <span class="muted small">{size(p.m.size)}</span>
                   <button class="link" onClick={() => invoke("open_media", { id: p.id })}><ExternalLink size={14} /> Открыть</button>
-                  <button class="link" onClick={() => saveAs(p.id, p.m)}><Save size={14} /> Сохранить как</button>
+                  <button class="link" onClick={() => saveAs(p.id, p.m)}><Save size={14} /> {android ? "Сохранить" : "Сохранить как"}</button>
                 </div>
               </Show>
             </div>

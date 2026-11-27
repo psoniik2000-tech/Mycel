@@ -1,7 +1,8 @@
 // Full-screen photos and videos of a chat: swipe or arrows between them, pinch / wheel / double
 // tap to zoom a photo, swipe down or Esc to close.
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { ArrowLeft, ChevronLeft, ChevronRight, Save } from "lucide-solid";
+import { invoke } from "@tauri-apps/api/core";
+import { ArrowLeft, ChevronLeft, ChevronRight, ExternalLink, Save } from "lucide-solid";
 import { Media, saveAs, useMedia } from "./media";
 
 export type Shot = { id: string; author: string; ts: number; text: string; media: Media };
@@ -163,6 +164,7 @@ export function Viewer(p: { shots: Shot[]; at: string; onAt: (id: string) => voi
                 <small>{new Date(c().ts).toLocaleString("ru", { day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" })}</small>
               </div>
               <span>{ix() + 1} из {p.shots.length}</span>
+              <button class="icon" title="Открыть" onClick={() => (setErr(""), invoke("open_media", { id: c().id }).catch((e) => setErr(`Не удалось открыть: ${e}`)))}><ExternalLink size={22} /></button>
               <button class="icon" title="Сохранить"
                 onClick={() => (setErr(""), saveAs(c().id, c().media).catch((e) => setErr(`Не удалось сохранить: ${e}`)))}><Save size={22} /></button>
             </header>

@@ -2,6 +2,7 @@
 // (encrypts, sends over `mycel/call/1`); incoming frames → decoders → speakers / a canvas per peer.
 // Chromium already ships AEC, noise suppression and both codecs, so Rust needs no audio/video stack.
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { Accessor, createSignal, Setter } from "solid-js";
 
 const AUDIO = 0, VIDEO_KEY = 1, VIDEO_DELTA = 2;
@@ -125,6 +126,7 @@ export class CallMedia {
   private kbps = this.v.kbps; // current Opus bitrate: the setting, lowered on loss
   private red = false; // heavy loss: each packet also carries the previous frame
   private ptt = false;
+  private unlistenPtt?: UnlistenFn;
   private openUntil = 0;
   private timer = 0;
   private keys = (e: KeyboardEvent) => {
@@ -145,9 +147,14 @@ export class CallMedia {
     const t = dest.stream.getAudioTracks()[0];
     this.local.addTrack(t);
     this.pumpAudio(t);
-    // shortcut: push-to-talk works while the app window is focused; a global hook needs a native plugin.
+    // Push-to-talk: the window's keys, and on desktop the same key as a global shortcut (Rust
+    // `ptt_key`), so it works while another window has the focus.
     addEventListener("keydown", this.keys);
     addEventListener("keyup", this.keys);
+    if (this.v.mode === "ptt") {
+      this.unlistenPtt = await listen<boolean>("ptt", (e) => (this.ptt = e.payload)).catch(() => undefined);
+      await invoke("ptt_key", { key: this.v.pttKey }).catch(() => {});
+    }
     if (video) await this.setCam(true).catch(() => {});
     this.timer = window.setInterval(() => this.poll(), 2000);
   }
@@ -158,6 +165,11 @@ export class CallMedia {
     clearInterval(this.timer);
     removeEventListener("keydown", this.keys);
     removeEventListener("keyup", this.keys);
+    if (this.unlistenPtt) {
+      this.unlistenPtt();
+      this.unlistenPtt = undefined;
+      invoke("ptt_key", { key: null }).catch(() => {});
+    }
     this.input.close();
     this.local.getTracks().forEach((t) => t.stop());
     for (const p of this.rx.values()) {

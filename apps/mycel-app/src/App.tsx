@@ -66,14 +66,19 @@ const initials = (id: string) => {
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : typeof (e as any)?.message === "string" ? (e as any).message : JSON.stringify(e);
 const android = /Android/.test(navigator.userAgent);
-const n0 = () => localStorage.getItem("n0") !== "0";
+// n0, relays and the anchor are per space: the key carries the space id (a new space, not yet
+// named, uses the bare key).
+const sk = (k: string, space?: string | null) => (space ? `${k}:${space}` : k);
+// Per-space value, else the old shared one (settings made before 0.1.15 keep working).
+const ls = (k: string, space?: string | null) => localStorage.getItem(sk(k, space)) ?? localStorage.getItem(k);
+const n0 = (space?: string | null) => ls("n0", space) !== "0";
 // This PC is an anchor: its relay URL (Settings → Якорь).
-const anchor = () => localStorage.getItem("anchor") || null;
+const anchor = (space?: string | null) => ls("anchor", space) || null;
 // Backup public relays (n0's test servers): used besides the main n0 ones; editable in Settings → Связь.
 const DEFAULT_RELAYS = ["https://euc1-1.staging-relay.n0.iroh.link", "https://use1-1.staging-relay.n0.iroh.link"];
-const relays = (): string[] => {
+const relays = (space?: string | null): string[] => {
   try {
-    const v = JSON.parse(localStorage.getItem("relays") ?? "null");
+    const v = JSON.parse(ls("relays", space) ?? "null");
     return Array.isArray(v) ? v : DEFAULT_RELAYS;
   } catch {
     return DEFAULT_RELAYS;
@@ -85,19 +90,19 @@ const DEFAULT_MAILBOX = "https://mycel-box.psoniik2000.workers.dev";
 const mailbox = () => (localStorage.getItem("mailbox") ?? DEFAULT_MAILBOX) || null;
 /** Applies changed connection settings to the open space at once (it reopens). */
 const reopen = (id: string) =>
-  invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() });
+  invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: anchor(id), relays: relays(id), mailbox: mailbox() });
 const autoAnchor = () => !android && localStorage.getItem("anchor_auto") !== "0";
 /** Turns this PC's anchor on (relay at the external IP, port 3340) or off; reopens the space. Returns the URL. */
 async function setAnchor(id: string, on: boolean): Promise<string> {
   // shortcut: fixed port 3340; a port field when someone needs another one.
   const u = on ? `http://${await invoke<string>("public_ip")}:3340` : "";
-  await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(), anchor: u || null, relays: relays(), mailbox: mailbox() });
-  u ? localStorage.setItem("anchor", u) : localStorage.removeItem("anchor");
+  await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: u || null, relays: relays(id), mailbox: mailbox() });
+  u ? localStorage.setItem(sk("anchor", id), u) : localStorage.removeItem(sk("anchor", id));
   return u;
 }
 /** The router lets us open the port: become an anchor without asking (Settings → Якорь turns it off). */
 async function tryAutoAnchor(id: string) {
-  if (!autoAnchor() || anchor() || !(await invoke<boolean>("upnp_ok").catch(() => false))) return;
+  if (!autoAnchor() || anchor(id) || !(await invoke<boolean>("upnp_ok").catch(() => false))) return;
   try {
     await setAnchor(id, true);
     const [, mapped] = await invoke<[boolean, boolean, boolean]>("anchor_check");
@@ -303,7 +308,7 @@ export default function App() {
   const refresh = async () => {
     const s = await invoke<Status>("status");
     // Anchor mode survives a lost WebView storage: the backend keeps the last unlock's URL.
-    if (s.anchor && !android && !anchor()) localStorage.setItem("anchor", s.anchor);
+    if (s.anchor && !android && !anchor(s.current)) localStorage.setItem(sk("anchor", s.current), s.anchor);
     setStatus(s);
     spaceId = s.current ?? "";
     return s;
@@ -319,7 +324,7 @@ export default function App() {
     setHow(h);
     if (sp?.remembered) {
       try {
-        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
+        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(sp.id), anchor: anchor(sp.id), relays: relays(sp.id), mailbox: mailbox() }));
       } catch {
         // falls through to the password screen
       }
@@ -414,7 +419,7 @@ function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: bo
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name().trim() || defaultName, password: pw(), remember: remember(), n0: n0(), anchor: anchor(), relays: relays(), mailbox: mailbox() }));
+      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name().trim() || defaultName, password: pw(), remember: remember(), n0: n0(p.space?.id), anchor: anchor(p.space?.id), relays: relays(p.space?.id), mailbox: mailbox() }));
     } catch (e) {
       setErr(exists() ? "Неверный пароль" : errText(e));
     }
@@ -518,7 +523,7 @@ function RemoveSpace(p: { space: Space; forgot?: boolean; onClose: () => void; o
 
 // Settings → Вход: password at start, password change.
 function AnchorSettings(p: { space: Space }) {
-  const [url, setUrl] = createSignal(anchor() ?? "");
+  const [url, setUrl] = createSignal(anchor(p.space.id) ?? "");
   const [state, setState] = createSignal<[boolean, boolean, boolean]>();
   const [msg, setMsg] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -609,14 +614,14 @@ function RelaySettings(p: { space: Space }) {
   const [checked, setChecked] = createSignal<Check>({});
   const [checking, setChecking] = createSignal(false);
   // The anchor is a relay too: check it with the backups.
-  const targets = () => [...list(), ...(anchor() && !list().includes(anchor()!) ? [anchor()!] : [])];
+  const targets = () => [...list(), ...(anchor(p.space.id) && !list().includes(anchor(p.space.id)!) ? [anchor(p.space.id)!] : [])];
   const check = async () => {
     setChecking(true);
     setChecked({});
     setChecked(await checkServers(targets(), false).catch(() => ({})));
     setChecking(false);
   };
-  const [list, setList] = createSignal(relays());
+  const [list, setList] = createSignal(relays(p.space.id));
   const [url, setUrl] = createSignal("");
   const [msg, setMsg] = createSignal("");
   const [now, setNow] = createSignal<string | null>();
@@ -624,7 +629,7 @@ function RelaySettings(p: { space: Space }) {
   refreshNow();
   const save = async (next: string[]) => {
     const prev = list();
-    localStorage.setItem("relays", JSON.stringify(next));
+    localStorage.setItem(sk("relays", p.space.id), JSON.stringify(next));
     setList(next);
     try {
       await reopen(p.space.id);
@@ -632,7 +637,7 @@ function RelaySettings(p: { space: Space }) {
       setNow(undefined);
       refreshNow();
     } catch (e) {
-      localStorage.setItem("relays", JSON.stringify(prev));
+      localStorage.setItem(sk("relays", p.space.id), JSON.stringify(prev));
       setList(prev);
       setMsg(errText(e));
     }
@@ -679,11 +684,11 @@ function RelaySettings(p: { space: Space }) {
         </ul>
         <p>Удалить сервер можно корзиной справа. Изменения применяются сразу, без перезапуска.</p>
       </details>
-      <Show when={anchor() && !list().includes(anchor()!)}>
+      <Show when={anchor(p.space.id) && !list().includes(anchor(p.space.id)!)}>
         <div class="relay-row">
           <span class="muted small">Якорь:</span>
-          <code class="grow ellipsis">{anchor()}</code>
-          <CheckMark c={checked()[anchor()!]} />
+          <code class="grow ellipsis">{anchor(p.space.id)}</code>
+          <CheckMark c={checked()[anchor(p.space.id)!]} />
         </div>
       </Show>
       <div class="actions">
@@ -1552,8 +1557,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   </Match>
                   <Match when={sub() === "Связь"}>
                     <label class="check">
-                      <input type="checkbox" checked={n0()} onChange={(e) => {
-                        localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0");
+                      <input type="checkbox" checked={n0(p.space.id)} onChange={(e) => {
+                        localStorage.setItem(sk("n0", p.space.id), e.currentTarget.checked ? "1" : "0");
                         reopen(p.space.id).catch((e) => alert(errText(e)));
                       }} />
                       Публичные серверы связи n0 (Европа, США, Азия)

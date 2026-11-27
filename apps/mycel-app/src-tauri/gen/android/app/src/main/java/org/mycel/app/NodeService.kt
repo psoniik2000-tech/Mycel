@@ -31,7 +31,14 @@ class NodeService : Service() {
       .build()
     val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0
     ServiceCompat.startForeground(this, 1, n, type)
-    // The node needs the password after a restart, so a killed process stays dead until the app is opened.
-    return START_NOT_STICKY
+    // Restarted by the system after its process was killed (no intent): start the app in the
+    // background, so its UI reopens the last space with the remembered password (Settings → Вход).
+    // MainActivity sends itself to the back for this extra.
+    if (intent == null) {
+      startActivity(Intent(this, MainActivity::class.java)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        .putExtra(MainActivity.BACKGROUND, true))
+    }
+    return START_STICKY
   }
 }
