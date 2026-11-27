@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Space {
@@ -12,7 +13,15 @@ pub struct Space {
     /// Chats without notifications on this device (the UI's chat ids).
     #[serde(default)]
     pub muted: Vec<String>,
+    /// Chats at the top of the list, in pinning order, at most `MAX_PINNED`.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// Chats moved to the archive; a new message brings one back unless it is muted.
+    #[serde(default)]
+    pub archived: Vec<String>,
 }
+
+pub const MAX_PINNED: usize = 5;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct List {
@@ -77,6 +86,8 @@ impl List {
                         id: "main".into(),
                         name: "Моё пространство".into(),
                         muted: vec![],
+                        pinned: vec![],
+                        archived: vec![],
                     },
                 );
                 l.last = Some("main".into());
@@ -94,8 +105,12 @@ impl List {
         Ok(l)
     }
 
+    pub fn space(&self, id: &str) -> Option<&Space> {
+        self.spaces.iter().find(|s| s.id == id)
+    }
+
     pub fn muted(&self, space: &str, chat: &str) -> bool {
-        let s = self.spaces.iter().find(|s| s.id == space);
+        let s = self.space(space);
         s.is_some_and(|s| s.muted.iter().any(|c| c == chat))
     }
 
@@ -106,6 +121,58 @@ impl List {
                 s.muted.push(chat.into());
             }
         }
+    }
+
+    /// False: `MAX_PINNED` chats are pinned already.
+    pub fn set_pinned(&mut self, space: &str, chat: &str, on: bool) -> bool {
+        let Some(s) = self.spaces.iter_mut().find(|s| s.id == space) else {
+            return true;
+        };
+        if !on {
+            s.pinned.retain(|c| c != chat);
+        } else if !s.pinned.iter().any(|c| c == chat) {
+            if s.pinned.len() >= MAX_PINNED {
+                return false;
+            }
+            s.pinned.push(chat.into());
+        }
+        true
+    }
+
+    /// Archiving also unpins.
+    pub fn set_archived(&mut self, space: &str, chat: &str, on: bool) {
+        if let Some(s) = self.spaces.iter_mut().find(|s| s.id == space) {
+            s.archived.retain(|c| c != chat);
+            if on {
+                s.pinned.retain(|c| c != chat);
+                s.archived.push(chat.into());
+            }
+        }
+    }
+
+    /// Load, change, save, one at a time: a command and an arriving message must not undo each other.
+    pub fn edit<T>(root: &Path, f: impl FnOnce(&mut Self) -> T) -> Result<T> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _one = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = Self::load(root)?;
+        let out = f(&mut l);
+        l.save(root)?;
+        Ok(out)
+    }
+
+    /// Something new came to `chat`: an archived chat with sound returns to the list.
+    /// True if the chat is muted (no notification then).
+    pub fn arrived(root: &Path, space: &str, chat: &str) -> bool {
+        let Ok(l) = Self::load(root) else {
+            return false;
+        };
+        let muted = l.muted(space, chat);
+        let s = l.space(space);
+        if !muted && s.is_some_and(|s| s.archived.iter().any(|c| c == chat)) {
+            // A failed write only leaves the chat in the archive: the notification still shows.
+            let _ = Self::edit(root, |l| l.set_archived(space, chat, false));
+        }
+        muted
     }
 
     /// Written via a temp file, so a crash never leaves a broken list.
@@ -150,6 +217,22 @@ mod tests {
         assert!(l.muted("main", "") && !l.muted("main", "ab") && !l.muted("gone", ""));
         l.set_muted("main", "", false);
         assert!(!l.muted("main", ""));
+
+        for c in ["a", "b", "c", "d", "e"] {
+            assert!(l.set_pinned("main", c, true));
+        }
+        // The limit holds; pinning again keeps the place; archiving unpins.
+        assert!(!l.set_pinned("main", "f", true) && l.set_pinned("main", "a", true));
+        l.set_archived("main", "b", true);
+        assert_eq!(l.spaces[0].pinned, ["a", "c", "d", "e"]);
+        l.set_archived("main", "q", true);
+        l.set_muted("main", "q", true);
+        l.save(&root).unwrap();
+
+        // A new message: the muted chat stays archived, the one with sound comes back.
+        assert!(List::arrived(&root, "main", "q"));
+        assert!(!List::arrived(&root, "main", "b"));
+        assert_eq!(List::load(&root).unwrap().spaces[0].archived, ["q"]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

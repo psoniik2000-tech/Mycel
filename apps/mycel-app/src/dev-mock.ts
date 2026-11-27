@@ -40,7 +40,11 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     [WORK]: [m(WORK, "Созвон перенесли на четверг, в 15:00 по Москве, ссылка будет в календаре", now - 2 * day)],
   };
   const unread: Record<string, number> = { [MAMA]: 2, [ANNA]: 1 };
-  const chats = () => Object.keys(hist).map((id) => ({ id, last: hist[id].at(-1), unread: unread[id] ?? 0, muted: id === WORK }));
+  const muted = new Set([WORK]), archived = new Set<string>();
+  let pinned: string[] = [];
+  const toggle = (set: Set<string>, a: any) => void (a.on ? set.add(a.chat) : set.delete(a.chat));
+  const chats = () => Object.keys(hist).map((id) => ({ id, last: hist[id].at(-1), unread: unread[id] ?? 0, muted: muted.has(id),
+    pin: pinned.includes(id) ? pinned.indexOf(id) : null, archived: archived.has(id) }));
   const calls = [{ id: "c1", video: false, author: MAMA, chat: MAMA, mine: false, ts: now - day, duration_ms: 320_000, missed: false, active: false },
     { id: "c2", video: true, author: OLEG, chat: OLEG, mine: false, ts: now - 2 * day, duration_ms: null, missed: true, active: false }];
   const space = { id: "s1", name: "Личные чаты", remembered: true };
@@ -52,6 +56,9 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     calls_list: () => calls,
     peers: () => 2,
     mark_read: (a) => void (unread[a.chat] = 0),
+    set_muted: (a) => toggle(muted, a),
+    set_pinned: (a) => void (pinned = a.on ? [...new Set([...pinned, a.chat])] : pinned.filter((c) => c !== a.chat)),
+    set_archived: (a) => (a.on && (pinned = pinned.filter((c) => c !== a.chat)), toggle(archived, a)),
     send: (a) => (hist[a.chat].push(m(ME, a.text, Date.now(), a.replyTo ? { reply: { id: a.replyTo, author: ANNA, text: "…" } } : {})), "x"),
     react: () => null,
     safety_code: () => ({ link: "mycel://safety/123", svg: "" }),

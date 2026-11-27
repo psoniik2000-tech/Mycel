@@ -236,7 +236,7 @@ async fn pull(root: &Path, id: &str, pw: &str, list: &spaces::List) -> Option<Ve
                 Some(ev) = rx.recv() => {
                     let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
                     if let Some((title, body)) = note(&node, &ev, &chat) {
-                        if list.muted(id, &chat_id(&chat)) {
+                        if spaces::List::arrived(root, id, &chat_id(&chat)) {
                             muted = true;
                         } else {
                             notes.push([id.to_string(), chat_id(&chat), title, body]);
@@ -473,6 +473,9 @@ struct ChatRow {
     unread: usize,
     /// No notifications on this device.
     muted: bool,
+    /// Place among the pinned chats.
+    pin: Option<usize>,
+    archived: bool,
 }
 
 #[derive(Serialize)]
@@ -810,6 +813,8 @@ async fn unlock(
                 id: id.clone(),
                 name: name.trim().to_string(),
                 muted: vec![],
+                pinned: vec![],
+                archived: vec![],
             });
             id
         }
@@ -932,7 +937,7 @@ async fn unlock(
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
             if let Some((who, text)) = note(&node, &ev, &chat)
-                && !spaces::List::load(&root).is_ok_and(|l| l.muted(&space, &chat_id(&chat)))
+                && !spaces::List::arrived(&root, &space, &chat_id(&chat))
             {
                 notify(&app, &space, &chat_id(&chat), who, text);
             }
@@ -1236,6 +1241,7 @@ async fn mark_read(st: State<'_, App>, chat: String) -> R<()> {
 async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
     let (n, space) = &st.open()?;
     let spaces = spaces::List::load(&data_dir(&app)?).map_err(|e| e.to_string())?;
+    let flags = spaces.space(space);
     let mut list = vec![None];
     list.extend(n.dms().map_err(err)?.into_iter().map(Some));
     list.iter()
@@ -1248,6 +1254,8 @@ async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
                 unread: msgs.iter().filter(|m| new.contains(&m.id)).count(),
                 last: msgs.into_iter().last(),
                 muted: spaces.muted(space, &id),
+                pin: flags.and_then(|s| s.pinned.iter().position(|c| *c == id)),
+                archived: flags.is_some_and(|s| s.archived.contains(&id)),
                 id,
             })
         })
@@ -1258,10 +1266,30 @@ async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
 #[tauri::command]
 fn set_muted(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()> {
     let (_, space) = st.open()?;
-    let root = data_dir(&app)?;
-    let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
-    list.set_muted(&space, &chat, on);
-    list.save(&root).map_err(|e| e.to_string())
+    spaces::List::edit(&data_dir(&app)?, |l| l.set_muted(&space, &chat, on))
+        .map_err(|e| e.to_string())
+}
+
+/// Pinned and archived chats of the list, on this device only, like `set_muted`.
+#[tauri::command]
+fn set_pinned(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()> {
+    let (_, space) = st.open()?;
+    let fit = spaces::List::edit(&data_dir(&app)?, |l| l.set_pinned(&space, &chat, on))
+        .map_err(|e| e.to_string())?;
+    if !fit {
+        return Err(format!(
+            "можно закрепить не больше {} чатов",
+            spaces::MAX_PINNED
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_archived(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()> {
+    let (_, space) = st.open()?;
+    spaces::List::edit(&data_dir(&app)?, |l| l.set_archived(&space, &chat, on))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1834,6 +1862,8 @@ async fn restore_backup(app: AppHandle, path: String, password: String) -> R<()>
                 id: id.clone(),
                 name: name.into(),
                 muted: vec![],
+                pinned: vec![],
+                archived: vec![],
             });
             if m.lock().unwrap().is_empty() {
                 list.last = Some(id.clone());
@@ -2079,6 +2109,8 @@ pub fn run() {
             set_visible,
             mark_read,
             set_muted,
+            set_pinned,
+            set_archived,
             stash,
             close_space,
             remove_space,

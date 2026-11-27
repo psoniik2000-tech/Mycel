@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, Smartphone,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -30,7 +30,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null };
-type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean };
+type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean };
 type Tab = "chats" | "calls" | "people" | "settings";
@@ -1001,6 +1001,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
   const [find, setFind] = createSignal<string>(); // chat list search, undefined = closed
+  const [arch, setArch] = createSignal(false); // the chats tab shows the archive
+  const openArch = () => (history.pushState(null, ""), setArch(true));
   const [sub, setSub] = createSignal(""); // open settings page, "" = the list
   const openSub = (s: string) => (history.pushState(null, ""), setSub(s));
   // The open chat: "" = the space chat, else the 1:1 partner's id.
@@ -1022,7 +1024,45 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const toggleMute = (on: boolean) =>
     invoke("set_muted", { chat: chat(), on }).then(loadChats, (e) => setCallErr("Не удалось изменить уведомления: " + errText(e)));
   createEffect(() => chatVisible() && msgs() && untrack(markRead));
-  const unread = () => rows().reduce((n, r) => n + r.unread, 0);
+  const sum = (rs: ChatRow[]) => rs.reduce((n, r) => n + r.unread, 0);
+  const archived = () => rows().filter((r) => r.archived);
+  const unread = () => sum(rows().filter((r) => !r.archived));
+  const setFlag = (cmd: "set_muted" | "set_pinned" | "set_archived", id: string, on: boolean) =>
+    invoke(cmd, { chat: id, on }).then(loadChats, (e) => alert("Не удалось изменить чат: " + errText(e)));
+  // Chat row gestures, like on messages: right click or holding opens the menu, sliding left archives.
+  const [rowMenu, setRowMenu] = createSignal<{ id: string; x: number; y: number }>();
+  const [rowSwipe, setRowSwipe] = createSignal<{ id: string; dx: number }>();
+  let rowTimer = 0, rowHeld = false, rowTouch: { x: number; y: number } | undefined;
+  const rowPress = (e: PointerEvent, id: string) => {
+    rowHeld = false;
+    if (e.pointerType !== "touch") return;
+    const { clientX: x, clientY: y } = e;
+    rowTouch = { x, y };
+    rowTimer = window.setTimeout(() => ((rowHeld = true), (rowTouch = undefined), setRowMenu({ id, x, y })), 500);
+  };
+  const rowMove = (e: PointerEvent, id: string) => {
+    if (!rowTouch) return;
+    const dx = e.clientX - rowTouch.x;
+    if (!rowSwipe() && Math.hypot(dx, e.clientY - rowTouch.y) < 10) return;
+    clearTimeout(rowTimer);
+    rowHeld = true; // not a tap any more
+    setRowSwipe({ id, dx: Math.min(0, Math.max(dx, -100)) });
+  };
+  // A right click, or the WebView's own long press arriving before our timer.
+  const rowContext = (e: MouseEvent, id: string) => {
+    e.preventDefault();
+    clearTimeout(rowTimer);
+    rowHeld ||= !!rowTouch;
+    rowTouch = undefined;
+    setRowMenu({ id, x: e.clientX, y: e.clientY });
+  };
+  // pointercancel means the list took the gesture to scroll.
+  const rowRelease = (e: PointerEvent, r: ChatRow) => {
+    clearTimeout(rowTimer);
+    if (e.type === "pointerup" && (rowSwipe()?.dx ?? 0) <= -70) setFlag("set_archived", r.id, !r.archived);
+    rowTouch = undefined;
+    setRowSwipe(undefined);
+  };
 
   const loadMembers = () => invoke<Member[]>("members").then(setPeople);
   const loadCalls = () => invoke<CallView[]>("calls_list").then(setCallList);
@@ -1157,7 +1197,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     };
     document.addEventListener("visibilitychange", onVis);
     // Android back closes the chat: opening it pushes a history entry.
-    const onBack = () => (chatOpen() ? setChatOpen(false) : setSub(""));
+    // On a wide screen the chat stays beside the list, so Back leaves the archive.
+    const onBack = () => (chatOpen() && !(wide() && arch()) ? setChatOpen(false) : (setSub(""), setArch(false)));
     addEventListener("popstate", onBack);
     if (!(await isPermissionGranted())) requestPermission();
     const onWide = () => setWide(wideQuery.matches);
@@ -1188,12 +1229,14 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   };
   const sortedRows = () => {
     const q = find()?.trim().toLowerCase();
-    return [...rows()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0))
-      .filter((r) => !q || `${r.id ? nameOf(r.id) : "Общий чат"} ${preview(r)}`.toLowerCase().includes(q));
+    // A search looks everywhere, the archive included.
+    return rows().filter((r) => (q ? `${chatName(r.id)} ${preview(r)}`.toLowerCase().includes(q) : r.archived === arch()))
+      .sort((a, b) => (a.pin ?? Infinity) - (b.pin ?? Infinity) || (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
   };
+  const chatName = (id: string) => (id ? nameOf(id) : "Общий чат");
   const titles = () => ({ chats: "Чаты", calls: "Звонки", people: simple() ? "Контакты" : "Люди", settings: "Настройки" });
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
-    <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); setSub(""); setFind(undefined); }} title={label}>
+    <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); setSub(""); setArch(false); setFind(undefined); }} title={label}>
       <Icon size={22} />
       <span>{label}</span>
       <Show when={t === "chats" && unread()}><b class="badge">{unread()}</b></Show>
@@ -1212,11 +1255,11 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
 
       <section class="panel">
         <header class="bar">
-          <Show when={tab() === "settings" && sub()}>
+          <Show when={(tab() === "settings" && sub()) || (tab() === "chats" && arch())}>
             <button class="icon" onClick={() => history.back()} title="Назад"><ArrowLeft size={20} /></button>
           </Show>
           <Show when={find() !== undefined} fallback={<>
-            <h2 class="ellipsis">{tab() === "settings" && sub() ? sub() : titles()[tab()]}</h2>
+            <h2 class="ellipsis">{tab() === "settings" && sub() ? sub() : tab() === "chats" && arch() ? "Архив" : titles()[tab()]}</h2>
             <NetDot n={peers()} />
             <Show when={tab() === "chats"}><button class="icon" onClick={() => setFind("")} title="Поиск"><Search size={20} /></button></Show>
           </>}>
@@ -1228,13 +1271,34 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         <Switch>
           <Match when={tab() === "chats"}>
             <div class="scroll">
+              <Show when={!arch() && !find()?.trim() && archived().length}>
+                <button class="row chat-row" onClick={openArch}>
+                  <div class="avatar archive"><Archive size={24} /></div>
+                  <div class="grow">
+                    <div class="row-top"><b class="ellipsis">Архив</b></div>
+                    <div class="row-bottom">
+                      <span class="muted ellipsis">{archived().map((r) => chatName(r.id)).join(", ")}</span>
+                      <Show when={sum(archived())}><b class="badge off">{sum(archived())}</b></Show>
+                    </div>
+                  </div>
+                </button>
+              </Show>
               <For each={sortedRows()}>
                 {(r) => {
                   const l = () => r.last;
                   const draft = () => getDraft(draftKey(r.id));
-                  const name = () => (r.id ? nameOf(r.id) : "Общий чат");
+                  const name = () => chatName(r.id);
+                  const dx = () => (rowSwipe()?.id === r.id ? rowSwipe()!.dx : 0);
                   return (
-                    <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => openChat(r.id)}>
+                    // A held or slid touch must not end in a click on the row or on the menu's backdrop.
+                    <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => !rowHeld && openChat(r.id)}
+                      onContextMenu={(e) => rowContext(e, r.id)}
+                      onPointerDown={(e) => rowPress(e, r.id)} onPointerMove={(e) => rowMove(e, r.id)} onPointerUp={(e) => rowRelease(e, r)} onPointerCancel={(e) => rowRelease(e, r)}
+                      onTouchEnd={(e) => rowHeld && e.preventDefault()}
+                      style={dx() ? { transform: `translateX(${dx()}px)`, transition: "none" } : {}}>
+                      <Show when={dx()}>
+                        <span class="swipe-archive" style={{ opacity: Math.min(1, -dx() / 70) }}>{r.archived ? <ArchiveRestore size={22} /> : <Archive size={22} />}</span>
+                      </Show>
                       {r.id ? <Avatar id={r.id} dot /> : <div class="avatar group"><Hash size={20} /></div>}
                       <div class="grow">
                         <div class="row-top">
@@ -1247,6 +1311,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                         </div>
                         <div class="row-bottom">
                           <span class="muted ellipsis">{draft() ? <><span class="draft">Черновик:</span> {draft()}</> : preview(r)}</span>
+                          <Show when={r.pin !== null}><Pin size={15} class="muted pin-mark" aria-label="Закреплён" /></Show>
                           <Show when={r.unread}><b class="badge" classList={{ off: r.muted }}>{r.unread}</b></Show>
                         </div>
                       </div>
@@ -1256,8 +1321,37 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
               </For>
               <Show when={!rows().length}><p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p></Show>
               <Show when={find()?.trim() && !sortedRows().length}><p class="muted small pad">Ничего не найдено</p></Show>
+              <Show when={arch() && !find()?.trim() && !archived().length}><p class="muted small pad">Архив пуст</p></Show>
             </div>
-            <button class="fab" onClick={() => setTab("people")} title="Новый чат"><Pencil size={22} /></button>
+            <Show when={!arch()}><button class="fab" onClick={() => setTab("people")} title="Новый чат"><Pencil size={22} /></button></Show>
+            <Show when={rows().find((r) => r.id === rowMenu()?.id)}>
+              {(r) => {
+                const full = () => rows().filter((x) => x.pin !== null).length >= 5;
+                return (
+                  // Android may send its own long-press contextmenu after ours has opened the menu.
+                  <div class="overlay" onClick={() => setRowMenu(undefined)} onContextMenu={(e) => (e.preventDefault(), rowHeld || setRowMenu(undefined))}>
+                    <div class="menu" style={{ left: `${Math.min(rowMenu()!.x, innerWidth - 240)}px`, top: `${Math.min(rowMenu()!.y, innerHeight - 200)}px` }}>
+                      <Show when={!r().archived}>
+                        <button disabled={r().pin === null && full()} onClick={() => setFlag("set_pinned", r().id, r().pin === null)}>
+                          {r().pin === null ? <Pin size={16} /> : <PinOff size={16} />} {r().pin !== null ? "Открепить" : full() ? "Закреплено уже 5" : "Закрепить"}
+                        </button>
+                      </Show>
+                      <button onClick={() => setFlag("set_archived", r().id, !r().archived)}>
+                        {r().archived ? <ArchiveRestore size={16} /> : <Archive size={16} />} {r().archived ? "Из архива" : "В архив"}
+                      </button>
+                      <button onClick={() => setFlag("set_muted", r().id, !r().muted)}>
+                        {r().muted ? <Bell size={16} /> : <BellOff size={16} />} {r().muted ? "Со звуком" : "Без звука"}
+                      </button>
+                      <Show when={r().unread}>
+                        <button onClick={() => invoke("mark_read", { chat: r().id }).then(loadChats, (e) => alert("Не удалось отметить: " + errText(e)))}>
+                          <CheckCheck size={16} /> Отметить прочитанным
+                        </button>
+                      </Show>
+                    </div>
+                  </div>
+                );
+              }}
+            </Show>
           </Match>
           <Match when={tab() === "calls"}>
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
