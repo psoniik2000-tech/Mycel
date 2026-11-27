@@ -1504,6 +1504,16 @@ impl Node {
         self.wipe(&[target])
     }
 
+    /// Erases a whole chat from this device; its group stays, so a new message shows it again.
+    pub fn delete_chat(&self, chat: &Chat) -> Result<()> {
+        let rows = self.st.lock().unwrap().store.events(chat_key(chat))?;
+        let ids = rows
+            .iter()
+            .map(|b| Ok(postcard::from_bytes::<Event>(b)?.id))
+            .collect::<Result<Vec<_>>>()?;
+        self.wipe(&ids)
+    }
+
     pub fn pin(&self, target: EventId, pinned: bool) -> Result<Event> {
         let chat = self.event(&target)?.0;
         self.send_event(&chat, EventBody::Pin { target, pinned })

@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -32,7 +32,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
-type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null };
+type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null; removed: boolean };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean; anchor: string | null };
@@ -1221,6 +1221,27 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     }));
     loadChats();
   };
+  const [profile, setProfile] = createSignal<string>();
+  // «Удалить чат» stays on this device; «Удалить контакт» also hides the person in «Люди» (no kick in the protocol).
+  const deleteChat = async (id: string, contact: boolean) => {
+    const text = contact
+      ? `Удалить ${nameOf(id)} из контактов? Переписка удалится с этого устройства${simple() ? "" : ", из пространства человек не исключается"}`
+      : `Удалить чат с ${nameOf(id)}? Переписка удалится только на этом устройстве`;
+    if (!(await ask(text, { title: contact ? "Удалить контакт" : "Удалить чат", kind: "warning", okLabel: "Удалить", cancelLabel: "Отмена" }))) return;
+    try {
+      await invoke("delete_chat", { chat: id, contact });
+    } catch (e) {
+      return message("Не удалось удалить: " + errText(e), { kind: "error" });
+    }
+    setProfile();
+    if (chat() === id) {
+      setMsgs([]);
+      setChat("");
+      if (chatOpen()) history.back();
+    }
+    loadChats();
+    loadMembers();
+  };
   const openChat = async (id: string) => {
     if (id && memberOf(id)?.me) return;
     setCallErr("");
@@ -1517,7 +1538,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
           </Match>
           <Match when={tab() === "people"}>
             <NewGroup people={members()} onEnter={p.onEnter} />
-            <People members={members()} simple={simple()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
+            <People members={members()} simple={simple()} onWrite={openChat} onProfile={setProfile} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
             <Show when={sub()} fallback={
@@ -1626,7 +1647,14 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         {(k) => (
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
             peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
-            openChat={openChat} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute} />
+            openChat={openChat} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute}
+            onProfile={() => setProfile(k.c)} onDelete={() => deleteChat(k.c, false)} />
+        )}
+      </Show>
+      <Show when={profile()} keyed>
+        {(id) => (
+          <Profile id={id} inCall={!!active()} onClose={() => setProfile()} onDelete={(c) => deleteChat(id, c)}
+            onWrite={() => (setProfile(), openChat(id))} onCall={(v) => (setProfile(), startCall(v, id))} />
         )}
       </Show>
       <Show when={people().some((m) => m.me && !m.name)}>
@@ -1649,12 +1677,46 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   );
 }
 
-function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) => void; onCall: (id: string, video: boolean) => void; inCall: boolean }) {
+/** A person's profile, like Telegram's: opened from the chat header and from «Люди». */
+function Profile(p: { id: string; inCall: boolean; onClose: () => void; onWrite: () => void; onCall: (video: boolean) => void; onDelete: (contact: boolean) => void }) {
+  const m = () => memberOf(p.id);
+  const [code, setCode] = createSignal<{ link: string; svg: string }>();
+  const [err, setErr] = createSignal("");
+  const showCode = () => (code() ? setCode() : invoke<{ link: string; svg: string }>("safety_code", { id: p.id }).then(setCode, (e) => setErr(errText(e))));
+  return (
+    <div class="modal" onClick={p.onClose}>
+      <div class="card dialog profile" onClick={(e) => e.stopPropagation()}>
+        <Avatar id={p.id} dot />
+        <h3>{nameOf(p.id)}</h3>
+        <div class="muted small" classList={{ online: !!m()?.link }}>{m()?.link ? "в сети" : linkText(m())}<Username id={p.id} /></div>
+        <button onClick={p.onWrite}><MessageCircle size={18} /> Написать</button>
+        <button disabled={p.inCall} onClick={() => p.onCall(false)}><Phone size={18} /> Позвонить</button>
+        <button disabled={p.inCall} onClick={() => p.onCall(true)}><Video size={18} /> Видеозвонок</button>
+        <button onClick={showCode}><ShieldCheck size={18} /> Код безопасности</button>
+        <Show when={code()}>
+          {(c) => (
+            <>
+              <div class="qr" innerHTML={c().svg} />
+              <code class="path">{c().link}</code>
+              <p class="muted small">Сверьте код с собеседником лично; отметить проверенным можно в «Люди»</p>
+            </>
+          )}
+        </Show>
+        <Show when={err()}><p class="error">{err()}</p></Show>
+        <button class="del" onClick={() => p.onDelete(false)}><Trash2 size={18} /> Удалить чат</button>
+        <button class="del" onClick={() => p.onDelete(true)}><UserMinus size={18} /> Удалить контакт</button>
+      </div>
+    </div>
+  );
+}
+
+function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) => void; onProfile: (id: string) => void; onCall: (id: string, video: boolean) => void; inCall: boolean }) {
   const [inv, setInv] = createSignal<{ link: string; svg: string }>();
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const amAdmin = () => p.members.some((m) => m.me && m.admin);
+  const shown = () => p.members.filter((m) => !m.removed);
   // Verified members on this device: name (or short id) -> safety code; "!" = the key changed since.
   const vKey = `verified:${spaceId}`;
   const readVer = (): Record<string, string> => {
@@ -1779,11 +1841,11 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
           )}
         </Show>
       </div>
-      <p class="section muted">{p.simple ? `Контакты · ${p.members.length - 1}` : `Участники · ${p.members.length}`}</p>
-      <For each={p.members}>
+      <p class="section muted">{p.simple ? `Контакты · ${shown().length - 1}` : `Участники · ${shown().length}`}</p>
+      <For each={shown()}>
         {(m) => (
-          <div class="row person" classList={{ link: !m.me }} onClick={() => !m.me && p.onWrite(m.id)}>
-            <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onWrite(m.id)} />
+          <div class="row person" classList={{ link: !m.me }} onClick={() => !m.me && p.onProfile(m.id)}>
+            <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onProfile(m.id)} />
             <div class="grow">
               <b class="ellipsis">{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
               <div class="muted small" classList={{ online: !!m.link }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={p.simple}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !p.simple}> · админ</Show>
@@ -1827,7 +1889,7 @@ const isVideo = (path: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(path);
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
   inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void;
-  muted: boolean; onMute: (on: boolean) => void;
+  muted: boolean; onMute: (on: boolean) => void; onProfile: () => void; onDelete: () => void;
 }) {
   const key = draftKey(p.chat);
   const [text, setText] = createSignal(getDraft(key));
@@ -2239,8 +2301,8 @@ function Chat(p: {
     <section class="chat">
       <Show when={sel().length} fallback={<header class="bar">
         <button class="icon back" onClick={p.back} title="Назад"><ArrowLeft size={20} /></button>
-        {p.chat ? <Avatar id={p.chat} dot /> : <div class="avatar group small-av"><Hash size={18} /></div>}
-        <div class="grow ellipsis">
+        {p.chat ? <Avatar id={p.chat} dot onClick={p.onProfile} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
+        <div class="grow ellipsis" classList={{ link: !!p.chat }} onClick={() => p.chat && p.onProfile()}>
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
           <div class="muted small ellipsis" classList={{ typing: !!typingText(p.chat), online: !!memberOf(p.chat)?.link }} title={p.chat ? linkText(memberOf(p.chat)) : ""}>
             {typingText(p.chat) || (p.chat ? presence(memberOf(p.chat)) : `${p.members} участн.`)}
@@ -2264,6 +2326,10 @@ function Chat(p: {
               <button onClick={() => p.onMute(!p.muted)}>{p.muted ? <><Bell size={18} /> Включить уведомления</> : <><BellOff size={18} /> Без звука</>}</button>
               <button onClick={(e) => (e.stopPropagation(), setTtlPick(true))}>
                 <Timer size={18} /> <span class="grow">Автоудаление</span><span class="muted">{TTLS.find(([s]) => s === ttl())?.[1] ?? `${ttl()} с`}</span></button>
+              <Show when={p.chat}>
+                <button onClick={p.onProfile}><Users size={18} /> Профиль</button>
+                <button class="del" onClick={p.onDelete}><Trash2 size={18} /> Удалить чат</button>
+              </Show>
               <div class="muted small more-net"><NetDot n={p.peers} /><Show when={p.chat}><div>{linkText(memberOf(p.chat))}</div></Show></div>
               </Show>
             </div>

@@ -561,6 +561,8 @@ struct Member {
     link: Option<&'static str>,
     /// Unix ms of the last message received from this device.
     seen: Option<u64>,
+    /// Removed from «Люди» on this device; still named in chats.
+    removed: bool,
 }
 
 /// A row of the chat list.
@@ -961,6 +963,8 @@ async fn unlock(
                 muted: vec![],
                 pinned: vec![],
                 archived: vec![],
+                hidden: vec![],
+                removed: vec![],
             });
             id
         }
@@ -1443,6 +1447,11 @@ async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
                 id,
             })
         })
+        .filter(|r| {
+            !r.as_ref().is_ok_and(|r: &ChatRow| {
+                r.last.is_none() && flags.is_some_and(|s| s.hidden.contains(&r.id))
+            })
+        })
         .collect()
 }
 
@@ -1476,11 +1485,38 @@ fn set_archived(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()>
         .map_err(|e| e.to_string())
 }
 
+/// «Удалить чат»: erases it here and leaves it out of the list until a new message;
+/// `contact` also removes the person from «Люди».
 #[tauri::command]
-async fn open_dm(st: State<'_, App>, peer: String) -> R<()> {
-    let n = &st.node()?;
+async fn delete_chat(app: AppHandle, st: State<'_, App>, chat: String, contact: bool) -> R<()> {
+    let (n, space) = &st.open()?;
+    n.delete_chat(&chat_of(n, &chat)?).map_err(err)?;
+    spaces::List::edit(&data_dir(&app)?, |l| {
+        if let Some(s) = l.spaces.iter_mut().find(|s| s.id == *space) {
+            s.pinned.retain(|c| *c != chat);
+            s.hidden.retain(|c| *c != chat);
+            s.removed.retain(|c| *c != chat);
+            s.hidden.push(chat.clone());
+            if contact {
+                s.removed.push(chat);
+            }
+        }
+    })
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_dm(app: AppHandle, st: State<'_, App>, peer: String) -> R<()> {
+    let (n, space) = &st.open()?;
     let p = chat_of(n, &peer)?.ok_or("no such member")?;
-    n.open_dm(p).map_err(err)
+    n.open_dm(p).map_err(err)?;
+    // Writing to someone removed brings them back to «Люди».
+    spaces::List::edit(&data_dir(&app)?, |l| {
+        if let Some(s) = l.spaces.iter_mut().find(|s| s.id == *space) {
+            s.removed.retain(|c| *c != peer);
+        }
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1960,8 +1996,10 @@ async fn call_stats(st: State<'_, App>) -> R<Vec<Link>> {
 }
 
 #[tauri::command]
-async fn members(st: State<'_, App>) -> R<Vec<Member>> {
-    let n = &st.node()?;
+async fn members(app: AppHandle, st: State<'_, App>) -> R<Vec<Member>> {
+    let (n, space) = &st.open()?;
+    let list = spaces::List::load(&data_dir(&app)?).map_err(|e| e.to_string())?;
+    let removed = list.space(space).map_or(&[][..], |s| &s.removed);
     let (me, admin) = (n.account(), n.admin().map_err(err)?);
     let mut prof = n.profiles().map_err(err)?;
     // Space members, then contacts added by link (§4.2).
@@ -1981,6 +2019,7 @@ async fn members(st: State<'_, App>) -> R<Vec<Member>> {
             Member {
                 link: link.map(|r| if r { "relay" } else { "direct" }),
                 seen,
+                removed: removed.contains(&short(m)),
                 id: short(m),
                 me: *m == me,
                 admin: *m == admin,
@@ -2174,6 +2213,8 @@ async fn restore_backup(app: AppHandle, path: String, password: String, phrase: 
                 muted: vec![],
                 pinned: vec![],
                 archived: vec![],
+                hidden: vec![],
+                removed: vec![],
             });
             if m.lock().unwrap().is_empty() {
                 list.last = Some(id.clone());
@@ -2431,6 +2472,7 @@ pub fn run() {
             history,
             chats,
             open_dm,
+            delete_chat,
             set_profile,
             send,
             edit,
