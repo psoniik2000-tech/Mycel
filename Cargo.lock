@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-anchor"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "mycel-core",
@@ -4237,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-app"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "igd-next 0.18.0",
@@ -4264,7 +4264,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4289,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-crypto"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4305,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-media"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "blurhash",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-net"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "iroh",
@@ -4329,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-proto"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "postcard",
  "serde",
@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-store"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4347,7 +4347,7 @@ dependencies = [
 
 [[package]]
 name = "mycel-sync"
-version = "0.1.9"
+version = "0.1.10"
 
 [[package]]
 name = "n0-dns-resolver"
