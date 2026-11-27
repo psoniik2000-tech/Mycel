@@ -20,6 +20,7 @@ import { CallMedia, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
+import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameSettings, withBox, withServer } from "./directory";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
@@ -90,13 +91,13 @@ const DEFAULT_MAILBOX = "https://mycel-box.psoniik2000.workers.dev";
 const mailbox = () => (localStorage.getItem("mailbox") ?? DEFAULT_MAILBOX) || null;
 /** Applies changed connection settings to the open space at once (it reopens). */
 const reopen = (id: string) =>
-  invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: anchor(id), relays: relays(id), mailbox: mailbox() });
+  invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: anchor(id), relays: withServer(relays(id)), mailbox: withBox(mailbox()) });
 const autoAnchor = () => !android && localStorage.getItem("anchor_auto") !== "0";
 /** Turns this PC's anchor on (relay at the external IP, port 3340) or off; reopens the space. Returns the URL. */
 async function setAnchor(id: string, on: boolean): Promise<string> {
   // shortcut: fixed port 3340; a port field when someone needs another one.
   const u = on ? `http://${await invoke<string>("public_ip")}:3340` : "";
-  await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: u || null, relays: relays(id), mailbox: mailbox() });
+  await invoke("unlock", { id, name: "", password: null, remember: true, n0: n0(id), anchor: u || null, relays: withServer(relays(id)), mailbox: withBox(mailbox()) });
   u ? localStorage.setItem(sk("anchor", id), u) : localStorage.removeItem(sk("anchor", id));
   return u;
 }
@@ -316,7 +317,7 @@ export default function App() {
   const opened = async (inSpace: boolean) => {
     await refresh();
     setStage(inSpace ? "main" : "onboard");
-    if (inSpace) tryAutoAnchor(spaceId);
+    if (inSpace) (tryAutoAnchor(spaceId), keepRegistered(spaceId));
   };
   // A remembered space opens at once; otherwise (or if the saved password no longer fits) the password screen.
   const enter = async (sp?: Space, h?: How) => {
@@ -324,7 +325,7 @@ export default function App() {
     setHow(h);
     if (sp?.remembered) {
       try {
-        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(sp.id), anchor: anchor(sp.id), relays: relays(sp.id), mailbox: mailbox() }));
+        return await opened(await invoke<boolean>("unlock", { id: sp.id, name: "", password: null, remember: true, n0: n0(sp.id), anchor: anchor(sp.id), relays: withServer(relays(sp.id)), mailbox: withBox(mailbox()) }));
       } catch {
         // falls through to the password screen
       }
@@ -392,7 +393,8 @@ export default function App() {
             <Onboard how={how()} setHow={setHow} link={invite()} setLink={setInvite} onDone={() => setStage("main")} />
           </Match>
           <Match when={stage() === "main" && s().spaces.find((x) => x.id === s().current)}>
-            {(sp) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh} />}
+            {(sp) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh}
+              onEnter={async (id) => { const sp = (await refresh()).spaces.find((x) => x.id === id); if (sp) enter(sp); }} />}
           </Match>
         </Switch>
       )}
@@ -419,7 +421,7 @@ function Lock(p: { space?: Space; how?: How; count: number; onDone: (inSpace: bo
     setBusy(true);
     setErr("");
     try {
-      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name().trim() || defaultName, password: pw(), remember: remember(), n0: n0(p.space?.id), anchor: anchor(p.space?.id), relays: relays(p.space?.id), mailbox: mailbox() }));
+      p.onDone(await invoke<boolean>("unlock", { id: p.space?.id ?? null, name: name().trim() || defaultName, password: pw(), remember: remember(), n0: n0(p.space?.id), anchor: anchor(p.space?.id), relays: withServer(relays(p.space?.id)), mailbox: withBox(mailbox()) }));
     } catch (e) {
       setErr(exists() ? "Неверный пароль" : errText(e));
     }
@@ -1066,6 +1068,7 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
   const [err, setErr] = createSignal(crashed ? "Сканер QR не сработал на этом телефоне. Скопируйте ссылку-приглашение и вставьте её в поле выше" : "");
   const [busy, setBusy] = createSignal("");
   const [stage, setStage] = createSignal("");
+  const [other, setOther] = createSignal(false);
   const run = async (what: string, cmd: string, args?: Record<string, unknown>) => {
     setBusy(what);
     setErr("");
@@ -1085,6 +1088,11 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
     setBusy("");
   };
   return (
+    <Show when={p.how || other()} fallback={
+      <div class="center">
+        <QuickStart space={spaceId} color={Math.floor(Math.random() * PALETTE.length)} onDone={p.onDone} onOther={() => setOther(true)} />
+      </div>
+    }>
     <div class="center">
       <div class="card intro">
         <img src={logo} class="logo" alt="" />
@@ -1125,10 +1133,11 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
         </Show>
       </div>
     </div>
+    </Show>
   );
 }
 
-function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void }) {
+function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void; onEnter: (id: string) => void }) {
   const [del, setDel] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
@@ -1149,7 +1158,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const [wide, setWide] = createSignal(wideQuery.matches);
   const chatVisible = () => (wide() || chatOpen()) && focused();
   // Simple mode has no space chat ("").
-  const loadChats = () => invoke<ChatRow[]>("chats").then((r) => setRows(simple() ? r.filter((x) => x.id) : r));
+  const loadChats = () => invoke<ChatRow[]>("chats").then((r) => setRows(simple() && p.space.name === SIMPLE_NAME ? r.filter((x) => x.id) : r));
   createEffect(() => (simple(), untrack(loadChats)));
   // Unread counts follow our Read receipts: reload them once the receipt is stored.
   const markRead = () => invoke("mark_read", { chat: chat() }).catch(() => {}).then(loadChats);
@@ -1427,6 +1436,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   </div>
                 </button>
               </Show>
+              <Show when={!arch() && !find()?.trim()}>
+                <SpaceRows current={p.space.id} personal={SIMPLE_NAME} onEnter={p.onEnter} />
+              </Show>
               <For each={sortedRows()}>
                 {(r) => {
                   const l = () => r.last;
@@ -1465,6 +1477,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
               </For>
               <Show when={!rows().length}><p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p></Show>
               <Show when={find()?.trim() && !sortedRows().length}><p class="muted small pad">Ничего не найдено</p></Show>
+              <Show when={find()?.trim()}>
+                <DirSearch q={find()!} onOpen={(id) => (setFind(undefined), loadChats(), openChat(id))} />
+              </Show>
               <Show when={arch() && !find()?.trim() && !archived().length}><p class="muted small pad">Архив пуст</p></Show>
             </div>
             <Show when={!arch()}><button class="fab" onClick={() => setTab("people")} title="Новый чат"><Pencil size={22} /></button></Show>
@@ -1501,6 +1516,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
           </Match>
           <Match when={tab() === "people"}>
+            <NewGroup people={members()} onEnter={p.onEnter} />
             <People members={members()} simple={simple()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
@@ -1510,7 +1526,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   <Show when={members().find((m) => m.me)}>{(me) => <Avatar id={me().id} />}</Show>
                   <div class="grow">
                     <b class="ellipsis">{members().find((m) => m.me)?.name ?? "Без имени"}</b>
-                    <div class="muted small">Имя и аватар</div>
+                    <div class="muted small">Имя и аватар<Username id="" me /></div>
                   </div>
                 </button>
                 <div class="list">
@@ -1540,6 +1556,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 <Switch>
                   <Match when={sub() === "Профиль"}>
                     <ProfileForm submit="Сохранить" />
+                    <UsernameSettings space={p.space.id} />
                   </Match>
                   <Match when={sub() === "Оформление"}>
                     <h3>Тема</h3>
@@ -1769,7 +1786,7 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
             <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
               <b class="ellipsis">{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small" classList={{ online: !!m.link }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={m.admin && !p.simple}> · админ</Show>
+              <div class="muted small" classList={{ online: !!m.link }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={p.simple}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !p.simple}> · админ</Show>
                 <Show when={status(m) === "ok"}> · проверен</Show></div>
               <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
@@ -2346,6 +2363,7 @@ function Chat(p: {
                         <Show when={head().text}>
                           <span class="text">{re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{s}</mark> : s)) : head().text}</span>
                         </Show>
+                        <Show when={joinLink(head().text ?? "")}><JoinGroup text={head().text} mine={m.mine} /></Show>
                         <Show when={reactionsOf(m).length}>
                           <div class="reacts">
                             <For each={reactionsOf(m)}>

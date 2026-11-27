@@ -11,6 +11,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
+mod directory;
 mod spaces;
 mod update;
 mod vault;
@@ -59,7 +60,7 @@ static RELAY: Mutex<Option<Relay>> = Mutex::new(None);
 /// Starts the anchor's relay at `url` (kept if it already runs there); returns whether the
 /// router opened the port.
 #[cfg(not(target_os = "android"))]
-async fn start_relay(url: &str) -> bool {
+async fn start_relay(url: &str, root: &std::path::Path) -> bool {
     if let Some(r) = RELAY.lock().unwrap().as_ref().filter(|r| r.url == url) {
         return r.mapped.load(Ordering::Relaxed);
     }
@@ -67,7 +68,12 @@ async fn start_relay(url: &str) -> bool {
     let port = port_of(url);
     let mapped = Arc::new(AtomicBool::new(upnp(port, true).await.is_ok()));
     let up = Arc::new(AtomicBool::new(false));
-    let task = tauri::async_runtime::spawn(keep_relay(url.to_string(), up.clone(), mapped.clone()));
+    let task = tauri::async_runtime::spawn(keep_relay(
+        url.to_string(),
+        root.to_path_buf(),
+        up.clone(),
+        mapped.clone(),
+    ));
     // Briefly, so the node finds its relay up; if the port is busy it keeps retrying.
     for _ in 0..30 {
         if up.load(Ordering::Relaxed) {
@@ -88,11 +94,16 @@ async fn start_relay(url: &str) -> bool {
 /// Runs the relay, restarting it 3 s after it stops or fails to start; renews the UPnP lease
 /// (7 days where a permanent one is refused) every 6 h.
 #[cfg(not(target_os = "android"))]
-async fn keep_relay(url: String, up: Arc<AtomicBool>, mapped: Arc<AtomicBool>) {
+async fn keep_relay(
+    url: String,
+    root: std::path::PathBuf,
+    up: Arc<AtomicBool>,
+    mapped: Arc<AtomicBool>,
+) {
     const RENEW: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
     let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW, RENEW);
     loop {
-        match mycel_core::spawn_relay(&url).await {
+        match mycel_core::spawn_anchor(&url, &root).await {
             Ok(mut s) => {
                 up.store(true, Ordering::Relaxed);
                 let stopped = loop {
@@ -986,7 +997,7 @@ async fn unlock(
         Some(u) => {
             #[cfg(windows)]
             allow_firewall(port_of(u));
-            start_relay(u).await;
+            start_relay(u, &root).await;
         }
         None => {
             let old = RELAY.lock().unwrap().take();
@@ -2405,6 +2416,12 @@ pub fn run() {
             allow_preview,
             create_space,
             join,
+            directory::dir_register,
+            directory::dir_search,
+            directory::dir_add,
+            directory::dir_name_of,
+            directory::create_group,
+            directory::join_group,
             invite,
             contact_invite,
             device_invite,

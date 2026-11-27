@@ -10,7 +10,8 @@ use iroh_blobs::store::fs::{FsStore, options::Options};
 use mycel_crypto::mls::{Incoming, Mls};
 use mycel_crypto::{SecretKey, envelope_id, sign_addr, sign_event, verify_addr, verify_event};
 use mycel_net::{
-    BLOBS_ALPN, CALL_ALPN, ConnInbox, EndpointAddr, EndpointId, EndpointTicket, JoinInbox, Net,
+    BLOBS_ALPN, CALL_ALPN, ConnInbox, DIR_ALPN, EndpointAddr, EndpointId, EndpointTicket,
+    JoinInbox, Net,
 };
 use mycel_proto::{
     BlobRef, DeviceId, Envelope, Event, EventBody, EventId, Forwarded, JoinReq, JoinResp,
@@ -27,9 +28,9 @@ use tokio::sync::mpsc;
 
 pub mod backup;
 mod call;
+pub mod dir;
+mod serverbox;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
-#[cfg(not(target_os = "android"))]
-pub use iroh_relay::server::Server as RelayServer;
 pub use mycel_crypto::safety_code;
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
@@ -66,7 +67,9 @@ pub struct Opts {
     pub keep_blobs: bool,
     /// Largest media file to send or download, bytes; 0 = 4 GiB (§8.1).
     pub max_blob: u64,
-    /// HTTP mailbox (`mailbox/worker.js`) that keeps envelopes for members who are offline.
+    /// HTTP mailbox (`mailbox/worker.js`) that keeps envelopes for members who are offline;
+    /// several separated by spaces (the user's one first, then the main server's, §4.6):
+    /// every envelope goes to each, each is pulled.
     pub mailbox: Option<String>,
 }
 
@@ -459,7 +462,7 @@ pub struct Node {
     max_blob: u64,
     call: Mutex<Option<call::Call>>,
     frames: Mutex<Option<mpsc::Sender<call::Frame>>>,
-    mailbox: Option<Mailbox>,
+    mailbox: Vec<Mailbox>,
     /// Feeds envelopes pulled from the mailbox to the inbox loop.
     box_tx: mpsc::Sender<Vec<Envelope>>,
     /// This phone's FCM token: the mailbox wakes it when something new is posted.
@@ -560,7 +563,12 @@ impl Node {
         let mut relays = st.relays()?;
         relays.extend(opts.own_relay.clone());
         relays.extend(opts.extra_relays.iter().cloned());
-        let mailbox = opts.mailbox.as_deref().map(Mailbox::new).transpose()?;
+        let mailbox = opts
+            .mailbox
+            .iter()
+            .flat_map(|m| m.split_whitespace())
+            .map(Mailbox::new)
+            .collect::<Result<Vec<_>>>()?;
         let (net, mut inbox, joins, conns) = Net::bind(key, opts.port, &relays, opts.n0).await?;
         let mut bopts = Options::new(&dir.join("blobs"));
         bopts.gc = Some(GcConfig {
@@ -1947,6 +1955,10 @@ impl Node {
 
     async fn serve_conns(self: Arc<Self>, mut conns: ConnInbox) {
         while let Some(conn) = conns.recv().await {
+            // Only a main server's DirServer answers the directory.
+            if conn.alpn() == DIR_ALPN {
+                continue;
+            }
             if conn.alpn() == CALL_ALPN {
                 if let Err(e) = self.add_call_conn(conn, None) {
                     eprintln!("mycel: call connection refused: {e}");
@@ -2076,7 +2088,7 @@ impl Node {
     }
 
     /// A message sent within `FAST_FOR` still has no receipt.
-    fn awaiting_receipt(&self) -> bool {
+    pub fn awaiting_receipt(&self) -> bool {
         self.unacked
             .lock()
             .unwrap()
@@ -2235,7 +2247,12 @@ impl Node {
 
     /// `post_box` to the mailbox topic of `space` (our other devices pull our space's topic).
     fn post_box_at(&self, env: &Envelope, space: &[u8], push: bool, chat: Chat) {
-        let Some(b) = &self.mailbox else { return };
+        for b in &self.mailbox {
+            self.post_box_to(b, env, space, push, chat);
+        }
+    }
+
+    fn post_box_to(&self, b: &Mailbox, env: &Envelope, space: &[u8], push: bool, chat: Chat) {
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
         };
@@ -2285,18 +2302,35 @@ impl Node {
 
     /// Pulls the topic of the space and of every contact (each has its own space id, §4.2).
     async fn try_poll_box(&self, tx: &mpsc::Sender<Vec<Envelope>>) -> Result<()> {
-        let Some(b) = &self.mailbox else {
-            return Ok(());
-        };
+        let mut res = Ok(());
+        for (i, b) in self.mailbox.iter().enumerate() {
+            // Each mailbox counts its own seq: the first keeps the old keys.
+            let at = match i {
+                0 => String::new(),
+                _ => format!("@{}", &Hash::new(b.url.as_bytes()).to_hex()[..8]),
+            };
+            if let Err(e) = self.try_poll_one(b, &at, tx).await {
+                res = Err(e);
+            }
+        }
+        res
+    }
+
+    async fn try_poll_one(
+        &self,
+        b: &Mailbox,
+        at: &str,
+        tx: &mpsc::Sender<Vec<Envelope>>,
+    ) -> Result<()> {
         // (space id, meta key of its last seen seq).
         let topics: Vec<(Vec<u8>, String)> = {
             let st = self.st.lock().unwrap();
             if !st.in_space()? {
                 return Ok(());
             }
-            let mut t = vec![(st.group()?[..16].to_vec(), "box_seq".to_string())];
+            let mut t = vec![(st.group()?[..16].to_vec(), format!("box_seq{at}"))];
             for g in st.contacts()? {
-                t.push((g[..16].to_vec(), format!("box_seq:{}", hex(&g[..16]))));
+                t.push((g[..16].to_vec(), format!("box_seq:{}{at}", hex(&g[..16]))));
             }
             t
         };
@@ -2516,10 +2550,17 @@ impl Node {
             return self.accept_link(from, &req);
         }
         let sib = self.sibling_kps()?;
+        // The directory's reusable contact link (§4.6) is not burned.
+        let public = self.is_public_secret(&req.secret);
         let mut st = self.st.lock().unwrap();
-        if st
-            .store
-            .take_meta(&format!("contact:{}", hex(&req.secret)))?
+        if public {
+            let account = st.account_of(from.as_bytes())?;
+            ensure!(st.gid(&Some(account)).is_err(), "already a contact");
+        }
+        if public
+            || st
+                .store
+                .take_meta(&format!("contact:{}", hex(&req.secret)))?
         {
             // A contact link: a new pair group with the two of us and our other devices (§4.2);
             // the joiner adds its own other devices.
@@ -2783,20 +2824,197 @@ pub async fn check_server(url: &str, mailbox: bool) -> Result<u64> {
     Ok(ms)
 }
 
+/// A running relay and, on a main server, its username directory (§4.6). Stops when dropped.
+#[cfg(not(target_os = "android"))]
+pub struct RelayServer {
+    task: tokio::task::JoinHandle<()>,
+    svc: iroh_relay::server::RelayService,
+    dir: Option<dir::DirServer>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for RelayServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        // Relayed clients live outside the accept loop: disconnect them, so they move to
+        // whatever serves the port next.
+        let svc = self.svc.clone();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { svc.shutdown().await });
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+impl RelayServer {
+    /// Endpoint id of the directory, if this server runs one.
+    pub fn dir_id(&self) -> Option<EndpointId> {
+        self.dir.as_ref().map(|d| d.id())
+    }
+
+    /// Waits until the accept loop stops.
+    pub async fn join(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.task).await
+    }
+}
+
 /// iroh-relay over plain HTTP on the port of `url` (like `http://1.2.3.4:3340`), all interfaces.
-/// Pass the same URL as [`Opts::own_relay`]. Kept running until the returned server is dropped or shut down.
+/// Pass the same URL as [`Opts::own_relay`]. Kept running until the returned server is dropped.
 // shortcut: no TLS (relayed QUIC is end-to-end encrypted anyway, but not disguised as HTTPS);
 // serve HTTPS (ACME) once an anchor has a domain. Needs the TCP port forwarded and NAT loopback on the router.
 #[cfg(not(target_os = "android"))]
-pub async fn spawn_relay(url: &str) -> Result<iroh_relay::server::Server> {
-    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+pub async fn spawn_relay(url: &str) -> Result<RelayServer> {
+    relay_with(url, None, None).await
+}
+
+/// An anchor that is also a main server (§4.6): the relay, the username directory (`dir_key`,
+/// `directory.json` in `data`; the relay port answers its id at [`dir::ID_PATH`]) and a mailbox
+/// (the `mailbox/worker.js` API on the relay port, envelopes in `data/box`).
+#[cfg(not(target_os = "android"))]
+pub async fn spawn_anchor(url: &str, data: &Path) -> Result<RelayServer> {
+    let id = Arc::new(std::sync::OnceLock::new());
+    let boxes = Arc::new(serverbox::ServerBox::open(data)?);
+    let mut relay = relay_with(url, Some(id.clone()), Some(boxes)).await?;
+    let d = dir::DirServer::spawn(data, url).await?;
+    let _ = id.set(d.id().to_string());
+    relay.dir = Some(d);
+    Ok(relay)
+}
+
+/// The iroh relay service with our own accept loop, so the port can also answer `/mycel-id`
+/// and, with `boxes`, the mailbox.
+#[cfg(not(target_os = "android"))]
+async fn relay_with(
+    url: &str,
+    dir_id: Option<Arc<std::sync::OnceLock<String>>>,
+    boxes: Option<Arc<serverbox::ServerBox>>,
+) -> Result<RelayServer> {
+    use http::response::Builder;
+    use http_body_util::Full;
+    use hyper::body::{Bytes, Incoming};
+    use iroh_relay::server::http_server::{BytesBody, Handlers, HyperError, RelayService};
+    use iroh_relay::server::{AllowAll, Metrics};
+    type Req = hyper::Request<Incoming>;
+    fn reply(
+        b: Builder,
+        code: u16,
+        text: String,
+    ) -> Result<hyper::Response<BytesBody>, HyperError> {
+        let body: BytesBody = Box::new(Full::new(Bytes::from(text)));
+        b.status(code)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(body)
+            .map_err(|e| Box::new(e) as HyperError)
+    }
     let u: RelayUrl = url.parse().context("relay url like http://1.2.3.4:3340")?;
     let port = u
         .port_or_known_default()
         .context("relay url without port")?;
-    let mut cfg = ServerConfig::default();
-    cfg.relay = Some(RelayConfig::new(([0, 0, 0, 0], port)));
-    Ok(Server::spawn(cfg).await?)
+    let mut h = Handlers::default();
+    h.insert(
+        (http::Method::GET, "/"),
+        Box::new(|_: Req, b: Builder| reply(b, 200, "Mycel relay".into())),
+    );
+    // Clients measure latency here.
+    h.insert(
+        (http::Method::GET, iroh_relay::http::RELAY_PROBE_PATH),
+        Box::new(|_: Req, b: Builder| reply(b, 200, String::new())),
+    );
+    if let Some(id) = dir_id {
+        h.insert(
+            (http::Method::GET, dir::ID_PATH),
+            Box::new(move |_: Req, b: Builder| match id.get() {
+                Some(id) => reply(b, 200, id.clone()),
+                None => reply(b, 503, "starting".into()),
+            }),
+        );
+    }
+    let svc = RelayService::new(
+        h,
+        http::HeaderMap::new(),
+        None,
+        iroh_relay::KeyCache::new(1024),
+        Arc::new(AllowAll),
+        Arc::new(Metrics::default()),
+    );
+    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+        .await
+        .with_context(|| format!("port {port} is busy"))?;
+    let s2 = svc.clone();
+    let task = tokio::spawn(async move {
+        let svc = s2;
+        // Dropped with the task on abort, which ends every connection.
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                Some(_) = conns.join_next() => {}
+                r = listener.accept() => if let Ok((s, _)) = r {
+                    let svc = svc.clone();
+                    match &boxes {
+                        None => {
+                            conns.spawn(svc.handle_connection(s, None, std::time::Duration::from_secs(30)));
+                        }
+                        Some(b) => {
+                            conns.spawn(serve_with_box(s, svc, b.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(RelayServer {
+        task,
+        svc,
+        dir: None,
+    })
+}
+
+/// One HTTP connection of a main server: mailbox requests are ours, the rest is the relay's.
+// shortcut: no establish timeout here (iroh's handle_connection has one); a slow client holds a task.
+#[cfg(not(target_os = "android"))]
+async fn serve_with_box(
+    s: tokio::net::TcpStream,
+    svc: iroh_relay::server::RelayService,
+    b: Arc<serverbox::ServerBox>,
+) {
+    let service = BoxSvc {
+        relay: iroh_relay::server::http_server::RelayServiceWithNotify::new(
+            svc,
+            Arc::new(tokio::sync::Notify::new()),
+        ),
+        b,
+    };
+    let io = hyper_util::rt::TokioIo::new(iroh_relay::server::streams::MaybeTlsStream::Plain(s));
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .with_upgrades()
+        .await;
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone)]
+struct BoxSvc {
+    relay: iroh_relay::server::http_server::RelayServiceWithNotify,
+    b: Arc<serverbox::ServerBox>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for BoxSvc {
+    type Response = hyper::Response<iroh_relay::server::http_server::BytesBody>;
+    type Error = iroh_relay::server::http_server::HyperError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        let s = self.clone();
+        Box::pin(async move {
+            match serverbox::serve(&s.b, req).await {
+                Ok(resp) => Ok(resp),
+                Err(req) => s.relay.call(req).await,
+            }
+        })
+    }
 }
 
 #[cfg(test)]

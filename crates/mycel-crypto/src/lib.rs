@@ -53,6 +53,19 @@ fn addr_msg(a: &SignedAddr) -> Vec<u8> {
     postcard::to_allocvec(&(b"mycel-addr", &a.ticket, &a.relay, a.ts_ms)).expect("addr serializes")
 }
 
+/// Signs arbitrary bytes with the device key (directory records, §4.6).
+pub fn sign_bytes(key: &SecretKey, msg: &[u8]) -> Vec<u8> {
+    key.sign(msg).to_bytes().to_vec()
+}
+
+/// Checks a [`sign_bytes`] signature against `owner`.
+pub fn verify_bytes(owner: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
+    let (Ok(pk), Ok(sig)) = (PublicKey::from_bytes(owner), <[u8; 64]>::try_from(sig)) else {
+        return false;
+    };
+    pk.verify(msg, &Signature::from_bytes(&sig)).is_ok()
+}
+
 /// Content id of an envelope, used by sync.
 pub fn envelope_id(env: &mycel_proto::Envelope) -> [u8; 32] {
     blake3::hash(&postcard::to_allocvec(env).expect("envelope serializes")).into()

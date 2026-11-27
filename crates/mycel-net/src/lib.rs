@@ -20,6 +20,8 @@ pub const JOIN_ALPN: &[u8] = b"mycel/join/1";
 pub const BLOBS_ALPN: &[u8] = b"mycel/blobs/1";
 /// Call media (§9): audio as QUIC datagrams, video one uni stream per frame.
 pub const CALL_ALPN: &[u8] = b"mycel/call/1";
+/// Username directory on a main server (DESIGN.md §4.6).
+pub const DIR_ALPN: &[u8] = b"mycel/dir/1";
 // shortcut: one message per stream, capped at 16 MiB (a full-history Envs batch); chunk when histories grow.
 const MAX_MSG: usize = 16 << 20;
 /// How long a cached connection gets to acknowledge a message before it is replaced.
@@ -33,7 +35,7 @@ const PROBE_EVERY: Duration = Duration::from_secs(30);
 pub type Inbox = mpsc::Receiver<(EndpointId, SyncMsg)>;
 /// Incoming join requests: (sender, request bytes, reply). Dropping the reply refuses.
 pub type JoinInbox = mpsc::Receiver<(EndpointId, Vec<u8>, oneshot::Sender<Vec<u8>>)>;
-/// Incoming `mycel/blobs/1` and `mycel/call/1` connections; the owner checks membership and serves them.
+/// Incoming `mycel/blobs/1`, `mycel/call/1` and `mycel/dir/1` connections; the owner checks membership and serves them.
 pub type ConnInbox = mpsc::Receiver<Connection>;
 
 #[derive(Clone)]
@@ -72,6 +74,7 @@ impl Net {
             JOIN_ALPN.to_vec(),
             BLOBS_ALPN.to_vec(),
             CALL_ALPN.to_vec(),
+            DIR_ALPN.to_vec(),
         ]);
         if port != 0 {
             b = b
@@ -102,7 +105,7 @@ impl Net {
                 let Ok(conn) = incoming.await else { continue };
                 if conn.alpn() == JOIN_ALPN {
                     tokio::spawn(serve_join(conn, jtx.clone()));
-                } else if conn.alpn() == BLOBS_ALPN || conn.alpn() == CALL_ALPN {
+                } else if [BLOBS_ALPN, CALL_ALPN, DIR_ALPN].contains(&conn.alpn()) {
                     let _ = btx.send(conn).await;
                 } else {
                     n.track(conn);
