@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -35,6 +35,13 @@ type Tab = "chats" | "calls" | "people" | "settings";
 type How = "create" | "join";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+/** Chat list time, as in Telegram: today the time, this week the weekday, older the date. */
+const when = (ts: number) => {
+  const d = new Date(ts), now = new Date();
+  if (d.toDateString() === now.toDateString()) return time(ts);
+  if (now.getTime() - ts < 6 * 86_400_000) return d.toLocaleDateString("ru", { weekday: "short" }).replace(/^./, (c) => c.toUpperCase());
+  return d.toLocaleDateString("ru", { day: "2-digit", month: "2-digit", year: d.getFullYear() === now.getFullYear() ? undefined : "2-digit" });
+};
 const hue = (id: string) => parseInt(id.slice(0, 4), 16) % 360;
 // Avatar colors a member can pick (profile `color` is an index here).
 const PALETTE = [210, 0, 25, 45, 130, 175, 265, 320];
@@ -159,13 +166,16 @@ const linkText = (m?: Member) => {
   return `был(а) в сети ${min < 1 ? "только что" : min < 60 ? `${min} мин назад` : new Date(m.seen).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
 };
 
+/** Header status in Telegram's words; the link details are in linkText (tooltip, ⋮ menu). */
+const presence = (m?: Member) => (!m || m.me ? "личный чат" : m.link ? "в сети" : m.seen ? linkText(m) : "не в сети");
+
 function Avatar(p: { id: string; onClick?: () => void; dot?: boolean }) {
   const m = () => memberOf(p.id);
   return (
     <div class="avatar" classList={{ link: !!p.onClick }} style={{ background: `hsl(${colorOf(p.id)} 45% 55%)` }}
       onClick={(e) => p.onClick && (e.stopPropagation(), p.onClick())}>
       {initials(p.id)}
-      <Show when={p.dot && !m()?.me}><i class={`link-dot ${m()?.link ?? "off"}`} title={linkText(m())} /></Show>
+      <Show when={p.dot && !m()?.me && m()?.link}><i class={`link-dot ${m()?.link ?? "off"}`} title={linkText(m())} /></Show>
     </div>
   );
 }
@@ -821,6 +831,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
   const [del, setDel] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
+  const [find, setFind] = createSignal<string>(); // chat list search, undefined = closed
+  const [sub, setSub] = createSignal(""); // open settings page, "" = the list
+  const openSub = (s: string) => (history.pushState(null, ""), setSub(s));
   // The open chat: "" = the space chat, else the 1:1 partner's id.
   const [chat, setChat] = createSignal("");
   const [msgs, setMsgs] = createSignal<Msg[]>([]);
@@ -975,7 +988,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     };
     document.addEventListener("visibilitychange", onVis);
     // Android back closes the chat: opening it pushes a history entry.
-    const onBack = () => setChatOpen(false);
+    const onBack = () => (chatOpen() ? setChatOpen(false) : setSub(""));
     addEventListener("popstate", onBack);
     if (!(await isPermissionGranted())) requestPermission();
     const onWide = () => setWide(wideQuery.matches);
@@ -1000,10 +1013,18 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     });
   });
 
-  const sortedRows = () => [...rows()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
+  const preview = (r: ChatRow) => {
+    const l = r.last;
+    return l ? (l.mine ? "Вы: " : !r.id && !l.call ? `${nameOf(l.author)}: ` : "") + (l.call ? callLabel(l.call) : l.media ? label(l.media) : l.text) : "Сообщений пока нет";
+  };
+  const sortedRows = () => {
+    const q = find()?.trim().toLowerCase();
+    return [...rows()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0))
+      .filter((r) => !q || `${r.id ? nameOf(r.id) : "Общий чат"} ${preview(r)}`.toLowerCase().includes(q));
+  };
   const titles = () => ({ chats: "Чаты", calls: "Звонки", people: simple() ? "Контакты" : "Люди", settings: "Настройки" });
   const navItem = (t: Tab, label: string, Icon: typeof Users) => (
-    <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); }} title={label}>
+    <button classList={{ nav: true, active: tab() === t }} onClick={() => { setTab(t); setChatOpen(false); setSub(""); setFind(undefined); }} title={label}>
       <Icon size={22} />
       <span>{label}</span>
       <Show when={t === "chats" && unread()}><b class="badge">{unread()}</b></Show>
@@ -1022,8 +1043,18 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
 
       <section class="panel">
         <header class="bar">
-          <h2>{titles()[tab()]}</h2>
-          <NetDot n={peers()} />
+          <Show when={tab() === "settings" && sub()}>
+            <button class="icon" onClick={() => history.back()} title="Назад"><ArrowLeft size={20} /></button>
+          </Show>
+          <Show when={find() !== undefined} fallback={<>
+            <h2 class="ellipsis">{tab() === "settings" && sub() ? sub() : titles()[tab()]}</h2>
+            <NetDot n={peers()} />
+            <Show when={tab() === "chats"}><button class="icon" onClick={() => setFind("")} title="Поиск"><Search size={20} /></button></Show>
+          </>}>
+            <input class="grow find" placeholder="Поиск" value={find()} ref={(el) => queueMicrotask(() => el.focus())}
+              onInput={(e) => setFind(e.currentTarget.value)} onKeyDown={(e) => e.key === "Escape" && setFind(undefined)} />
+            <button class="icon" onClick={() => setFind(undefined)} title="Закрыть поиск"><X size={20} /></button>
+          </Show>
         </header>
         <Switch>
           <Match when={tab() === "chats"}>
@@ -1032,22 +1063,32 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                 {(r) => {
                   const l = () => r.last;
                   const draft = () => getDraft(draftKey(r.id));
+                  const name = () => (r.id ? nameOf(r.id) : "Общий чат");
                   return (
                     <button class="row chat-row" classList={{ active: wide() && chat() === r.id }} onClick={() => openChat(r.id)}>
                       {r.id ? <Avatar id={r.id} dot /> : <div class="avatar group"><Hash size={20} /></div>}
                       <div class="grow">
-                        <div class="row-top"><b class="ellipsis">{r.id ? nameOf(r.id) : "Общий чат"}</b><small class="muted">{l() ? time(l()!.ts) : ""}</small></div>
+                        <div class="row-top">
+                          <b class="ellipsis">{name()}</b>
+                          <Show when={r.muted}><BellOff size={14} class="muted" /></Show>
+                          <small class="when">
+                            <Show when={l()?.mine && !l()!.call}>{l()!.status === 2 ? <CheckCheck size={16} /> : l()!.status === 1 ? <Check size={16} /> : <Clock size={14} />}</Show>
+                            {l() ? when(l()!.ts) : ""}
+                          </small>
+                        </div>
                         <div class="row-bottom">
-                          <span class="muted ellipsis">{draft() ? `Черновик: ${draft()}` : l() ? (l()!.mine ? "Вы: " : !r.id && !l()!.call ? `${nameOf(l()!.author)}: ` : "") + (l()!.call ? callLabel(l()!.call!) : l()!.media ? label(l()!.media!) : l()!.text) : "Сообщений пока нет"}</span>
-                          <Show when={r.unread}><b class="badge">{r.unread}</b></Show>
+                          <span class="muted ellipsis">{draft() ? <><span class="draft">Черновик:</span> {draft()}</> : preview(r)}</span>
+                          <Show when={r.unread}><b class="badge" classList={{ off: r.muted }}>{r.unread}</b></Show>
                         </div>
                       </div>
                     </button>
                   );
                 }}
               </For>
-              <p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p>
+              <Show when={!rows().length}><p class="muted small pad">{simple() ? "Новый чат: «Контакты» → «Написать». Добавить человека — там же, «Добавить контакт»" : "Личный чат: «Люди» → «Написать» или нажмите на аватар в общем чате"}</p></Show>
+              <Show when={find()?.trim() && !sortedRows().length}><p class="muted small pad">Ничего не найдено</p></Show>
             </div>
+            <button class="fab" onClick={() => setTab("people")} title="Новый чат"><Pencil size={22} /></button>
           </Match>
           <Match when={tab() === "calls"}>
             <Calls calls={callList()} onCall={startCall} inCall={!!active()} />
@@ -1056,46 +1097,93 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
             <People members={members()} simple={simple()} onWrite={openChat} onCall={(id, v) => startCall(v, id)} inCall={!!active()} />
           </Match>
           <Match when={tab() === "settings"}>
-            <div class="scroll pad">
-              <h3>Профиль</h3>
-              <ProfileForm submit="Сохранить" />
-              <h3>Тема</h3>
-              <div class="segmented">
-                <For each={[["system", "Как в системе"], ["light", "Светлая"], ["dark", "Тёмная"]]}>
-                  {([v, label]) => (
-                    <button classList={{ active: p.theme === v }} onClick={() => p.setTheme(v)}>{label}</button>
-                  )}
-                </For>
+            <Show when={sub()} fallback={
+              <div class="scroll">
+                <button class="row me-card" onClick={() => openSub("Профиль")}>
+                  <Show when={members().find((m) => m.me)}>{(me) => <Avatar id={me().id} />}</Show>
+                  <div class="grow">
+                    <b class="ellipsis">{members().find((m) => m.me)?.name ?? "Без имени"}</b>
+                    <div class="muted small">Имя и аватар</div>
+                  </div>
+                </button>
+                <div class="list">
+                  <For each={[
+                    ["Оформление", Palette, "Тема"],
+                    ["Голос и видео", Mic, "Микрофон, камера, громкость"],
+                    ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
+                    ...(android ? [] : [["Приложение", Monitor, "Автозапуск, трей"]]),
+                    ["Вход", LockIcon, "Пароль при запуске"],
+                    ["Режим", Layers, simple() ? "Личные чаты" : "Пространства"],
+                    [simple() ? "Данные" : "Пространство", Database, "Хранение, удаление"],
+                  ] as [string, typeof Mic, string][]}>
+                    {([t, Icon, hint]) => (
+                      <button class="row item" onClick={() => openSub(t)}>
+                        <Icon size={22} />
+                        <div class="grow"><div>{t}</div><div class="muted small ellipsis">{hint}</div></div>
+                        <ChevronRight size={18} class="muted" />
+                      </button>
+                    )}
+                  </For>
+                </div>
               </div>
-              <VoiceSettings />
-              <h3>Связь</h3>
-              <label class="check">
-                <input type="checkbox" checked={n0()} onChange={(e) => {
-                  localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0");
-                  reopen(p.space.id).catch((e) => alert(errText(e)));
-                }} />
-                Публичные серверы связи n0 (Европа, США, Азия)
-              </label>
-              <p class="muted">Помогают устройствам из разных сетей найти друг друга. Сами сообщения после этого идут напрямую, а через сервер — только если напрямую не получилось. Можно выключить, если настроен свой якорь.</p>
-              <RelaySettings space={p.space} />
-              <MailboxSettings space={p.space} />
-              <Show when={!android}>
-                <AnchorSettings space={p.space} />
-                <AppSettings />
-              </Show>
-              <LoginSettings space={p.space} refresh={p.refresh} />
-              <ModeSettings />
-              <h3>{simple() ? "Данные" : `Пространство «${p.space.name}»`}</h3>
-              <p class="muted">Зашифрованная база хранится здесь:</p>
-              <code class="path">{p.dir}</code>
-              <div class="actions">
-                <Show when={!simple()}><button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button></Show>
-                <button class="danger" onClick={() => setDel(true)}><Trash2 size={18} /> Удалить с этого устройства</button>
+            }>
+              <div class="scroll pad">
+                <Switch>
+                  <Match when={sub() === "Профиль"}>
+                    <ProfileForm submit="Сохранить" />
+                  </Match>
+                  <Match when={sub() === "Оформление"}>
+                    <h3>Тема</h3>
+                    <div class="segmented">
+                      <For each={[["system", "Как в системе"], ["light", "Светлая"], ["dark", "Тёмная"]]}>
+                        {([v, label]) => (
+                          <button classList={{ active: p.theme === v }} onClick={() => p.setTheme(v)}>{label}</button>
+                        )}
+                      </For>
+                    </div>
+                  </Match>
+                  <Match when={sub() === "Голос и видео"}>
+                    <VoiceSettings />
+                  </Match>
+                  <Match when={sub() === "Связь"}>
+                    <label class="check">
+                      <input type="checkbox" checked={n0()} onChange={(e) => {
+                        localStorage.setItem("n0", e.currentTarget.checked ? "1" : "0");
+                        reopen(p.space.id).catch((e) => alert(errText(e)));
+                      }} />
+                      Публичные серверы связи n0 (Европа, США, Азия)
+                    </label>
+                    <p class="muted">Помогают устройствам из разных сетей найти друг друга. Сами сообщения после этого идут напрямую, а через сервер — только если напрямую не получилось. Можно выключить, если настроен свой якорь.</p>
+                    <RelaySettings space={p.space} />
+                    <MailboxSettings space={p.space} />
+                    <Show when={!android}>
+                      <AnchorSettings space={p.space} />
+                    </Show>
+                  </Match>
+                  <Match when={sub() === "Приложение"}>
+                    <AppSettings />
+                  </Match>
+                  <Match when={sub() === "Вход"}>
+                    <LoginSettings space={p.space} refresh={p.refresh} />
+                  </Match>
+                  <Match when={sub() === "Режим"}>
+                    <ModeSettings />
+                  </Match>
+                  <Match when={true}>
+                    <h3>{simple() ? "Данные" : `Пространство «${p.space.name}»`}</h3>
+                    <p class="muted">Зашифрованная база хранится здесь:</p>
+                    <code class="path">{p.dir}</code>
+                    <div class="actions">
+                      <Show when={!simple()}><button onClick={p.onLeave}><LogOut size={18} /> Сменить пространство</button></Show>
+                      <button class="danger" onClick={() => setDel(true)}><Trash2 size={18} /> Удалить с этого устройства</button>
+                    </div>
+                    <Show when={del()}>
+                      <RemoveSpace space={p.space} onClose={() => setDel(false)} onDone={p.onLeave} />
+                    </Show>
+                  </Match>
+                </Switch>
               </div>
-              <Show when={del()}>
-                <RemoveSpace space={p.space} onClose={() => setDel(false)} onDone={p.onLeave} />
-              </Show>
-            </div>
+            </Show>
           </Match>
         </Switch>
       </section>
@@ -1261,21 +1349,19 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
       <p class="section muted">{p.simple ? `Контакты · ${p.members.length - 1}` : `Участники · ${p.members.length}`}</p>
       <For each={p.members}>
         {(m) => (
-          <div class="row person">
+          <div class="row person" classList={{ link: !m.me }} onClick={() => !m.me && p.onWrite(m.id)}>
             <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onWrite(m.id)} />
             <div class="grow">
-              <b>{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small mono">{m.id}<Show when={m.admin && !p.simple}> · админ</Show>
+              <b class="ellipsis">{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
+              <div class="muted small" classList={{ online: !!m.link }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={m.admin && !p.simple}> · админ</Show>
                 <Show when={status(m) === "ok"}> · проверен</Show></div>
               <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
             <Show when={!m.me}>
-              <button class="icon" onClick={(e) => (openSafe(m), e.currentTarget.closest(".scroll")?.scrollTo({ top: 0, behavior: "smooth" }))} title="Код безопасности">
+              <button class="icon" onClick={(e) => (e.stopPropagation(), openSafe(m), e.currentTarget.closest(".scroll")?.scrollTo({ top: 0, behavior: "smooth" }))} title="Код безопасности">
                 {status(m) === "changed" ? <ShieldAlert size={20} /> : <ShieldCheck size={20} />}
               </button>
-              <button class="icon" onClick={() => p.onWrite(m.id)} title="Написать"><MessageCircle size={20} /></button>
-              <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, false)} title="Позвонить"><Phone size={20} /></button>
-              <button class="icon" disabled={p.inCall} onClick={() => p.onCall(m.id, true)} title="Видеозвонок"><Video size={20} /></button>
+              <button class="icon" disabled={p.inCall} onClick={(e) => (e.stopPropagation(), p.onCall(m.id, false))} title="Позвонить"><Phone size={20} /></button>
             </Show>
           </div>
         )}
@@ -1680,8 +1766,8 @@ function Chat(p: {
         {p.chat ? <Avatar id={p.chat} dot /> : <div class="avatar group small-av"><Hash size={18} /></div>}
         <div class="grow ellipsis">
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
-          <div class="muted small" classList={{ typing: !!typingText(p.chat) }}>
-            {typingText(p.chat) || (p.chat ? linkText(memberOf(p.chat)) : `${p.members} участн.`)}
+          <div class="muted small ellipsis" classList={{ typing: !!typingText(p.chat), online: !!memberOf(p.chat)?.link }} title={p.chat ? linkText(memberOf(p.chat)) : ""}>
+            {typingText(p.chat) || (p.chat ? presence(memberOf(p.chat)) : `${p.members} участн.`)}
           </div>
         </div>
         <button class="icon" disabled={p.inCall || p.members < 2} onClick={() => p.onCall(false)}
@@ -1693,7 +1779,7 @@ function Chat(p: {
               <button disabled={p.inCall || p.members < 2} onClick={() => p.onCall(true)}><Video size={18} /> {p.chat ? "Видеозвонок" : "Групповой видеозвонок"}</button>
               <button onClick={() => setQuery(query() === undefined ? "" : undefined)}><Search size={18} /> Поиск</button>
               <button onClick={() => p.onMute(!p.muted)}>{p.muted ? <><Bell size={18} /> Включить уведомления</> : <><BellOff size={18} /> Без звука</>}</button>
-              <div class="muted small more-net"><NetDot n={p.peers} /></div>
+              <div class="muted small more-net"><NetDot n={p.peers} /><Show when={p.chat}><div>{linkText(memberOf(p.chat))}</div></Show></div>
             </div>
           </div>
         </Show>
@@ -1747,7 +1833,10 @@ function Chat(p: {
                     </div>
                   ) : (
                     <div class="msg" data-id={m.id}
-                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id }}
+                      classList={{ mine: m.mine, cont: same(prev(), m), tail: !same(m, next()), sel: sel().includes(m.id), found: hit() === m.id,
+                        // Photo/video alone: edge to edge with the time over it; a video note has no bubble at all.
+                        bare: !!m.media && (m.media.kind === "photo" || m.media.kind === "video") && !m.text && !m.reply && !m.reactions.length,
+                        note: m.media?.kind === "videonote" && !m.text && !m.reply }}
                       onClick={(e) => clickMsg(e, m)} onMouseDown={(e) => (e.shiftKey || e.detail > 1) && e.preventDefault()} onContextMenu={(e) => openMenu(e, m)}
                       onPointerDown={(e) => press(e, m)} onPointerMove={(e) => swipeMove(e, m)} onPointerUp={(e) => unpress(e, m)} onPointerCancel={(e) => unpress(e, m)}
                       // Lifting the finger after a hold must not click the menu's backdrop and close it.
@@ -1925,7 +2014,7 @@ function Chat(p: {
       </Show>
       <input ref={picker} type="file" multiple hidden onChange={pick} />
       <div class="composer">
-        <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={20} /></button>
+        <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={22} /></button>
         <Show when={rec()}>
           <div class="recording grow" classList={{ cancel: slide() < -60 }}>
             <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")},{Math.floor(elapsed() / 100) % 10}
@@ -1940,7 +2029,10 @@ function Chat(p: {
         <Show when={rec() && !locked()}>
           <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)`, opacity: 0.3 + 0.7 * (lift() / 80) }}><LockIcon size={18} /></div>
         </Show>
-        <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()} style={{ display: rec() ? "none" : undefined }}
+        <div class="field-wrap" style={{ display: rec() ? "none" : undefined }}>
+          <button class="icon" classList={{ on: emo() !== undefined }} title="Смайлики"
+            onClick={() => setEmo(emo() !== undefined ? undefined : recentEmoji().length ? -1 : 0)}><Smile size={22} /></button>
+        <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()}
           onInput={(e) => {
             setText(e.currentTarget.value);
             grow();
@@ -1953,10 +2045,7 @@ function Chat(p: {
               send();
             }
           }} />
-        <Show when={!rec()}>
-          <button class="icon" classList={{ on: emo() !== undefined }} title="Смайлики"
-            onClick={() => setEmo(emo() !== undefined ? undefined : recentEmoji().length ? -1 : 0)}><Smile size={20} /></button>
-        </Show>
+        </div>
         <Show when={emo() !== undefined}>
           <div class="overlay" onClick={() => setEmo(undefined)} />
           <div class="emoji-panel card">
@@ -1979,11 +2068,11 @@ function Chat(p: {
             onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
             <i class="halo" ref={halo} />
-            {locked() ? <Send size={20} /> : video() ? <Video size={20} /> : <Mic size={20} />}
+            {locked() ? <Send size={22} /> : video() ? <Video size={22} /> : <Mic size={22} />}
           </button>
         }>
           <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>
-            {editing() ? <Check size={20} /> : <Send size={20} />}
+            {editing() ? <Check size={22} /> : <Send size={22} />}
           </button>
         </Show>
       </div>
@@ -2003,10 +2092,11 @@ function Calls(p: { calls: CallView[]; onCall: (video: boolean, to: string) => v
             <div class="row">
               {c.chat || !c.mine ? <Avatar id={who()} /> : <div class="avatar group"><Hash size={20} /></div>}
               <div class="grow">
-                <b>{c.chat ? nameOf(c.chat) : c.mine ? "Общий чат" : `${nameOf(c.author)} · общий чат`}</b>
-                <div class="muted small" classList={{ error: c.missed && !c.mine }}>{c.mine ? "↗ " : "↙ "}{callLabel(c)}</div>
+                <b class="ellipsis">{c.chat ? nameOf(c.chat) : c.mine ? "Общий чат" : `${nameOf(c.author)} · общий чат`}</b>
+                <div class="muted small ellipsis" classList={{ error: c.missed && !c.mine }}>
+                  {c.mine ? "↗ " : "↙ "}{callLabel(c)} · {when(c.ts) === time(c.ts) ? time(c.ts) : `${when(c.ts)}, ${time(c.ts)}`}
+                </div>
               </div>
-              <small class="muted">{new Date(c.ts).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small>
               <button class="icon" disabled={p.inCall} onClick={() => p.onCall(c.video, c.chat)} title="Позвонить снова">
                 {c.video ? <Video size={20} /> : <Phone size={20} />}
               </button>

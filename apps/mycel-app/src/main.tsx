@@ -1,3 +1,4 @@
+import "./dev-mock"; // first: media.tsx listens at import time
 import { render } from "solid-js/web";
 import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
