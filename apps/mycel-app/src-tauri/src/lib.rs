@@ -848,10 +848,14 @@ async fn unlock(
     st.close().await;
     #[cfg(not(target_os = "android"))]
     let (relay, mapped) = match &anchor {
-        Some(u) => (
-            Some(mycel_core::spawn_relay(u).await.map_err(err)?),
-            upnp(port_of(u), true).await.is_ok(),
-        ),
+        Some(u) => {
+            #[cfg(windows)]
+            allow_firewall(port_of(u));
+            (
+                Some(mycel_core::spawn_relay(u).await.map_err(err)?),
+                upnp(port_of(u), true).await.is_ok(),
+            )
+        }
         None => {
             if let Some(u) = was_anchor {
                 let _ = upnp(port_of(&u), false).await;
@@ -983,6 +987,41 @@ async fn unlock(
         }
     });
     Ok(in_space)
+}
+
+/// Windows Firewall blocks the anchor's port on a "Public" network: adds an inbound rule once
+/// (one UAC prompt), in the background.
+#[cfg(windows)]
+fn allow_firewall(port: u16) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const NO_WINDOW: u32 = 0x0800_0000;
+    // At most one prompt per run: a declined UAC must not come back on every reopen.
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let name = format!("Mycel-anchor-{port}");
+        let has = Command::new("netsh")
+            .args(["advfirewall", "firewall", "show", "rule"])
+            .arg(format!("name={name}"))
+            .creation_flags(NO_WINDOW)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has {
+            let args = format!(
+                "advfirewall firewall add rule name={name} dir=in action=allow protocol=TCP localport={port} profile=any"
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-Command"])
+                .arg(format!(
+                    "Start-Process netsh -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '{args}'"
+                ))
+                .creation_flags(NO_WINDOW)
+                .status();
+        }
+    });
 }
 
 fn port_of(url: &str) -> u16 {

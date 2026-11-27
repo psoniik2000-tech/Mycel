@@ -1693,7 +1693,13 @@ impl Node {
         }
         let mut peers: Vec<_> = self.st.lock().unwrap().store.peers()?;
         peers.retain(|p| peer_addr(p).is_some_and(|a| a.id != self.net.id()));
-        peers.sort_by_key(|p| peer_addr(p).is_none_or(|a| *a.id.as_bytes() != author));
+        // The author first, then peers we already have a link to: a cold dial to an offline
+        // member can hang until its timeout, which made media show up minutes late.
+        peers.sort_by_key(|p| {
+            peer_addr(p).map_or((true, true), |a| {
+                (*a.id.as_bytes() != author, self.net.link(a.id).0.is_none())
+            })
+        });
         let mut last = anyhow::anyhow!("no member is reachable");
         for p in peers {
             let Some(addr) = peer_addr(&p) else { continue };
@@ -1712,7 +1718,12 @@ impl Node {
         progress: &mut impl FnMut(u64),
     ) -> Result<u64> {
         let base = self.blobs.remote().local(hash).await?.local_bytes();
-        let conn = self.net.connect(addr, BLOBS_ALPN).await?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.net.connect(addr, BLOBS_ALPN),
+        )
+        .await
+        .context("peer did not answer")??;
         let mut s = self.blobs.remote().fetch(conn, hash).stream();
         while let Some(item) = s.next().await {
             match item {
