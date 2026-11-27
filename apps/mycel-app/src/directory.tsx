@@ -26,11 +26,13 @@ export async function register(space: string, username: string) {
   names.set("", Promise.resolve(norm(username)));
 }
 
-/** At every start: refreshes our record (addresses change), quietly. */
-export const keepRegistered = (space: string) => {
+/** Sends our record again, if we have a username (it carries addresses and the search setting). */
+export const refreshRegistration = async (space: string) => {
   const u = localStorage.getItem(userKey(space));
-  if (u) register(space, u).catch(() => {});
+  if (u) await register(space, u);
 };
+/** At every start, quietly: addresses change. */
+export const keepRegistered = (space: string) => void refreshRegistration(space).catch(() => {});
 
 const nameOf = (id: string) => {
   if (!names.has(id)) names.set(id, invoke<string | null>("dir_name_of", { server: server(), id }).catch(() => null));

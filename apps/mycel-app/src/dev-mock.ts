@@ -11,11 +11,11 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#5b8bd9"/><stop offset="1" stop-color="#e8a33d"/></linearGradient></defs><rect width="400" height="300" fill="url(#g)"/><circle cx="300" cy="80" r="40" fill="#fff8"/><path d="M0 300 L120 160 L220 260 L290 200 L400 300Z" fill="#2a3b2a"/></svg>`);
   const wave = Array.from({ length: 48 }, (_, i) => Math.round(60 + 160 * Math.abs(Math.sin(i * 0.7))));
   const members = [
-    { id: ME, me: true, admin: true, name: "Евгений", avatar: "", color: 0, link: null, seen: null },
-    { id: ANNA, me: false, admin: false, name: "Анна Смирнова", avatar: "", color: 6, link: "direct", seen: now },
-    { id: OLEG, me: false, admin: false, name: "Олег", avatar: "", color: 4, link: null, seen: now - 25 * min },
-    { id: MAMA, me: false, admin: false, name: "Мама", avatar: "", color: 7, link: "relay", seen: now },
-    { id: WORK, me: false, admin: false, name: "Константин Константинопольский", avatar: "", color: 2, link: null, seen: now - 3 * day },
+    { id: ME, me: true, admin: true, name: "Евгений", avatar: "", color: 0, link: null, online: false, seen: null, hidden: false },
+    { id: ANNA, me: false, admin: false, name: "Анна Смирнова", avatar: "", color: 6, link: "direct", online: true, seen: now, hidden: false },
+    { id: OLEG, me: false, admin: false, name: "Олег", avatar: "", color: 4, link: null, online: false, seen: now - 25 * min, hidden: false },
+    { id: MAMA, me: false, admin: false, name: "Мама", avatar: "", color: 7, link: "relay", online: false, seen: now, hidden: true },
+    { id: WORK, me: false, admin: false, name: "Константин Константинопольский", avatar: "", color: 2, link: null, online: false, seen: now - 3 * day, hidden: false },
   ];
   let n = 0;
   const m = (author: string, text: string, ts: number, extra: any = {}) => ({
@@ -62,6 +62,7 @@ if (import.meta.env.DEV && !(window as any).__TAURI_INTERNALS__) {
     send: (a) => (hist[a.chat].push(m(ME, a.text, Date.now(), a.replyTo ? { reply: { id: a.replyTo, author: ANNA, text: "…" } } : {})), "x"),
     react: () => null,
     safety_code: () => ({ link: "mycel://safety/123", svg: "" }),
+    privacy: () => ({ last_seen: "everyone", calls: "everyone", read_receipts: true, findable: true }),
     upnp_ok: () => false,
     autostart: () => false,
     home_relay: () => null,

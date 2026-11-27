@@ -52,6 +52,14 @@ async fn register_lookup_conflict_rename_and_add() {
     );
     assert!(b.dir_search(url, "zz").await.unwrap().is_empty());
 
+    // Not findable: out of the search, still found by the whole name.
+    let mut p = a.privacy();
+    p.findable = false;
+    a.set_privacy(p).unwrap();
+    a.dir_register(url, "alice_1").await.unwrap();
+    assert!(b.dir_search(url, "al").await.unwrap().is_empty());
+    assert!(b.dir_lookup(url, "alice_1").await.unwrap().is_some());
+
     // Renaming frees the old name.
     a.dir_register(url, "alice_2").await.unwrap();
     assert!(b.dir_lookup(url, "alice_1").await.unwrap().is_none());
@@ -66,6 +74,14 @@ async fn register_lookup_conflict_rename_and_add() {
     assert_eq!(b.dir_add(url, "alice_2").await.unwrap(), a.device_id());
     assert_eq!(b.contacts().unwrap(), [a.device_id()]);
     assert!(b.dir_add(url, "bob_22").await.is_err(), "not yourself");
+
+    // Who came by the public link is not A's contact until A writes to them.
+    let mut p = a.privacy();
+    p.last_seen = mycel_core::Who::Contacts;
+    a.set_privacy(p).unwrap();
+    assert!(a.presence(&b.device_id()).hidden);
+    a.send_text(&Some(b.device_id()), "привет", None).unwrap();
+    assert!(!a.presence(&b.device_id()).hidden);
 
     // A is offline: the main server keeps B's message until A pulls it.
     a.close().await;

@@ -18,6 +18,9 @@ pub const ID_PATH: &str = "/mycel-id";
 /// Most names a search returns.
 const SEARCH_MAX: usize = 20;
 const DIR_TIMEOUT: Duration = Duration::from_secs(15);
+/// Invisible last char of a record's name: its owner does not want to come up in search (no
+/// wire change; an older server or app still lists it).
+const UNLISTED: char = '\u{2063}';
 
 /// A username's entry: the account's public contact link, signed by the key in it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -158,6 +161,7 @@ impl Db {
                     self.names
                         .range(p.clone()..)
                         .take_while(|(n, _)| n.starts_with(&p))
+                        .filter(|(_, r)| !r.name.ends_with(UNLISTED))
                         .take(SEARCH_MAX)
                         .map(|(n, r)| (n.clone(), r.name.clone()))
                         .collect(),
@@ -375,11 +379,14 @@ impl Node {
     pub async fn dir_register(&self, server: &str, name: &str) -> Result<String> {
         let username = username(name).context("username: 5–32 of a-z, 0-9, _")?;
         let me = self.device_id();
-        let display = self
+        let mut display = self
             .profiles()?
             .get(&me)
             .map(|p| p.0.clone())
             .unwrap_or_default();
+        if !self.privacy().findable {
+            display = display.chars().take(63).chain([UNLISTED]).collect();
+        }
         let rec = DirRecord {
             username,
             name: display,
@@ -414,7 +421,11 @@ impl Node {
             .await?
             .1
         {
-            DirResp::List(l) => Ok(l),
+            DirResp::List(mut l) => {
+                // An older server lists the unlisted ones too.
+                l.retain(|(_, n)| !n.ends_with(UNLISTED));
+                Ok(l)
+            }
             _ => bail!("bad answer"),
         }
     }
