@@ -76,7 +76,7 @@ struct Visible(AtomicBool);
 
 /// The system notification for a new event from someone else: (title, body).
 fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
-    if ev.author_device == n.device_id() {
+    if n.account_of(&ev.author_device) == n.account() {
         return None;
     }
     let mut who = name_of(n, &ev.author_device);
@@ -487,6 +487,11 @@ fn short(id: &[u8; 32]) -> String {
     id[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Short id of the account a device belongs to: the UI shows one person per account (§4.4).
+fn who(n: &Node, dev: &[u8; 32]) -> String {
+    short(&n.account_of(dev))
+}
+
 /// The UI names a chat by "" (space chat) or the partner's short id.
 fn chat_id(c: &Chat) -> String {
     c.as_ref().map(short).unwrap_or_default()
@@ -522,7 +527,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
         let c = cx.calls.get(&hex(call_id))?.clone();
         return Some(Msg {
             id: hex(&ev.id),
-            author: short(&ev.author_device),
+            author: who(n, &ev.author_device),
             mine: c.mine,
             text: String::new(),
             ts: ev.timestamp_ms,
@@ -548,7 +553,7 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
     let reply = reply_to.map(|r| match cx.by_id.get(&r) {
         Some(t) => Reply {
             id: hex(&r),
-            author: short(&t.author_device),
+            author: who(n, &t.author_device),
             text: match (cx.text(t), media(t)) {
                 (s, Some((_, b))) if s.is_empty() => b.name.clone().unwrap_or("Медиа".into()),
                 (s, _) => s,
@@ -562,8 +567,8 @@ fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
     });
     Some(Msg {
         id: hex(&ev.id),
-        author: short(&ev.author_device),
-        mine: ev.author_device == n.device_id(),
+        author: who(n, &ev.author_device),
+        mine: n.account_of(&ev.author_device) == n.account(),
         text: cx.text(ev),
         ts: ev.timestamp_ms,
         status: 0,
@@ -599,7 +604,7 @@ fn call_id(s: &str) -> R<[u8; 16]> {
 
 /// Every call in the history of `chat` by hex id.
 fn calls(n: &Node, hist: &[Event], chat: &str) -> HashMap<String, CallView> {
-    let me = n.device_id();
+    let me = n.account();
     let mut out: HashMap<String, CallView> = HashMap::new();
     // shortcut: a group call counts as ended at its last hang-up event seen so far; track per-member presence if that misleads.
     let mut answered: HashMap<String, u64> = HashMap::new();
@@ -615,9 +620,9 @@ fn calls(n: &Node, hist: &[Event], chat: &str) -> HashMap<String, CallView> {
                     CallView {
                         id,
                         video: *video,
-                        author: short(&e.author_device),
+                        author: who(n, &e.author_device),
                         chat: chat.into(),
-                        mine: e.author_device == me,
+                        mine: n.account_of(&e.author_device) == me,
                         ts: e.timestamp_ms,
                         duration_ms: None,
                         missed: true,
@@ -901,14 +906,14 @@ async fn unlock(
         #[cfg(not(target_os = "android"))]
         _relay: relay,
     });
-    let (mut typing, app2) = (node.typing_events(), app.clone());
+    let (mut typing, app2, node2) = (node.typing_events(), app.clone(), node.clone());
     tauri::async_runtime::spawn(async move {
         while let Some(t) = typing.recv().await {
             let _ = app2.emit(
                 "typing",
                 TypingSignal {
                     chat: chat_id(&t.chat),
-                    author: short(&t.from),
+                    author: who(&node2, &t.from),
                     voice: t.voice,
                     done: false,
                 },
@@ -941,7 +946,7 @@ async fn unlock(
                         id: hex(call_id),
                         action,
                         video,
-                        author: short(&ev.author_device),
+                        author: who(&node, &ev.author_device),
                         chat: chat_id(&chat),
                         ts: ev.timestamp_ms,
                     },
@@ -953,7 +958,7 @@ async fn unlock(
                     "typing",
                     TypingSignal {
                         chat: chat_id(&chat),
-                        author: short(&ev.author_device),
+                        author: who(&node, &ev.author_device),
                         voice: false,
                         done: true,
                     },
@@ -1151,6 +1156,40 @@ async fn invite(st: State<'_, App>) -> R<Invite> {
 #[tauri::command]
 async fn contact_invite(st: State<'_, App>) -> R<Invite> {
     qr(st.node()?.contact_invite().await.map_err(err)?)
+}
+
+/// One-time link that adds a new device to this account (§4.4).
+#[tauri::command]
+async fn device_invite(st: State<'_, App>) -> R<Invite> {
+    qr(st.node()?.device_invite().await.map_err(err)?)
+}
+
+#[derive(Serialize)]
+struct Device {
+    id: String,
+    me: bool,
+    /// The account's first device: the only one that links and unlinks.
+    root: bool,
+}
+
+/// Devices of this account, the first one first.
+#[tauri::command]
+async fn devices(st: State<'_, App>) -> R<Vec<Device>> {
+    let n = st.node()?;
+    let (me, root) = (n.device_id(), n.account());
+    Ok(n.devices()
+        .iter()
+        .map(|d| Device {
+            id: hex(d),
+            me: *d == me,
+            root: *d == root,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn unlink_device(st: State<'_, App>, id: String) -> R<()> {
+    st.node()?.unlink_device(unhex(&id)?).map_err(err)
 }
 
 fn qr(link: String) -> R<Invite> {
@@ -1559,7 +1598,7 @@ async fn call_stats(st: State<'_, App>) -> R<Vec<Link>> {
 #[tauri::command]
 async fn members(st: State<'_, App>) -> R<Vec<Member>> {
     let n = &st.node()?;
-    let (me, admin) = (n.device_id(), n.admin().map_err(err)?);
+    let (me, admin) = (n.account(), n.admin().map_err(err)?);
     let mut prof = n.profiles().map_err(err)?;
     // Space members, then contacts added by link (§4.2).
     let mut all = n.members();
@@ -1568,6 +1607,8 @@ async fn members(st: State<'_, App>) -> R<Vec<Member>> {
             all.push(c);
         }
     }
+    // One row per account: its other devices are not listed (§4.4).
+    all.retain(|m| n.account_of(m) == *m);
     Ok(all
         .iter()
         .map(|m| {
@@ -1752,6 +1793,9 @@ pub fn run() {
             join,
             invite,
             contact_invite,
+            device_invite,
+            devices,
+            unlink_device,
             safety_code,
             history,
             chats,

@@ -108,6 +108,16 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Moves every event of chat `from` to chat `to` (a partner's device turned out to be one
+    /// device of an account, §4.4).
+    pub fn move_chat(&self, from: &[u8], to: &[u8]) -> Result<()> {
+        self.db.execute(
+            "UPDATE events SET chat = ?1 WHERE chat = ?2",
+            params![to, from],
+        )?;
+        Ok(())
+    }
+
     /// (chat, data) of an event.
     pub fn event(&self, id: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         Ok(self

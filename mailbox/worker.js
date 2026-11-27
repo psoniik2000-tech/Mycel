@@ -2,7 +2,7 @@
 // Cloudflare Worker with a D1 database bound as `DB`. Setup: mailbox/README.md.
 //   POST /box/<topic>/<id>   body = envelope bytes (deduplicated by id);
 //                            header x-push: 1 wakes the topic's phones (FCM), x-from: sender's token is skipped,
-//                            x-to: device tag of a 1:1 partner → only that phone (and untagged old ones)
+//                            x-to: device tags (comma-separated) of a 1:1 partner → only those phones (and untagged old ones)
 //   GET  /box/<topic>?after=N  -> lines "<seq> <base64>", oldest first, at most 200
 //   POST /push/<topic>       body = FCM token of a phone in that space, header x-device: its tag
 // Pushes need the secret FCM_KEY = the Firebase service account JSON (optional).
@@ -58,8 +58,10 @@ export default {
 /** Sends a data-only FCM message ("something new", no content) to every phone of the topic but the sender,
  *  or only to the `to` device (1:1 chat); phones registered without a tag still get every push. */
 async function wake(env, topic, from, to) {
-  const { results } = HEX.test(to)
-    ? await env.DB.prepare("SELECT token FROM push WHERE topic = ? AND token != ? AND (device IS NULL OR device = ?)").bind(topic, from, to).all()
+  // x-to: comma-separated tags (every device of the partner's account, DESIGN §4.4).
+  const tags = to.split(",").filter((t) => HEX.test(t)).slice(0, 16);
+  const { results } = tags.length
+    ? await env.DB.prepare(`SELECT token FROM push WHERE topic = ? AND token != ? AND (device IS NULL OR device IN (${tags.map(() => "?").join(",")}))`).bind(topic, from, ...tags).all()
     : await env.DB.prepare("SELECT token FROM push WHERE topic = ? AND token != ?").bind(topic, from).all();
   if (!results.length) return;
   const key = JSON.parse(env.FCM_KEY);
