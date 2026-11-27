@@ -27,7 +27,7 @@ export const setMode = (m: Mode | null) => {
 /** Name of the space simple mode creates (seen only in spaces mode). */
 export const SIMPLE_NAME = "Личные чаты";
 
-export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void }) {
+export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void; onRestore: () => void }) {
   return (
     <div class="center">
       <div class="card intro">
@@ -38,6 +38,7 @@ export function ModeChoice(p: { onSimple: () => void; onSpaces: () => void }) {
         <p class="muted small">Контакты и личные чаты</p>
         <button onClick={() => (setMode("spaces"), p.onSpaces())}><Hash size={18} /> Пространства</button>
         <p class="muted small">Сообщества с общим чатом, администратором и приглашениями</p>
+        <button class="link" onClick={p.onRestore}>Восстановить из копии</button>
       </div>
     </div>
   );

@@ -4267,6 +4267,8 @@ name = "mycel-core"
 version = "0.1.8"
 dependencies = [
  "anyhow",
+ "argon2",
+ "chacha20poly1305",
  "data-encoding",
  "getrandom 0.3.4",
  "iroh-blobs",

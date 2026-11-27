@@ -20,6 +20,8 @@ n0-future = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-roots = "1"
+argon2 = "0.6"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 iroh-relay.workspace = true
