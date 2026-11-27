@@ -2012,6 +2012,7 @@ function Chat(p: {
   const [slide, setSlide] = createSignal(0); // finger moved left while holding, px (≤ 0)
   const [lift, setLift] = createSignal(0); // finger moved up while holding, px (≥ 0)
   const [locked, setLocked] = createSignal(false); // recording locked: hands-free, send/cancel by buttons
+  const [hint, setHint] = createSignal(""); // shown after a press too short to record
   const [emo, setEmo] = createSignal<number>(); // open emoji panel: tab index, -1 = recent
   const insertEmoji = (e: string) => {
     const a = input.selectionStart, b = input.selectionEnd, t = text();
@@ -2091,11 +2092,11 @@ function Chat(p: {
 
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
   // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
-  let holdTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, red = false, raf = 0, halo!: HTMLElement;
+  let holdTimer = 0, holdId = 0, hintTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, red = false, raf = 0, halo!: HTMLElement;
   let ctx: AudioContext | undefined;
   // Telegram-like haptics: short ticks on start, entering the cancel zone, lock, send and cancel; never on every move.
-  const vib = (ms: number) => navigator.vibrate?.(ms);
-  // The halo behind the mic scales 1.0–1.4 with the microphone's loudness (smoothed).
+  const vib = (ms: number) => android && void invoke("vibrate", { ms }).catch(() => {});
+  // The halo behind the mic scales 1.0–1.25 with the microphone's loudness (smoothed).
   const meter = (stream: MediaStream) => {
     ctx = new AudioContext();
     const an = ctx.createAnalyser();
@@ -2108,13 +2109,15 @@ function Chat(p: {
       let sum = 0;
       for (const v of buf) sum += (v - 128) ** 2;
       lvl += (Math.min(1, Math.sqrt(sum / buf.length) / 128 * 4) - lvl) * 0.25;
-      if (halo) halo.style.transform = `scale(${1 + 0.4 * lvl})`;
+      if (halo) halo.style.transform = `scale(${1 + 0.25 * lvl})`;
       raf = requestAnimationFrame(frame);
     };
     frame();
   };
   const stopRec = async (send: boolean) => {
     const r = rec();
+    holding = false; // a release after the recording ended by itself does nothing
+    clearTimeout(holdTimer);
     clearInterval(tick);
     cancelAnimationFrame(raf);
     void ctx?.close();
@@ -2125,10 +2128,10 @@ function Chat(p: {
     setLocked(false);
     if (!r) return;
     if (!send || Date.now() - r.started < 500) {
-      if (!send) vib(20); // a deliberate cancel ticks; a too-short press is silently dropped
+      if (!send) vib(50); // a deliberate cancel ticks; a too-short press is dropped
       return r.cancel();
     }
-    vib(15);
+    vib(30);
     const blob = await r.stop();
     const kind = video() ? "videonote" : "voice";
     const wave = kind === "voice" ? await waveform(blob) : [];
@@ -2137,23 +2140,26 @@ function Chat(p: {
     await queue({ text: kind === "voice" ? "🎤 Голосовое" : "📹 Видеосообщение" }, () => invoke<string>("send_rec", body, { headers }));
   };
   const down = (e: PointerEvent) => {
-    if (locked()) {
-      // Locked: the big button is Send.
-      void stopRec(true);
-      return;
-    }
+    e.preventDefault(); // no focus, text selection or closing keyboard: the press only records
+    if (!e.isPrimary || e.button !== 0) return;
+    // Locked: the big button is Send.
+    if (locked()) return void stopRec(true);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     startX = e.clientX;
     startY = e.clientY;
     holding = true;
+    setHint("");
+    const id = ++holdId; // the mic may still be opening for an earlier press
+    clearTimeout(holdTimer);
     holdTimer = window.setTimeout(async () => {
+      holdTimer = 0;
       try {
         const r = await record(video());
-        if (!holding) return r.cancel();
+        if (!holding || id !== holdId) return r.cancel();
         setRec(r);
         setElapsed(0);
         red = false;
-        vib(10);
+        vib(30);
         if (video()) preview.srcObject = r.stream;
         meter(r.stream);
         tick = window.setInterval(() => {
@@ -2164,20 +2170,25 @@ function Chat(p: {
       } catch (e) {
         setErr("Нет доступа к микрофону или камере: " + errText(e));
       }
-    }, 300);
+    }, 200);
   };
   const up = () => {
     if (!holding) return; // already cancelled or locked while sliding
-    holding = false;
-    clearTimeout(holdTimer);
-    if (rec()) stopRec(true);
-    else setVideo(!video());
+    // Released before recording was due: a tap, switches voice ↔ video.
+    if (holdTimer) setVideo(!video());
+    const r = rec();
+    if (!r || Date.now() - r.started < 500) {
+      setHint(`Удерживайте для записи ${video() ? "видео" : "голосового"}`);
+      clearTimeout(hintTimer);
+      hintTimer = window.setTimeout(() => setHint(""), 2000);
+    }
+    void stopRec(true); // sends; no recording or a too-short one is dropped
   };
+  // The system took the pointer away (also fires after a normal release, when `holding` is already false).
   const abort = () => {
-    holding = false;
-    clearTimeout(holdTimer);
-    if (rec() && !locked()) stopRec(false);
+    if (holding) void stopRec(false);
   };
+  onCleanup(() => (clearTimeout(hintTimer), void stopRec(false))); // leaving the chat frees the mic
   const move = (e: PointerEvent) => {
     if (!holding || !rec()) return;
     const dx = Math.min(0, e.clientX - startX), dy = Math.max(0, startY - e.clientY);
@@ -2186,14 +2197,14 @@ function Chat(p: {
       setLocked(true);
       setSlide(0);
       setLift(0);
-      vib(10);
+      vib(30);
     } else if (dx < -120) {
       holding = false;
       stopRec(false);
     } else {
       // One tick when the finger enters the cancel zone (the bar turns red), none while inside.
       const r = dx < -60;
-      if (r !== red && (red = r)) vib(10);
+      if (r !== red && (red = r)) vib(20);
       setSlide(dx);
       setLift(Math.min(dy, 80));
     }
@@ -2528,8 +2539,9 @@ function Chat(p: {
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={22} /></button>
         <Show when={rec() && !locked()}>
-          <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)`, opacity: 0.3 + 0.7 * (lift() / 80) }}><LockIcon size={18} /></div>
+          <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)` }}><LockIcon size={18} /><ChevronUp size={16} /></div>
         </Show>
+        <Show when={hint()}><div class="rec-hint" role="status">{hint()}</div></Show>
         {/* While recording the field stays in place (hidden): the bar keeps its height. */}
         <div class="field-wrap" classList={{ rec: !!rec() }}>
           <Show when={rec()}>
@@ -2575,13 +2587,14 @@ function Chat(p: {
             </div>
           </div>
         </Show>
-        <Show when={text().trim() || editing()} fallback={
+        <Show when={!rec() && (text().trim() || editing())} fallback={
           <button class="icon mic" classList={{ live: !!rec() }}
-            style={rec() ? { transform: `translateX(${slide()}px) scale(2)` } : undefined}
-            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort} onContextMenu={(e) => e.preventDefault()}
+            style={rec() ? { transform: `translateX(${slide()}px)` } : undefined}
+            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort} onLostPointerCapture={(e) => e.target === e.currentTarget && abort()}
+            onContextMenu={(e) => e.preventDefault()}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
             <i class="halo" ref={halo} />
-            {locked() ? <Send size={22} /> : video() ? <Video size={22} /> : <Mic size={22} />}
+            {locked() ? <Send size={rec() ? 28 : 22} /> : video() ? <Video size={rec() ? 28 : 22} /> : <Mic size={rec() ? 28 : 22} />}
           </button>
         }>
           <button class="icon send" disabled={!text().trim()} onClick={send} title={editing() ? "Сохранить" : "Отправить"}>

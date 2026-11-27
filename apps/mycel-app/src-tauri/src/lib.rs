@@ -1847,6 +1847,24 @@ async fn save_download(st: State<'_, App>, id: String) -> R<String> {
     r
 }
 
+/// Short haptic tick (voice recording), Android only (Haptics.kt): `navigator.vibrate` gave no feedback there.
+#[tauri::command]
+fn vibrate(ms: u32) {
+    #[cfg(target_os = "android")]
+    let _ = vault::with_class("org.mycel.app.Haptics", |env, class, ctx| {
+        use jni::objects::JValue;
+        env.call_static_method(
+            class,
+            "vibrate",
+            "(Landroid/content/Context;J)V",
+            &[JValue::Object(ctx), JValue::Long(ms.into())],
+        )?;
+        Ok(())
+    });
+    #[cfg(not(target_os = "android"))]
+    let _ = ms;
+}
+
 /// Calls tab: newest first.
 #[tauri::command]
 async fn calls_list(st: State<'_, App>) -> R<Vec<CallView>> {
@@ -2398,6 +2416,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ptt_key,
             save_download,
+            vibrate,
             status,
             unlock,
             backup,

@@ -452,20 +452,30 @@ button.link:hover:not(:disabled) { background: none; text-decoration: underline;
 .drop { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; display: grid; place-items: center; background: rgb(232 163 61 / 12%); font-weight: 600; z-index: 40; pointer-events: none; }
 /* The recording bar lies over the hidden field: the composer keeps its height. */
 .field-wrap.rec { position: relative; background: none; box-shadow: none; }
-.field-wrap.rec > :not(.recording) { visibility: hidden; }
-.recording { position: absolute; inset: 0; display: flex; align-items: center; gap: 10px; padding: 0 44px 0 8px; font-variant-numeric: tabular-nums; }
+/* Not visibility: that would blur the textarea and close the phone keyboard under the finger. */
+.field-wrap.rec > :not(.recording) { opacity: 0; pointer-events: none; }
+.recording { position: absolute; inset: 0; display: flex; align-items: center; gap: 10px; padding: 0 76px 0 8px; font-variant-numeric: tabular-nums; }
 .recording.cancel { color: var(--danger); }
 .recording .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
 .recording .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* Hold-to-record mic: 2x while live (inline transform carries the slide), halo follows loudness */
-/* No long-press selection/callout: Android would add its own strong long-press buzz. */
-.icon.mic { position: relative; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: transform .2s; transform-origin: 70% 80%; }
-.icon.mic.live { position: relative; z-index: 6; background: var(--danger); color: #fff; transition: none; }
+/* Hold-to-record mic: while live a 64px circle in the corner; it and its halo (up to 1.25×) stay inside the window.
+   The inline transform carries the slide. No long-press selection/callout: Android would add its own strong buzz. */
+.icon.mic { position: relative; flex: none; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+/* The press targets the button itself, not the icon: a finger's capture never moves between them. */
+.icon.mic > * { pointer-events: none; }
+/* A tap on a touch screen must not leave the button looking selected. */
+@media (hover: none) { .icon.mic:hover:not(.live) { background: none; } }
+.icon.mic.live { position: absolute; right: 8px; bottom: 8px; z-index: 6; width: 64px; height: 64px; padding: 0; display: grid; place-items: center;
+  outline: none; background: var(--danger); color: #fff; animation: rec-pop .15s ease-out; }
+@keyframes rec-pop { from { scale: .6; } }
 .icon.mic .halo { display: none; position: absolute; inset: 0; border-radius: 50%; background: rgb(196 69 47 / 35%); z-index: -1; pointer-events: none; }
 .icon.mic.live .halo { display: block; }
-.lock-tip { position: absolute; right: 12px; bottom: 92px; width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
-  background: var(--panel); border: 1px solid var(--line); color: var(--muted); pointer-events: none; }
+/* Centred above the live circle. */
+.lock-tip { position: absolute; right: 22px; bottom: 96px; z-index: 6; width: 36px; padding: 8px 0 4px; border-radius: 18px; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: var(--panel); border: 1px solid var(--line); color: var(--muted); box-shadow: var(--shadow); pointer-events: none; }
+.rec-hint { position: absolute; right: 8px; bottom: calc(100% + 8px); z-index: 6; max-width: calc(100% - 16px); padding: 8px 12px; border-radius: 10px;
+  background: #000c; color: #fff; font-size: 13px; pointer-events: none; animation: pop .15s; }
 
 /* Calls (§9) */
 .call-line { align-self: center; display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted);
