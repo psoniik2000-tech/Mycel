@@ -4,7 +4,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { decode } from "blurhash";
-import { Download, ExternalLink, FileText, Film, Pause, Play, Save } from "lucide-solid";
+import { Download, ExternalLink, FileText, Pause, Play, Save } from "lucide-solid";
 
 export type Media = {
   kind: "file" | "photo" | "video" | "voice" | "videonote";
@@ -55,6 +55,11 @@ function blurUrl(hash: string, w: number, h: number) {
   return c.toDataURL();
 }
 
+/** A thin spinning ring; the arc grows with the download. */
+const Ring = (p: { pct: number }) => (
+  <svg class="ring" viewBox="0 0 36 36"><circle cx="18" cy="18" r="15" pathLength="100" stroke-dasharray={`${Math.max(8, p.pct)} 100`} /></svg>
+);
+
 /** The file of a media message: downloads it (at once when `auto`) and shows the progress. */
 export function useMedia(id: string, m: Media, auto: boolean) {
   const [path, setPath] = createSignal(m.path ?? got[id] ?? null);
@@ -77,43 +82,41 @@ export function useMedia(id: string, m: Media, auto: boolean) {
     if (!path() && auto) fetch();
   });
   const pct = () => Math.min(100, Math.round(((progress()[id] ?? 0) / Math.max(1, m.size)) * 100));
-  const waiting = () => (
-    <div class="dl">
-      <Show when={busy()} fallback={<button class="icon" onClick={(e) => (e.stopPropagation(), fetch())} title="Скачать"><Download size={18} /></button>}>
-        <div class="ring" style={{ "--p": pct() }} />
-      </Show>
-      <span class="muted small">{busy() ? `${pct()}% из ${size(m.size)}` : size(m.size)}</span>
-    </div>
+  // Telegram-style: a spinning ring while downloading, else a download button.
+  const dlIcon = () => (
+    <Show when={busy()} fallback={<button class="icon" onClick={(e) => (e.stopPropagation(), fetch())} title="Скачать"><Download size={18} /></button>}>
+      <Ring pct={pct()} />
+    </Show>
   );
-  return { path, src, err, waiting };
+  const status = () => <span class="muted small">{busy() ? `${pct()}% из ${size(m.size)}` : size(m.size)}</span>;
+  const waiting = () => <div class="dl">{dlIcon()}{status()}</div>;
+  return { path, src, err, waiting, dlIcon, status, busy, pct, fetch };
 }
 
 /** `tile`: a cell of an album grid, which sets the size. `onView` opens the full-screen viewer. */
 export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: boolean }) {
   // §8.3: photos and voice always, video and files up to 20 MB.
-  const { path, src, err, waiting } = useMedia(p.id, p.m, ["photo", "voice", "videonote"].includes(p.m.kind) || p.m.size <= 20 << 20);
+  const { path, src, err, waiting, dlIcon, status, busy, pct, fetch } = useMedia(p.id, p.m, ["photo", "voice", "videonote"].includes(p.m.kind) || p.m.size <= 20 << 20);
   const [w, h] = p.m.dims ?? [4, 3];
+  // Not here yet: the blurred preview (or a grey box) of the right shape, the ring in the middle.
+  const placeholder = () => (
+    <div class="photo" style={p.tile ? {} : { "aspect-ratio": `${w} / ${h}` }}>
+      <Show when={p.m.blurhash}><img class="blur" src={blurUrl(p.m.blurhash!, w, h)} alt="" /></Show>
+      <div class="over">{waiting()}</div>
+    </div>
+  );
   return (
     <div class="media">
       <Switch>
         <Match when={p.m.kind === "photo"}>
-          <div class="photo" style={p.tile ? {} : { "aspect-ratio": `${w} / ${h}` }}>
-            <Show when={path()} fallback={
-              <>
-                <Show when={p.m.blurhash}><img class="blur" src={blurUrl(p.m.blurhash!, w, h)} alt="" /></Show>
-                <div class="over">{waiting()}</div>
-              </>
-            }>
+          <Show when={path()} fallback={placeholder()}>
+            <div class="photo" style={p.tile ? {} : { "aspect-ratio": `${w} / ${h}` }}>
               <img src={src()} alt="Фото" onClick={p.onView} />
-            </Show>
-          </div>
+            </div>
+          </Show>
         </Match>
         <Match when={p.m.kind === "video"}>
-          <Show when={path()} fallback={
-            <Show when={p.tile} fallback={<div class="file"><Film size={28} /><div class="grow"><div class="ellipsis">{p.m.name ?? "Видео"}</div>{waiting()}</div></div>}>
-              <div class="photo"><div class="over">{waiting()}</div></div>
-            </Show>
-          }>
+          <Show when={path()} fallback={placeholder()}>
             {/* #t: Android's WebView shows no first frame without it. */}
             <button class="video" onClick={p.onView} title="Смотреть видео">
               <video src={`${src()}#t=0.1`} preload="metadata" muted playsinline />
@@ -122,7 +125,7 @@ export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: 
           </Show>
         </Match>
         <Match when={p.m.kind === "voice"}>
-          <Voice src={src()} wave={p.m.wave ?? []} ms={p.m.duration_ms ?? 0} ready={!!path()} />
+          <Voice src={src()} wave={p.m.wave ?? []} ms={p.m.duration_ms ?? 0} ready={!!path()} busy={busy()} pct={pct()} fetch={fetch} />
         </Match>
         <Match when={p.m.kind === "videonote"}>
           <Show when={path()} fallback={<div class="circle empty">{waiting()}</div>}>
@@ -131,10 +134,10 @@ export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: 
         </Match>
         <Match when={p.m.kind === "file"}>
           <div class="file">
-            <FileText size={28} />
+            <Show when={path()} fallback={dlIcon()}><FileText size={28} /></Show>
             <div class="grow">
               <div class="ellipsis" title={p.m.name ?? ""}>{p.m.name ?? "Файл"}</div>
-              <Show when={path()} fallback={waiting()}>
+              <Show when={path()} fallback={status()}>
                 <div class="actions">
                   <span class="muted small">{size(p.m.size)}</span>
                   <button class="link" onClick={() => invoke("open_media", { id: p.id })}><ExternalLink size={14} /> Открыть</button>
@@ -150,7 +153,7 @@ export function MediaView(p: { id: string; m: Media; onView: () => void; tile?: 
   );
 }
 
-function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean }) {
+function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean; busy: boolean; pct: number; fetch: () => void }) {
   let audio!: HTMLAudioElement;
   const [playing, setPlaying] = createSignal(false);
   const [pos, setPos] = createSignal(0);
@@ -166,7 +169,9 @@ function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean }) {
   };
   return (
     <div class="voice">
-      <button class="icon play" disabled={!p.ready} onClick={toggle}>{playing() ? <Pause size={18} /> : <Play size={18} />}</button>
+      <button class="icon play" onClick={() => (p.ready ? toggle() : p.fetch())} title={p.ready ? undefined : "Скачать"}>
+        {!p.ready ? (p.busy ? <Ring pct={p.pct} /> : <Download size={18} />) : playing() ? <Pause size={18} /> : <Play size={18} />}
+      </button>
       <div class="wave" onClick={seek}>
         <For each={bars()}>
           {(v, i) => <i style={{ height: `${10 + (v / 255) * 90}%` }} classList={{ done: (i() + 0.5) / bars().length <= pos() / Math.max(1, len()) }} />}

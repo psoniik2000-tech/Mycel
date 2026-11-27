@@ -1912,8 +1912,9 @@ function Chat(p: {
 
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
   // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
-  let holdTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, raf = 0, halo!: HTMLElement;
+  let holdTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, red = false, raf = 0, halo!: HTMLElement;
   let ctx: AudioContext | undefined;
+  // Telegram-like haptics: short ticks on start, entering the cancel zone, lock, send and cancel; never on every move.
   const vib = (ms: number) => navigator.vibrate?.(ms);
   // The halo behind the mic scales 1.0–1.4 with the microphone's loudness (smoothed).
   const meter = (stream: MediaStream) => {
@@ -1945,7 +1946,7 @@ function Chat(p: {
     setLocked(false);
     if (!r) return;
     if (!send || Date.now() - r.started < 500) {
-      if (!send) vib(40); // a deliberate cancel buzzes; a too-short press is silently dropped
+      if (!send) vib(20); // a deliberate cancel ticks; a too-short press is silently dropped
       return r.cancel();
     }
     vib(15);
@@ -1972,7 +1973,8 @@ function Chat(p: {
         if (!holding) return r.cancel();
         setRec(r);
         setElapsed(0);
-        vib(15);
+        red = false;
+        vib(10);
         if (video()) preview.srcObject = r.stream;
         meter(r.stream);
         tick = window.setInterval(() => {
@@ -2005,11 +2007,14 @@ function Chat(p: {
       setLocked(true);
       setSlide(0);
       setLift(0);
-      vib(15);
+      vib(10);
     } else if (dx < -120) {
       holding = false;
       stopRec(false);
     } else {
+      // One tick when the finger enters the cancel zone (the bar turns red), none while inside.
+      const r = dx < -60;
+      if (r !== red && (red = r)) vib(10);
       setSlide(dx);
       setLift(Math.min(dy, 80));
     }
@@ -2330,21 +2335,22 @@ function Chat(p: {
       <input ref={picker} type="file" multiple hidden onChange={pick} />
       <div class="composer">
         <button class="icon" onClick={attach} title="Прикрепить файл (или перетащите в окно)"><Paperclip size={22} /></button>
-        <Show when={rec()}>
-          <div class="recording grow" classList={{ cancel: slide() < -60 }}>
-            <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")},{Math.floor(elapsed() / 100) % 10}
-            <Show when={locked()} fallback={
-              <span class="muted small grow" style={{ opacity: 1 - Math.min(1, -slide() / 120) }}>‹ Влево — отмена</span>
-            }>
-              <span class="grow" />
-              <button class="link" onClick={() => stopRec(false)}>Отмена</button>
-            </Show>
-          </div>
-        </Show>
         <Show when={rec() && !locked()}>
           <div class="lock-tip" style={{ transform: `translate(${slide()}px, ${-lift()}px)`, opacity: 0.3 + 0.7 * (lift() / 80) }}><LockIcon size={18} /></div>
         </Show>
-        <div class="field-wrap" style={{ display: rec() ? "none" : undefined }}>
+        {/* While recording the field stays in place (hidden): the bar keeps its height. */}
+        <div class="field-wrap" classList={{ rec: !!rec() }}>
+          <Show when={rec()}>
+            <div class="recording" classList={{ cancel: slide() < -60 }}>
+              <i class="dot" /> {Math.floor(elapsed() / 60000)}:{String(Math.floor(elapsed() / 1000) % 60).padStart(2, "0")},{Math.floor(elapsed() / 100) % 10}
+              <Show when={locked()} fallback={
+                <span class="muted small grow" style={{ opacity: 1 - Math.min(1, -slide() / 120) }}>‹ Влево — отмена</span>
+              }>
+                <span class="grow" />
+                <button class="link" onClick={() => stopRec(false)}>Отмена</button>
+              </Show>
+            </div>
+          </Show>
           <button class="icon" classList={{ on: emo() !== undefined }} title="Смайлики"
             onClick={() => setEmo(emo() !== undefined ? undefined : recentEmoji().length ? -1 : 0)}><Smile size={22} /></button>
         <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()}
@@ -2380,7 +2386,7 @@ function Chat(p: {
         <Show when={text().trim() || editing()} fallback={
           <button class="icon mic" classList={{ live: !!rec() }}
             style={rec() ? { transform: `translateX(${slide()}px) scale(2)` } : undefined}
-            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort}
+            onPointerDown={down} onPointerUp={up} onPointerMove={move} onPointerCancel={abort} onContextMenu={(e) => e.preventDefault()}
             title={video() ? "Удерживайте — видеосообщение; нажмите — голосовое" : "Удерживайте — голосовое; нажмите — видеосообщение"}>
             <i class="halo" ref={halo} />
             {locked() ? <Send size={22} /> : video() ? <Video size={22} /> : <Mic size={22} />}
