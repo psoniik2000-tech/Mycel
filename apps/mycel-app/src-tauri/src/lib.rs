@@ -1,7 +1,7 @@
 //! Tauri shell: thin commands over mycel-core; new events go to the UI as `message`.
 
 use mycel_core::mycel_proto::{BlobRef, CallAction, Event, EventBody, EventId, MediaKind, Preview};
-use mycel_core::{Chat, Node, Opts, edits_and_pins, media, reactions};
+use mycel_core::{Chat, Node, Opts, Privacy, edits_and_pins, media, reactions};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -164,6 +164,14 @@ impl App {
 
 /// The window is on screen (the UI reports `visibilitychange`); hidden → system notifications.
 struct Visible(AtomicBool);
+
+/// The window was shown or hidden: notifications and our presence follow.
+fn shown(app: &AppHandle, v: bool) {
+    app.state::<Visible>().0.store(v, Ordering::Relaxed);
+    if let Ok(n) = app.state::<App>().node() {
+        tauri::async_runtime::spawn(async move { n.set_active(v) });
+    }
+}
 
 /// The system notification for a new event from someone else: (title, body).
 fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
@@ -559,8 +567,11 @@ struct Member {
     color: Option<u8>,
     /// "direct" / "relay" / None (no connection right now).
     link: Option<&'static str>,
-    /// Unix ms of the last message received from this device.
+    /// In the app right now, as far as the privacy settings of both sides allow.
+    online: bool,
+    /// Unix ms they were last active; only roughly right when `hidden`.
     seen: Option<u64>,
+    hidden: bool,
     /// Removed from «Люди» on this device; still named in chats.
     removed: bool,
 }
@@ -1047,6 +1058,7 @@ async fn unlock(
     if let Ok(t) = std::fs::read_to_string(root.join("push_token")) {
         node.set_push_token(t.trim().to_string());
     }
+    node.set_active(app.state::<Visible>().0.load(Ordering::Relaxed));
     let in_space = node.admin().is_ok();
     let space = id.clone();
     *st.0.lock().unwrap() = Some(Open {
@@ -1490,7 +1502,11 @@ fn set_archived(app: AppHandle, st: State<App>, chat: String, on: bool) -> R<()>
 #[tauri::command]
 async fn delete_chat(app: AppHandle, st: State<'_, App>, chat: String, contact: bool) -> R<()> {
     let (n, space) = &st.open()?;
-    n.delete_chat(&chat_of(n, &chat)?).map_err(err)?;
+    let c = chat_of(n, &chat)?;
+    n.delete_chat(&c).map_err(err)?;
+    if let Some(peer) = c.filter(|_| contact) {
+        n.forget_contact(&peer).map_err(err)?;
+    }
     spaces::List::edit(&data_dir(&app)?, |l| {
         if let Some(s) = l.spaces.iter_mut().find(|s| s.id == *space) {
             s.pinned.retain(|c| *c != chat);
@@ -1701,8 +1717,19 @@ fn body<'a>(request: &'a tauri::ipc::Request<'_>) -> R<std::borrow::Cow<'a, [u8]
 }
 
 #[tauri::command]
-fn set_visible(v: bool, vis: State<Visible>) {
-    vis.0.store(v, Ordering::Relaxed);
+fn set_visible(app: AppHandle, v: bool) {
+    shown(&app, v);
+}
+
+/// Settings → «Конфиденциальность».
+#[tauri::command]
+async fn privacy(st: State<'_, App>) -> R<Privacy> {
+    Ok(st.node()?.privacy())
+}
+
+#[tauri::command]
+async fn set_privacy(st: State<'_, App>, privacy: Privacy) -> R<()> {
+    st.node()?.set_privacy(privacy).map_err(err)
 }
 
 /// A file picked in the WebView (Android has no paths): raw body saved as temp/`name`; returns the path for `send_files`.
@@ -2033,10 +2060,13 @@ async fn members(app: AppHandle, st: State<'_, App>) -> R<Vec<Member>> {
         .iter()
         .map(|m| {
             let p = prof.remove(m);
-            let (link, seen) = n.link(m);
+            let (link, _) = n.link(m);
+            let at = n.presence(m);
             Member {
                 link: link.map(|r| if r { "relay" } else { "direct" }),
-                seen,
+                online: at.online,
+                seen: at.seen,
+                hidden: at.hidden,
                 removed: removed.contains(&short(m)),
                 id: short(m),
                 me: *m == me,
@@ -2348,7 +2378,7 @@ fn show_main(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     }
-    app.state::<Visible>().0.store(true, Ordering::Relaxed);
+    shown(app, true);
 }
 
 /// Like other messengers: lives in the tray, closing the window only hides it.
@@ -2445,7 +2475,7 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = e {
                 api.prevent_close();
                 let _ = w.hide();
-                w.state::<Visible>().0.store(false, Ordering::Relaxed);
+                shown(w.app_handle(), false);
             }
         });
     b.plugin(tauri_plugin_dialog::init())
@@ -2518,6 +2548,8 @@ pub fn run() {
             members,
             peers,
             set_visible,
+            privacy,
+            set_privacy,
             mark_read,
             set_muted,
             set_pinned,

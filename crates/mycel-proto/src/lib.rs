@@ -36,6 +36,12 @@ pub enum SyncMsg {
         group_id: [u8; 32],
         voice: bool,
     },
+    /// The sender is in the app (`online`) or was `ago` seconds ago; `ago: None` = hidden from
+    /// the receiver. A new variant: older apps skip it.
+    Presence {
+        online: bool,
+        ago: Option<u32>,
+    },
 }
 
 /// A node's address (EndpointTicket string), signed by the node key over (ticket, relay, ts_ms).

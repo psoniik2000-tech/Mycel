@@ -22,6 +22,7 @@ use n0_future::StreamExt;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -29,11 +30,13 @@ use tokio::sync::mpsc;
 pub mod backup;
 mod call;
 pub mod dir;
+mod privacy;
 mod serverbox;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
 pub use mycel_crypto::safety_code;
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
+pub use privacy::{Presence, Privacy, Who};
 
 const LINK: &str = "mycel://join/";
 const CONTACT_LINK: &str = "mycel://contact/";
@@ -474,6 +477,8 @@ pub struct Node {
     typing_tx: Mutex<Option<mpsc::Sender<Typing>>>,
     /// Per chat: when we last sent a typing signal and whether it was voice.
     typing_sent: Mutex<HashMap<Chat, (Instant, bool)>>,
+    /// The app is on screen (`set_active`).
+    active: std::sync::atomic::AtomicBool,
 }
 
 /// A member is typing (or recording a voice message, `voice`) in a chat.
@@ -600,6 +605,7 @@ impl Node {
             unacked: Default::default(),
             typing_tx: Default::default(),
             typing_sent: Default::default(),
+            active: Default::default(),
         });
         let (tx, rx) = mpsc::channel(256);
         let n = node.clone();
@@ -632,6 +638,9 @@ impl Node {
                             n.clone().fetch_all(evs.clone());
                         }
                         for ev in evs {
+                            if n.screen_call(&ev) {
+                                continue;
+                            }
                             n.on_call_event(&ev);
                             let _ = tx.send(ev).await;
                         }
@@ -1649,6 +1658,7 @@ impl Node {
         let mine = self.mine();
         let hist = self.history(chat)?;
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
+        let hidden = self.hides_reads(chat);
         // Highest lamport delivered / read by anyone else.
         let (mut delivered, mut read) = (None, None);
         for e in &hist {
@@ -1656,7 +1666,7 @@ impl Node {
                 && !mine.contains(&e.author_device)
                 && let Some(&l) = lamport.get(up_to)
             {
-                let s = if *kind == ReceiptKind::Read {
+                let s = if *kind == ReceiptKind::Read && !hidden {
                     &mut read
                 } else {
                     &mut delivered
@@ -1700,7 +1710,8 @@ impl Node {
                 }
                 _ => None,
             })
-            .max();
+            .max()
+            .max(self.read_mark(chat)?);
         Ok(hist
             .iter()
             .filter(|e| !mine.contains(&e.author_device) && is_incoming(&e.body))
@@ -1721,6 +1732,9 @@ impl Node {
         else {
             return Ok(());
         };
+        if self.hides_reads(chat) {
+            return self.set_read_mark(chat, last.lamport);
+        }
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
         // A Read receipt from any of our devices counts (§4.4).
         let done = hist.iter().any(|e| {
@@ -2207,6 +2221,10 @@ impl Node {
             return Ok(());
         }
         let (sees, envs) = (st.audience()?, st.env_groups()?);
+        let (me, online) = (self.device_id(), self.active.load(Ordering::Relaxed));
+        if online {
+            st.touch_active()?;
+        }
         for p in st.store.peers()? {
             let Some(id) = peer_addr(&p).map(|a| *a.id.as_bytes()) else {
                 continue;
@@ -2221,6 +2239,9 @@ impl Node {
                 .collect();
             let to = vec![p];
             self.broadcast(to.clone(), SyncMsg::Peers(self.peer_list(&st, &id)?));
+            if let Some(m) = st.presence_msg(&id, me, online)? {
+                self.broadcast(to.clone(), m);
+            }
             self.broadcast(to, SyncMsg::Have { ids, reply: true });
         }
         Ok(())
@@ -2505,6 +2526,10 @@ impl Node {
                 }
                 if reply {
                     self.broadcast(to.clone(), SyncMsg::Peers(self.peer_list(&st, &who)?));
+                    let online = self.active.load(Ordering::Relaxed);
+                    if let Some(m) = st.presence_msg(&who, me, online)? {
+                        self.broadcast(to.clone(), m);
+                    }
                     let ids = st
                         .env_groups()?
                         .into_iter()
@@ -2515,6 +2540,7 @@ impl Node {
                 }
             }
             SyncMsg::Peers(list) => self.add_peers(&st, &list)?,
+            SyncMsg::Presence { online, ago } => st.take_presence(who, online, ago)?,
             SyncMsg::Typing { group_id, voice } => {
                 ensure!(st.audience()?(&group_id, &who), "not in this chat");
                 let chat = st.chat_of(&group_id)?.context("unknown chat")?;
@@ -2590,6 +2616,9 @@ impl Node {
             let id = ids[0];
             ensure!(id == *from.as_bytes(), "KeyPackage is not the sender's");
             st.add_contact(gid, id)?;
+            if public {
+                st.add_stranger(id)?;
+            }
             st.save_mls()?;
             st.store
                 .upsert_peer(&id, &postcard::to_allocvec(&req.addr)?)?;

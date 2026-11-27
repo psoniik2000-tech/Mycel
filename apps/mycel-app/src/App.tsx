@@ -9,6 +9,7 @@ import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notif
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
   Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer,
+  EyeOff,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -22,6 +23,7 @@ import { Signal, VoiceSettings } from "./voice";
 import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
 import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameSettings, withBox, withServer } from "./directory";
+import { lastSeen, PrivacySettings } from "./privacy";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
@@ -33,7 +35,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 // chat: "" = the space chat (group call), else the 1:1 partner's id.
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
-type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; seen: number | null; removed: boolean };
+type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; online: boolean; seen: number | null; hidden: boolean; removed: boolean };
 type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean; anchor: string | null };
@@ -169,17 +171,17 @@ const callLabel = (c: CallView) =>
   : c.active ? "Идёт звонок"
   : `${c.video ? "Видеозвонок" : "Звонок"}, ${clock(c.duration_ms ?? 0)}`;
 
-/** The connection to a member in words, for the 1:1 chat header. */
+/** The connection to a member in words (tooltip, ⋮ menu); one who hides their time shows only that. */
 const linkText = (m?: Member) => {
   if (!m || m.me) return "личный чат";
+  if (m.hidden) return presence(m);
   if (m.link) return m.link === "direct" ? "на связи напрямую" : "на связи через сервер-ретранслятор";
-  if (!m.seen) return "не в сети, сообщения дойдут через почтовый ящик";
-  const min = Math.round((Date.now() - m.seen) / 60_000);
-  return `был(а) в сети ${min < 1 ? "только что" : min < 60 ? `${min} мин назад` : new Date(m.seen).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
+  // Online without a link here: through another device of theirs.
+  return m.online ? "в сети" : "не в сети, сообщения дойдут через почтовый ящик";
 };
 
 /** Header status in Telegram's words; the link details are in linkText (tooltip, ⋮ menu). */
-const presence = (m?: Member) => (!m || m.me ? "личный чат" : m.link ? "в сети" : m.seen ? linkText(m) : "не в сети");
+const presence = (m?: Member) => (!m || m.me ? "личный чат" : m.online ? "в сети" : lastSeen(m.seen, m.hidden));
 
 function Avatar(p: { id: string; onClick?: () => void; dot?: boolean }) {
   const m = () => memberOf(p.id);
@@ -187,7 +189,7 @@ function Avatar(p: { id: string; onClick?: () => void; dot?: boolean }) {
     <div class="avatar" classList={{ link: !!p.onClick }} style={{ background: `hsl(${colorOf(p.id)} 45% 55%)` }}
       onClick={(e) => p.onClick && (e.stopPropagation(), p.onClick())}>
       {initials(p.id)}
-      <Show when={p.dot && !m()?.me && m()?.link}><i class={`link-dot ${m()?.link ?? "off"}`} title={linkText(m())} /></Show>
+      <Show when={p.dot && !m()?.me && m()?.online}><i class={`link-dot ${m()?.link ?? "direct"}`} title={linkText(m())} /></Show>
     </div>
   );
 }
@@ -1568,6 +1570,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                     ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
                     ["Приложение", Monitor, android ? "Обновления" : "Автозапуск, трей, обновления"],
                     ["Устройства", Smartphone, "Телефон и ПК как один аккаунт"],
+                    ["Конфиденциальность", EyeOff, "Время захода, звонки, прочтение, поиск"],
                     ["Вход", LockIcon, "Пароль при запуске"],
                     ["Резервная копия", Archive, "Копия, восстановление, экспорт чата"],
                     ["Режим", Layers, simple() ? "Личные чаты" : "Пространства"],
@@ -1621,6 +1624,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   </Match>
                   <Match when={sub() === "Приложение"}>
                     <AppSettings />
+                  </Match>
+                  <Match when={sub() === "Конфиденциальность"}>
+                    <PrivacySettings space={p.space.id} />
                   </Match>
                   <Match when={sub() === "Вход"}>
                     <LoginSettings space={p.space} refresh={p.refresh} />
@@ -1699,7 +1705,7 @@ function Profile(p: { id: string; inCall: boolean; onClose: () => void; onWrite:
       <div class="card dialog profile" onClick={(e) => e.stopPropagation()}>
         <Avatar id={p.id} dot />
         <h3>{nameOf(p.id)}</h3>
-        <div class="muted small" classList={{ online: !!m()?.link }}>{m()?.link ? "в сети" : linkText(m())}<Username id={p.id} /></div>
+        <div class="muted small" classList={{ online: !!m()?.online }}>{presence(m())}<Username id={p.id} /></div>
         <button onClick={p.onWrite}><MessageCircle size={18} /> Написать</button>
         <button disabled={p.inCall} onClick={() => p.onCall(false)}><Phone size={18} /> Позвонить</button>
         <button disabled={p.inCall} onClick={() => p.onCall(true)}><Video size={18} /> Видеозвонок</button>
@@ -1859,7 +1865,7 @@ function People(p: { members: Member[]; simple: boolean; onWrite: (id: string) =
             <Avatar id={m.id} dot onClick={m.me ? undefined : () => p.onProfile(m.id)} />
             <div class="grow">
               <b class="ellipsis">{nameOf(m.id)}{m.me ? " (вы)" : ""}</b>
-              <div class="muted small" classList={{ online: !!m.link }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={p.simple}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !p.simple}> · админ</Show>
+              <div class="muted small" classList={{ online: m.online }} title={m.id}>{m.me ? m.id : presence(m)}<Show when={p.simple}><Username id={m.id} me={m.me} /></Show><Show when={m.admin && !p.simple}> · админ</Show>
                 <Show when={status(m) === "ok"}> · проверен</Show></div>
               <Show when={status(m) === "changed"}><div class="error">Ключ сменился (новое устройство?) — проверьте код безопасности заново</div></Show>
             </div>
@@ -2326,7 +2332,7 @@ function Chat(p: {
         {p.chat ? <Avatar id={p.chat} dot onClick={p.onProfile} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
         <div class="grow ellipsis" classList={{ link: !!p.chat }} onClick={() => p.chat && p.onProfile()}>
           <b>{p.chat ? nameOf(p.chat) : "Общий чат"}</b>
-          <div class="muted small ellipsis" classList={{ typing: !!typingText(p.chat), online: !!memberOf(p.chat)?.link }} title={p.chat ? linkText(memberOf(p.chat)) : ""}>
+          <div class="muted small ellipsis" classList={{ typing: !!typingText(p.chat), online: !!memberOf(p.chat)?.online }} title={p.chat ? linkText(memberOf(p.chat)) : ""}>
             {typingText(p.chat) || (p.chat ? presence(memberOf(p.chat)) : `${p.members} участн.`)}
           </div>
         </div>
