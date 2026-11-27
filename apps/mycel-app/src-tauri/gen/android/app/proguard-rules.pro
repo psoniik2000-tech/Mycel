@@ -25,3 +25,5 @@
 # Called only from Rust over JNI.
 -keep class org.mycel.app.Vault { *; }
 -keep class org.mycel.app.Save { *; }
+# Push.show is called from Rust over JNI by name (lib.rs notify); R8 renamed it and the call failed silently.
+-keep class org.mycel.app.Push { *; }
