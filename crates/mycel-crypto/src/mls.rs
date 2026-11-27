@@ -42,6 +42,9 @@ pub enum Incoming {
     Commit,
 }
 
+/// (added device ids, commit, welcome).
+pub type Added = (Vec<[u8; 32]>, Vec<u8>, Vec<u8>);
+
 pub struct Mls {
     provider: Provider,
     signer: SignatureKeyPair,
@@ -117,15 +120,37 @@ impl Mls {
         Ok(kp.key_package().tls_serialize_detached()?)
     }
 
-    /// Adds the KeyPackage owner. Returns (new member's device id, commit, welcome); commit already merged.
-    pub fn add_member(&mut self, gid: &[u8], kp: &[u8]) -> Result<([u8; 32], Vec<u8>, Vec<u8>)> {
-        let kp = KeyPackageIn::tls_deserialize_exact(kp)?
-            .validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
-        let id = device(kp.leaf_node().credential())?;
+    /// Adds the KeyPackages' owners in one commit. Returns (their device ids, commit, welcome);
+    /// commit already merged.
+    pub fn add_members(&mut self, gid: &[u8], kps: &[Vec<u8>]) -> Result<Added> {
+        let mut ids = vec![];
+        let mut v = vec![];
+        for kp in kps {
+            let kp = KeyPackageIn::tls_deserialize_exact(kp)?
+                .validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
+            ids.push(device(kp.leaf_node().credential())?);
+            v.push(kp);
+        }
         let g = self.groups.get_mut(gid).context("no group")?;
-        let (commit, welcome, _) = g.add_members(&self.provider, &self.signer, &[kp])?;
+        let (commit, welcome, _) = g.add_members(&self.provider, &self.signer, &v)?;
         g.merge_pending_commit(&self.provider)?;
-        Ok((id, commit.to_bytes()?, welcome.to_bytes()?))
+        Ok((ids, commit.to_bytes()?, welcome.to_bytes()?))
+    }
+
+    /// Removes a member's leaves; returns the commit (already merged), `None` if not a member.
+    pub fn remove_member(&mut self, gid: &[u8], dev: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let g = self.groups.get_mut(gid).context("no group")?;
+        let leaves: Vec<_> = g
+            .members()
+            .filter(|m| device(&m.credential).ok().as_ref() == Some(dev))
+            .map(|m| m.index)
+            .collect();
+        if leaves.is_empty() {
+            return Ok(None);
+        }
+        let (commit, _, _) = g.remove_members(&self.provider, &self.signer, &leaves)?;
+        g.merge_pending_commit(&self.provider)?;
+        Ok(Some(commit.to_bytes()?))
     }
 
     /// Joins from a Welcome; returns the group id.
@@ -151,8 +176,13 @@ impl Mls {
             .to_bytes()?)
     }
 
-    /// Decrypts a message; commits are merged only if sent by `admin`.
-    pub fn process(&mut self, gid: &[u8], msg: &[u8], admin: &[u8; 32]) -> Result<Incoming> {
+    /// Decrypts a message; commits are merged only if sent by `admin` (any member when `None`).
+    pub fn process(
+        &mut self,
+        gid: &[u8],
+        msg: &[u8],
+        admin: Option<&[u8; 32]>,
+    ) -> Result<Incoming> {
         let g = self.groups.get_mut(gid).context("no group")?;
         let m = MlsMessageIn::tls_deserialize_exact(msg)?.try_into_protocol_message()?;
         let p = g.process_message(&self.provider, m)?;
@@ -164,7 +194,7 @@ impl Mls {
             }),
             ProcessedMessageContent::StagedCommitMessage(c) => {
                 // shortcut: single admin (space creator), so no epoch conflicts; add smaller-hash-wins (§5) with multiple admins.
-                ensure!(&sender == admin, "commit not from admin");
+                ensure!(admin.is_none_or(|a| *a == sender), "commit not from admin");
                 g.merge_staged_commit(&self.provider, *c)?;
                 Ok(Incoming::Commit)
             }
@@ -212,14 +242,14 @@ mod tests {
         let mut a = Mls::new(&ka, None, &[]).unwrap();
         a.create_group(g).unwrap();
         let mut b = Mls::new(&kb, None, &[]).unwrap();
-        let (id, _commit, welcome) = a.add_member(g, &b.key_package(false).unwrap()).unwrap();
-        assert_eq!(id, *kb.public().as_bytes());
+        let (id, _commit, welcome) = a.add_members(g, &[b.key_package(false).unwrap()]).unwrap();
+        assert_eq!(id, vec![*kb.public().as_bytes()]);
         assert_eq!(b.join(&welcome).unwrap(), g.to_vec());
         assert_eq!(a.members(g).len(), 2);
 
         let ct = a.encrypt(g, b"secret").unwrap();
         assert!(!ct.windows(6).any(|w| w == b"secret"));
-        let Incoming::App { sender, data } = b.process(g, &ct, &admin).unwrap() else {
+        let Incoming::App { sender, data } = b.process(g, &ct, Some(&admin)).unwrap() else {
             panic!("not app")
         };
         assert_eq!((sender, data.as_slice()), (admin, &b"secret"[..]));
@@ -227,7 +257,7 @@ mod tests {
         // Restart B from its dumped state.
         let mut b = Mls::new(&kb, Some(&b.state()), &[g.to_vec()]).unwrap();
         let ct = b.encrypt(g, b"back").unwrap();
-        let Incoming::App { data, .. } = a.process(g, &ct, &admin).unwrap() else {
+        let Incoming::App { data, .. } = a.process(g, &ct, Some(&admin)).unwrap() else {
             panic!("not app")
         };
         assert_eq!(data, b"back");
@@ -236,8 +266,15 @@ mod tests {
         let kp = b.key_package(true).unwrap();
         for gid in [[8; 32], [9; 32]] {
             a.create_group(&gid).unwrap();
-            let (_, _, w) = a.add_member(&gid, &kp).unwrap();
+            let (_, _, w) = a.add_members(&gid, std::slice::from_ref(&kp)).unwrap();
             assert_eq!(b.join(&w).unwrap(), gid.to_vec());
         }
+        // Removal: B is gone from A's view.
+        assert!(
+            a.remove_member(&[9; 32], &kb.public().as_bytes().clone())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(a.members(&[9; 32]).len(), 1);
     }
 }

@@ -36,6 +36,7 @@ pub use mycel_proto;
 
 const LINK: &str = "mycel://join/";
 const CONTACT_LINK: &str = "mycel://contact/";
+const DEVICE_LINK: &str = "mycel://device/";
 /// Join error prefixes (the UI shows a matching text).
 pub const JOIN_BAD_LINK: &str = "not a mycel invite link";
 pub const JOIN_UNREACHABLE: &str = "inviter unreachable";
@@ -72,6 +73,19 @@ pub type Chat = Option<[u8; 32]>;
 
 /// A member profile: (name, avatar letter, color index, last-resort KeyPackage).
 pub type Profile = (String, String, u8, Vec<u8>);
+
+/// Latest Account event of each author: (timestamp, account, devices) (§4.4).
+type Accounts = HashMap<[u8; 32], (u64, [u8; 32], Vec<[u8; 32]>)>;
+
+/// What a linked device gets from the account root in its join answer: the space Welcome,
+/// (group, partner, is a contact group, Welcome) of every 1:1 group, and the history.
+type LinkPack = (
+    Vec<u8>,
+    Vec<([u8; 32], [u8; 32], bool, Vec<u8>)>,
+    Vec<(Vec<u8>, Event)>,
+);
+/// Largest history a linked device gets at once (the join answer is at most 16 MiB).
+const LINK_HISTORY: usize = 8 << 20;
 
 fn chat_key(c: &Chat) -> &[u8] {
     c.as_ref().map_or(&[], |p| &p[..])
@@ -133,25 +147,82 @@ impl State {
     /// the space and its 1:1 groups. A closure, so a sync looks the rest up once.
     fn audience(&self) -> Result<impl Fn(&[u8; 32], &[u8; 32]) -> bool + use<>> {
         let members: HashSet<_> = self.mls.members(&self.group()?).into_iter().collect();
-        let dms: HashMap<_, _> = self.dms()?.into_iter().collect();
-        let contacts: HashMap<_, _> = self
-            .contacts()?
+        let contacts: HashSet<_> = self.contacts()?.into_iter().collect();
+        // Members of each 1:1 group: the partner's devices and ours (§4.4).
+        let groups: HashMap<_, _> = self
+            .dms()?
             .into_iter()
-            .filter_map(|g| Some((g, *dms.get(&g)?)))
+            .map(|(g, _)| (g, self.mls.members(&g)))
             .collect();
-        Ok(
-            move |gid: &[u8; 32], dev: &[u8; 32]| match contacts.get(gid) {
-                Some(p) => p == dev,
-                None => members.contains(dev),
-            },
-        )
+        Ok(move |gid: &[u8; 32], dev: &[u8; 32]| {
+            let inside = groups.get(gid).is_some_and(|m| m.contains(dev));
+            inside || (!contacts.contains(gid) && members.contains(dev))
+        })
     }
 
-    /// A space member or a contact partner: may sync with us and fetch blobs.
+    /// A space member or a member of one of our 1:1 groups: may sync with us and fetch blobs.
     fn knows(&self, dev: &[u8; 32]) -> Result<bool> {
-        let dms: HashMap<_, _> = self.dms()?.into_iter().collect();
         Ok(self.mls.members(&self.group()?).contains(dev)
-            || self.contacts()?.iter().any(|g| dms.get(g) == Some(dev)))
+            || self
+                .dms()?
+                .iter()
+                .any(|(g, _)| self.mls.members(g).contains(dev)))
+    }
+
+    fn accounts(&self) -> Result<Accounts> {
+        let r = self.store.meta("accounts")?;
+        Ok(r.map(|b| postcard::from_bytes(&b))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// The account of someone else's device: its root when the root lists it and it names the
+    /// root, else the device itself (an older app = an account of one device).
+    fn account_of(&self, d: &[u8; 32]) -> Result<[u8; 32]> {
+        let a = self.accounts()?;
+        Ok(match a.get(d) {
+            Some((_, acc, _)) if acc != d && a.get(acc).is_some_and(|(_, _, l)| l.contains(d)) => {
+                *acc
+            }
+            _ => *d,
+        })
+    }
+
+    fn my_account(&self, me: [u8; 32]) -> Result<[u8; 32]> {
+        let a = self.store.meta("account")?;
+        Ok(a.and_then(|a| a.try_into().ok()).unwrap_or(me))
+    }
+
+    /// Our account's devices as its root lists them (confirmed or not), us and the root.
+    fn mine(&self, me: [u8; 32]) -> Result<HashSet<[u8; 32]>> {
+        let acc = self.my_account(me)?;
+        let mut s: HashSet<_> = self
+            .accounts()?
+            .remove(&acc)
+            .map(|(_, _, l)| l)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        s.extend([me, acc]);
+        Ok(s)
+    }
+
+    /// Re-keys 1:1 chats whose partner device turned out to be one device of an account.
+    fn merge_chats(&self) -> Result<()> {
+        let mut d = self.dms()?;
+        let mut changed = false;
+        for (_, p) in d.iter_mut() {
+            let a = self.account_of(p)?;
+            if a != *p {
+                self.store.move_chat(p, &a)?;
+                *p = a;
+                changed = true;
+            }
+        }
+        if changed {
+            self.store.set_meta("dms", &postcard::to_allocvec(&d)?)?;
+        }
+        Ok(())
     }
 
     /// Stored peers that may get group `gid`'s envelopes.
@@ -239,13 +310,28 @@ impl State {
     }
 
     fn store_event(&self, ev: &Event, chat: &Chat) -> Result<bool> {
-        self.store.insert_event(
+        let new = self.store.insert_event(
             &ev.id,
             chat_key(chat),
             ev.lamport,
             ev.timestamp_ms,
             &postcard::to_allocvec(ev)?,
-        )
+        )?;
+        if new && let EventBody::Account { account, devices } = &ev.body {
+            let mut a = self.accounts()?;
+            if a.get(&ev.author_device)
+                .is_none_or(|o| o.0 <= ev.timestamp_ms)
+            {
+                a.insert(
+                    ev.author_device,
+                    (ev.timestamp_ms, *account, devices.clone()),
+                );
+                self.store
+                    .set_meta("accounts", &postcard::to_allocvec(&a)?)?;
+                self.merge_chats()?;
+            }
+        }
+        Ok(new)
     }
 
     /// Decrypts and stores envelopes (commits and 1:1 Welcomes, epoch 0, first); bad ones are skipped.
@@ -264,11 +350,10 @@ impl State {
     /// Decrypts and stores one envelope; returns the new events (several when it is the
     /// Welcome of a 1:1 chat whose messages came first).
     fn receive(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
-        let space = if self.contacts()?.contains(&env.group_id) {
-            env.group_id
-        } else {
-            self.group()?
-        };
+        // A contact group has its own space id; an unknown one may be a Welcome from our device.
+        let own = self.contacts()?.contains(&env.group_id)
+            || (self.chat_of(&env.group_id)?.is_none() && env.space_id == env.group_id[..16]);
+        let space = if own { env.group_id } else { self.group()? };
         ensure!(env.space_id == space[..16], "foreign space");
         if self.store.has_envelope(&envelope_id(env))? {
             return Ok(vec![]);
@@ -284,14 +369,18 @@ impl State {
     }
 
     fn open(&mut self, env: &Envelope, chat: Chat) -> Result<Option<(Chat, Event)>> {
-        // No commits in 1:1 groups: the Welcome already holds both members.
+        // shortcut: any member of a 1:1 group may commit (it adds its own devices, §4.4); two
+        // commits at once fork the group, order them if that happens.
         let admin = if chat.is_none() {
-            self.admin()?
+            Some(self.admin()?)
         } else {
-            [0; 32]
+            None
         };
         Ok(
-            match self.mls.process(&env.group_id, &env.ciphertext, &admin) {
+            match self
+                .mls
+                .process(&env.group_id, &env.ciphertext, admin.as_ref())
+            {
                 Ok(Incoming::App { sender, data }) => {
                     let ev: Event = postcard::from_bytes(&data)?;
                     ensure!(verify_event(&ev), "bad signature");
@@ -306,17 +395,42 @@ impl State {
         )
     }
 
-    /// Joins a 1:1 group from its Welcome (fails for anyone but the invited member), then
-    /// reads the messages of that group that are already here.
+    /// Joins a 1:1 group from its Welcome (fails for anyone but the invited members), then
+    /// reads the messages of that group that are already here. Its members are the partner's
+    /// devices and ours (§4.4); a contact's group comes only through one of our own devices.
+    // shortcut: a space member could pass a group off as a 1:1 with someone else; require one
+    // partner account once Account events are sure to arrive before the Welcome.
     fn join_dm(&mut self, env: &Envelope, me: [u8; 32]) -> Result<Vec<(Chat, Event)>> {
+        let contact = env.space_id == env.group_id[..16];
         let gid = self.mls.join(&env.ciphertext)?;
         ensure!(gid == env.group_id, "welcome for another group");
         let m = self.mls.members(&gid);
-        let peer = *m.iter().find(|p| **p != me).context("no partner")?;
-        let space = self.mls.members(&self.group()?);
-        ensure!(m.len() == 2 && m.contains(&me), "not a 1:1 group");
-        ensure!(space.contains(&peer), "partner is not a space member");
-        self.add_dm(env.group_id, peer)?;
+        let mine = self.mine(me)?;
+        ensure!(m.contains(&me), "not a member");
+        let others: Vec<_> = m.iter().filter(|d| !mine.contains(*d)).collect();
+        if contact {
+            ensure!(
+                m.iter().any(|d| *d != me && mine.contains(d)),
+                "a contact group not from our own device"
+            );
+        } else {
+            let space = self.mls.members(&self.group()?);
+            ensure!(
+                others.iter().all(|d| space.contains(*d)),
+                "partner is not a space member"
+            );
+        }
+        // A device of the partner; `merge_chats` re-keys the chat once its account is known.
+        let mut peer = [0; 32];
+        for d in &others {
+            peer = peer.max(self.account_of(d)?);
+        }
+        ensure!(peer != [0; 32], "no partner");
+        if contact {
+            self.add_contact(env.group_id, peer)?;
+        } else {
+            self.add_dm(env.group_id, peer)?;
+        }
         let mut out = vec![];
         for (_, data) in self.store.envelopes()? {
             let e: Envelope = postcard::from_bytes(&data)?;
@@ -477,14 +591,14 @@ impl Node {
         let n = node.clone();
         tokio::spawn(async move {
             loop {
-                let before = n.members().len();
+                let before = n.group_size();
                 let (from, res) = tokio::select! {
                     Some((from, msg)) = inbox.recv() => (Some(from), n.handle(from, msg)),
                     Some(envs) = box_rx.recv() => (None, n.take_envs(envs)),
                     else => break,
                 };
                 // Someone joined: they cannot read our older profile, so send it again.
-                if n.members().len() > before
+                if n.group_size() > before
                     && let Err(e) = n.refresh_profile(true)
                 {
                     eprintln!("mycel: profile resend failed: {e}");
@@ -637,19 +751,285 @@ impl Node {
     pub fn contacts(&self) -> Result<Vec<[u8; 32]>> {
         let st = self.st.lock().unwrap();
         let dms: HashMap<_, _> = st.dms()?.into_iter().collect();
-        Ok(st
+        let mut c: Vec<_> = st
             .contacts()?
             .iter()
             .filter_map(|g| dms.get(g).copied())
+            .collect();
+        c.sort();
+        c.dedup();
+        Ok(c)
+    }
+
+    /// Our account id: the first device's id (§4.4).
+    pub fn account(&self) -> [u8; 32] {
+        let me = self.device_id();
+        self.st.lock().unwrap().my_account(me).unwrap_or(me)
+    }
+
+    /// The account a device belongs to (itself for an account of one device).
+    pub fn account_of(&self, d: &[u8; 32]) -> [u8; 32] {
+        let me = self.device_id();
+        let st = self.st.lock().unwrap();
+        if st.mine(me).is_ok_and(|m| m.contains(d)) {
+            return st.my_account(me).unwrap_or(me);
+        }
+        st.account_of(d).unwrap_or(*d)
+    }
+
+    /// Devices of our account, the first (root) one first.
+    pub fn devices(&self) -> Vec<[u8; 32]> {
+        let me = self.device_id();
+        let st = self.st.lock().unwrap();
+        let acc = st.my_account(me).unwrap_or(me);
+        let mut v = vec![acc];
+        let listed = st.accounts().unwrap_or_default().remove(&acc);
+        v.extend(
+            listed
+                .map_or(vec![], |l| l.2)
+                .into_iter()
+                .filter(|d| *d != acc),
+        );
+        if !v.contains(&me) {
+            v.push(me);
+        }
+        v
+    }
+
+    /// Our devices' last-resort KeyPackages from their profiles, except ours (to add them to a
+    /// new 1:1 group).
+    fn sibling_kps(&self) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+        let me = self.device_id();
+        let mut prof = self.profiles()?;
+        Ok(self
+            .devices()
+            .into_iter()
+            .filter(|d| *d != me)
+            .filter_map(|d| Some((d, prof.remove(&d)?.3)))
             .collect())
     }
 
+    /// Our Account event (§4.4): the root lists the devices, a linked device names the root;
+    /// `None` for an account of one device (older apps cannot read it).
+    fn account_body(&self) -> Option<EventBody> {
+        let (me, account, devices) = (self.device_id(), self.account(), self.devices());
+        if account != me {
+            Some(EventBody::Account {
+                account,
+                devices: vec![],
+            })
+        } else {
+            (devices.len() > 1).then_some(EventBody::Account { account, devices })
+        }
+    }
+
+    /// Sends an event where profiles go: the space chat and every contact.
+    fn send_everywhere(&self, body: EventBody) -> Result<Event> {
+        for p in self.contacts()? {
+            self.send_event(&Some(p), body.clone())?;
+        }
+        self.send_event(&None, body)
+    }
+
+    /// One-time link that adds a new device to our account (§4.4): base32(secret, our ticket,
+    /// relay URLs). Only the account's first device makes one, and only as its space's admin.
+    // shortcut: no linking in a space someone else runs; the admin would have to add the device.
+    pub async fn device_invite(&self) -> Result<String> {
+        let ticket = self.ticket().await;
+        let relays = self.relays();
+        let mut secret = [0u8; 16];
+        getrandom::fill(&mut secret)?;
+        let me = self.device_id();
+        let st = self.st.lock().unwrap();
+        ensure!(
+            st.my_account(me)? == me,
+            "only the first device of the account can link others"
+        );
+        ensure!(
+            st.admin()? == me,
+            "only the admin of the space can link a device"
+        );
+        st.store.set_meta(&format!("link:{}", hex(&secret)), &[])?;
+        let bytes = postcard::to_allocvec(&(secret, ticket, relays))?;
+        Ok(format!("{DEVICE_LINK}{}", BASE32_NOPAD.encode(&bytes)))
+    }
+
+    /// Removes a linked device from our account and from every group (root only).
+    pub fn unlink_device(&self, dev: [u8; 32]) -> Result<()> {
+        let me = self.device_id();
+        ensure!(dev != me, "this is this device");
+        let devices: Vec<_> = self.devices().into_iter().filter(|d| *d != dev).collect();
+        let sends = {
+            let mut st = self.st.lock().unwrap();
+            ensure!(
+                st.my_account(me)? == me,
+                "only the first device of the account can unlink others"
+            );
+            let mut out = vec![];
+            let groups: Vec<_> = st.dms()?.into_iter().map(|(g, _)| g).collect();
+            for gid in [st.group()?].into_iter().chain(groups) {
+                let epoch = st.mls.epoch(&gid);
+                if let Some(c) = st.mls.remove_member(&gid, &dev)? {
+                    let env = st.envelope(gid, c, epoch)?;
+                    st.store_env(&env)?;
+                    out.push((env, st.peers_of(&gid)?));
+                }
+            }
+            st.save_mls()?;
+            out
+        };
+        for (env, peers) in sends {
+            self.post_box(&env, false, None);
+            self.broadcast(peers, SyncMsg::Envs(vec![env]));
+        }
+        self.send_everywhere(EventBody::Account {
+            account: me,
+            devices,
+        })?;
+        Ok(())
+    }
+
+    /// Root side of a device link: adds the new device to the space and every 1:1 group, tells
+    /// everyone it is ours, and answers with the Welcomes and the history (§4.4).
+    fn accept_link(&self, from: EndpointId, req: &JoinReq) -> Result<Vec<u8>> {
+        let dev = *from.as_bytes();
+        let (space_w, groups, commits) = {
+            let mut st = self.st.lock().unwrap();
+            let space = st.group()?;
+            let contacts = st.contacts()?;
+            let mut welcomes = vec![];
+            let mut commits = vec![];
+            for (gid, partner) in [(space, [0; 32])].into_iter().chain(st.dms()?) {
+                let epoch = st.mls.epoch(&gid);
+                let (ids, commit, welcome) = st
+                    .mls
+                    .add_members(&gid, std::slice::from_ref(&req.key_package))?;
+                ensure!(ids == [dev], "KeyPackage is not the sender's");
+                let env = st.envelope(gid, commit, epoch)?;
+                st.store_env(&env)?;
+                commits.push((env, st.peers_of(&gid)?));
+                welcomes.push((gid, partner, contacts.contains(&gid), welcome));
+            }
+            st.save_mls()?;
+            st.store
+                .upsert_peer(&dev, &postcard::to_allocvec(&req.addr)?)?;
+            if let Some(r) = &req.addr.relay {
+                self.learn_relays(&st, std::slice::from_ref(r))?;
+            }
+            let space_w = welcomes.remove(0).3;
+            (space_w, welcomes, commits)
+        };
+        for (env, peers) in commits {
+            self.post_box(&env, false, None);
+            self.broadcast(peers, SyncMsg::Envs(vec![env]));
+        }
+        let mut devices = self.devices();
+        if !devices.contains(&dev) {
+            devices.push(dev);
+        }
+        self.send_everywhere(EventBody::Account {
+            account: self.device_id(),
+            devices,
+        })?;
+        // Newest history first up to the size limit, then back in order.
+        let mut history = vec![];
+        let mut size = 0;
+        for (c, e) in self.all_events()?.into_iter().rev() {
+            size += postcard::to_allocvec(&e)?.len();
+            if size > LINK_HISTORY {
+                break;
+            }
+            history.push((chat_key(&c).to_vec(), e));
+        }
+        history.reverse();
+        let peers = {
+            let st = self.st.lock().unwrap();
+            let mut l: Vec<SignedAddr> = st
+                .store
+                .peers()?
+                .iter()
+                .filter_map(|b| postcard::from_bytes(b).ok())
+                .collect();
+            l.push(self.my_addr()?);
+            l
+        };
+        let pack: LinkPack = (space_w, groups, history);
+        Ok(postcard::to_allocvec(&JoinResp {
+            welcome: postcard::to_allocvec(&pack)?,
+            peers,
+        })?)
+    }
+
+    /// New-device side of a link: joins the root's space and 1:1 groups, takes its history,
+    /// copies its profile and names it as our account.
+    async fn link_to(&self, link: &str) -> Result<()> {
+        let parsed = || -> Result<_> {
+            let b32 = link.strip_prefix(DEVICE_LINK).context("no prefix")?;
+            let (secret, ticket, relays): ([u8; 16], String, Vec<String>) =
+                postcard::from_bytes(&BASE32_NOPAD.decode(b32.as_bytes())?)?;
+            let to: EndpointAddr = ticket.parse::<EndpointTicket>()?.into();
+            Ok((secret, ticket, relays, to))
+        };
+        let (secret, ticket, relays, to) = parsed().context(JOIN_BAD_LINK)?;
+        let root = *to.id.as_bytes();
+        ensure!(root != self.device_id(), "this is your own link");
+        {
+            let st = self.st.lock().unwrap();
+            ensure!(!st.in_space()?, "this device is already set up");
+            self.learn_relays(&st, &relays)?;
+        }
+        // Last resort: one KeyPackage joins every group.
+        let resp = self.ask_join(to, secret, true).await?;
+        let (space_w, groups, history): LinkPack = postcard::from_bytes(&resp.welcome)?;
+        {
+            let mut st = self.st.lock().unwrap();
+            let gid = st.mls.join(&space_w)?;
+            st.store.set_meta("group", &gid)?;
+            st.store.set_meta("admin", &root)?;
+            st.store.set_meta("account", &root)?;
+            for (g, partner, contact, w) in groups {
+                ensure!(st.mls.join(&w)? == g, "welcome for another group");
+                if contact {
+                    st.add_contact(g, partner)?;
+                } else {
+                    st.add_dm(g, partner)?;
+                }
+            }
+            st.save_mls()?;
+            for (c, e) in history {
+                if verify_event(&e) {
+                    st.store_event(&e, &chat_from(&c))?;
+                }
+            }
+            st.store.upsert_peer(&root, ticket.as_bytes())?;
+            self.add_peers(&st, &resp.peers)?;
+        }
+        self.push_registered
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        match self.profiles()?.remove(&root) {
+            Some((name, avatar, color, _)) => {
+                self.set_profile(&name, &avatar, color).map(|_| ())?
+            }
+            None => {
+                if let Some(b) = self.account_body() {
+                    self.send_everywhere(b)?;
+                }
+            }
+        }
+        self.sync()
+    }
+
     /// Proves an invite secret to `to` with a KeyPackage and our address; returns its answer.
-    async fn ask_join(&self, to: EndpointAddr, secret: [u8; 16]) -> Result<JoinResp> {
+    async fn ask_join(
+        &self,
+        to: EndpointAddr,
+        secret: [u8; 16],
+        last_resort: bool,
+    ) -> Result<JoinResp> {
         self.wait_relay().await;
         let req = JoinReq {
             secret,
-            key_package: self.st.lock().unwrap().mls.key_package(false)?,
+            key_package: self.st.lock().unwrap().mls.key_package(last_resort)?,
             addr: self.my_addr()?,
         };
         let resp = tokio::time::timeout(
@@ -682,19 +1062,48 @@ impl Node {
             self.create_space()?;
         }
         self.learn_relays(&self.st.lock().unwrap(), &relays)?;
-        let resp = self.ask_join(to, secret).await?;
-        {
+        let resp = self.ask_join(to, secret, false).await?;
+        let sib = self.sibling_kps()?;
+        let sends = {
             let mut st = self.st.lock().unwrap();
-            let gid = st.mls.join(&resp.welcome)?;
+            let gid: [u8; 32] = st
+                .mls
+                .join(&resp.welcome)?
+                .try_into()
+                .ok()
+                .context("bad group id")?;
             let m = st.mls.members(&gid);
+            // The author's own devices may be in it too (§4.4).
             ensure!(
-                m.len() == 2 && m.contains(&me) && m.contains(&peer),
+                m.contains(&me) && m.contains(&peer),
                 "not a pair group with the link's author"
             );
-            st.add_contact(gid.try_into().ok().context("bad group id")?, peer)?;
-            st.save_mls()?;
+            let account = st.account_of(&peer)?;
+            st.add_contact(gid, account)?;
             st.store.upsert_peer(&peer, ticket.as_bytes())?;
             self.add_peers(&st, &resp.peers)?;
+            // Our other devices join too; the Welcome also goes to our space's mailbox topic,
+            // which they pull.
+            let mut sends = vec![];
+            if !sib.is_empty() {
+                let epoch = st.mls.epoch(&gid);
+                let kps: Vec<_> = sib.iter().map(|s| s.1.clone()).collect();
+                let (_, commit, welcome) = st.mls.add_members(&gid, &kps)?;
+                let c = st.envelope(gid, commit, epoch)?;
+                // Epoch 0: members already in skip it, the new ones read it first.
+                let w = st.envelope(gid, welcome, 0)?;
+                st.store_env(&c)?;
+                st.store_env(&w)?;
+                sends = vec![(c, st.peers_of(&gid)?), (w, st.peers_of(&gid)?)];
+            }
+            st.save_mls()?;
+            (sends, st.group()?)
+        };
+        let (sends, space) = sends;
+        for (env, peers) in sends {
+            self.post_box(&env, false, None);
+            self.post_box_at(&env, &space[..16], false, None);
+            self.broadcast(peers, SyncMsg::Envs(vec![env]));
         }
         self.push_registered
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -711,6 +1120,9 @@ impl Node {
         if link.starts_with(CONTACT_LINK) {
             return self.add_contact(&link).await;
         }
+        if link.starts_with(DEVICE_LINK) {
+            return self.link_to(&link).await;
+        }
         let parsed = || -> Result<_> {
             let b32 = link.strip_prefix(LINK).context("no mycel://join/ prefix")?;
             let (gid, secret, ticket, relays): ([u8; 32], [u8; 16], String, Vec<String>) =
@@ -725,7 +1137,7 @@ impl Node {
             self.learn_relays(&st, &relays)?;
         }
         let admin_id = admin.id;
-        let resp = self.ask_join(admin, secret).await?;
+        let resp = self.ask_join(admin, secret, false).await?;
         let mut st = self.st.lock().unwrap();
         ensure!(
             st.mls.join(&resp.welcome)? == gid,
@@ -746,6 +1158,17 @@ impl Node {
     pub fn members(&self) -> Vec<[u8; 32]> {
         let st = self.st.lock().unwrap();
         st.group().map_or(vec![], |g| st.mls.members(&g))
+    }
+
+    /// Members of the space and of every 1:1 group, counted with repeats (grows when someone
+    /// joins one of them).
+    fn group_size(&self) -> usize {
+        let st = self.st.lock().unwrap();
+        let groups = st
+            .group()
+            .into_iter()
+            .chain(st.dms().unwrap_or_default().into_iter().map(|(g, _)| g));
+        groups.map(|g| st.mls.members(&g).len()).sum()
     }
 
     /// Devices in a chat's MLS group.
@@ -798,9 +1221,10 @@ impl Node {
         Ok(out)
     }
 
-    /// Latest profile of each member and contact: (name, avatar, color, key package).
+    /// Latest profile of each member and contact: (name, avatar, color, key package). A device
+    /// of an account shows the account's name and avatar (§4.4), with its own KeyPackage.
     pub fn profiles(&self) -> Result<HashMap<[u8; 32], Profile>> {
-        Ok(self
+        let raw: HashMap<_, _> = self
             .profile_events()?
             .into_iter()
             .filter_map(|(a, e)| match e.body {
@@ -812,10 +1236,18 @@ impl Node {
                 } => Some((a, (name, avatar, color, key_package))),
                 _ => None,
             })
+            .collect();
+        Ok(raw
+            .iter()
+            .map(|(d, p)| {
+                let (n, a, c, _) = raw.get(&self.account_of(d)).unwrap_or(p);
+                (*d, (n.clone(), a.clone(), *c, p.3.clone()))
+            })
             .collect())
     }
 
-    /// Sends our name and avatar to the space chat and every contact, with a fresh last-resort KeyPackage.
+    /// Sends our name and avatar to the space chat and every contact, with a fresh last-resort
+    /// KeyPackage; then our Account event, if we have more than one device.
     pub fn set_profile(&self, name: &str, avatar: &str, color: u8) -> Result<Event> {
         let name = name.trim();
         ensure!(!name.is_empty(), "empty name");
@@ -826,10 +1258,11 @@ impl Node {
             color,
             key_package,
         };
-        for p in self.contacts()? {
-            self.send_event(&Some(p), body.clone())?;
+        let ev = self.send_everywhere(body)?;
+        if let Some(b) = self.account_body() {
+            self.send_everywhere(b)?;
         }
-        self.send_event(&None, body)
+        Ok(ev)
     }
 
     /// Re-sends our profile when its KeyPackage is a month old (they expire after ~3 months),
@@ -857,18 +1290,29 @@ impl Node {
 
     /// Opens a 1:1 chat with a member (no-op if there is one): a new 2-member MLS group from
     /// the KeyPackage in their profile; the Welcome goes out as an envelope of that group.
+    /// `peer` is an account: all its devices and our other ones go in (§4.4).
     pub fn open_dm(&self, peer: [u8; 32]) -> Result<()> {
         let me = self.device_id();
-        ensure!(peer != me, "a chat with yourself");
         if self.st.lock().unwrap().gid(&Some(peer)).is_ok() {
             return Ok(());
         }
+        ensure!(
+            self.account_of(&peer) != self.account(),
+            "a chat with yourself"
+        );
         ensure!(self.members().contains(&peer), "not a member");
-        let kp = self
-            .profiles()?
+        let mut prof = self.profiles()?;
+        let kp = prof
             .remove(&peer)
             .context("this member has no profile yet (an older app version)")?
             .3;
+        let mut add = vec![(peer, kp)];
+        for d in self.members() {
+            if d != peer && d != me && self.account_of(&d) == peer {
+                add.extend(prof.remove(&d).map(|p| (d, p.3)));
+            }
+        }
+        add.extend(self.sibling_kps()?);
         let (env, peers) = {
             let mut st = self.st.lock().unwrap();
             if st.gid(&Some(peer)).is_ok() {
@@ -877,8 +1321,12 @@ impl Node {
             let mut gid = [0u8; 32];
             getrandom::fill(&mut gid)?;
             st.mls.create_group(&gid)?;
-            let (id, _commit, welcome) = st.mls.add_member(&gid, &kp)?;
-            ensure!(id == peer, "KeyPackage is not the member's");
+            let kps: Vec<_> = add.iter().map(|a| a.1.clone()).collect();
+            let (ids, _commit, welcome) = st.mls.add_members(&gid, &kps)?;
+            ensure!(
+                ids.iter().eq(add.iter().map(|a| &a.0)),
+                "KeyPackage is not the member's"
+            );
             st.add_dm(gid, peer)?;
             st.save_mls()?;
             let env = st.envelope(gid, welcome, 0)?;
@@ -1054,14 +1502,14 @@ impl Node {
     /// means "read by at least one", like 1:1.
     // shortcut: "has it" = a receipt up to an event with lamport >= ours; use per-author clocks if concurrent sends mislead it.
     pub fn statuses(&self, chat: &Chat) -> Result<Vec<(EventId, u8)>> {
-        let me = self.device_id();
+        let mine = self.mine();
         let hist = self.history(chat)?;
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
         // Highest lamport delivered / read by anyone else.
         let (mut delivered, mut read) = (None, None);
         for e in &hist {
             if let EventBody::Receipt { up_to, kind } = &e.body
-                && e.author_device != me
+                && !mine.contains(&e.author_device)
                 && let Some(&l) = lamport.get(up_to)
             {
                 let s = if *kind == ReceiptKind::Read {
@@ -1074,7 +1522,7 @@ impl Node {
         }
         Ok(hist
             .iter()
-            .filter(|e| e.author_device == me && is_msg(&e.body))
+            .filter(|e| mine.contains(&e.author_device) && is_msg(&e.body))
             .map(|e| {
                 let has = |s: Option<u64>| s.is_some_and(|l| l >= e.lamport);
                 let s = if has(read) {
@@ -1093,7 +1541,7 @@ impl Node {
     // shortcut: "newer" by lamport, as in `statuses`: in a group, one written offline that arrives after
     // I read later ones counts as read; keep per-author marks if that misleads.
     pub fn unread(&self, chat: &Chat) -> Result<Vec<EventId>> {
-        let me = self.device_id();
+        let mine = self.mine();
         let hist = self.history(chat)?;
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
         let read = hist
@@ -1103,7 +1551,7 @@ impl Node {
                 EventBody::Receipt {
                     up_to,
                     kind: ReceiptKind::Read,
-                } if e.author_device == me => {
+                } if mine.contains(&e.author_device) => {
                     Some(lamport.get(up_to).copied().unwrap_or(e.lamport))
                 }
                 _ => None,
@@ -1111,7 +1559,7 @@ impl Node {
             .max();
         Ok(hist
             .iter()
-            .filter(|e| e.author_device != me && is_incoming(&e.body))
+            .filter(|e| !mine.contains(&e.author_device) && is_incoming(&e.body))
             .filter(|e| read.is_none_or(|l| e.lamport > l))
             .map(|e| e.id)
             .collect())
@@ -1120,18 +1568,19 @@ impl Node {
     /// Sends one Read receipt up to the chat's newest message or call from someone else, unless one already
     /// covers it (§7.4). The UI calls it while the chat is open and the window visible.
     pub fn mark_read(&self, chat: &Chat) -> Result<()> {
-        let me = self.device_id();
+        let mine = self.mine();
         let hist = self.history(chat)?;
         let Some(last) = hist
             .iter()
-            .filter(|e| e.author_device != me && is_incoming(&e.body))
+            .filter(|e| !mine.contains(&e.author_device) && is_incoming(&e.body))
             .max_by_key(|e| e.lamport)
         else {
             return Ok(());
         };
         let lamport: HashMap<_, _> = hist.iter().map(|e| (e.id, e.lamport)).collect();
+        // A Read receipt from any of our devices counts (§4.4).
         let done = hist.iter().any(|e| {
-            e.author_device == me
+            mine.contains(&e.author_device)
                 && matches!(&e.body, EventBody::Receipt { up_to, kind: ReceiptKind::Read }
                     if lamport.get(up_to).is_some_and(|&l| l >= last.lamport))
         });
@@ -1437,10 +1886,10 @@ impl Node {
     /// One Delivered receipt per chat in a received batch, up to its newest text from someone else (§7.4).
     // shortcut: receipts are stored events (~members per message); prune or aggregate if history grows too big.
     fn send_receipt(&self, evs: &[(Chat, Event)]) {
-        let me = self.device_id();
+        let mine = self.mine();
         let mut last: HashMap<Chat, &Event> = HashMap::new();
         for (c, e) in evs {
-            if e.author_device != me && is_msg(&e.body) {
+            if !mine.contains(&e.author_device) && is_msg(&e.body) {
                 let l = last.entry(*c).or_insert(e);
                 if e.lamport > l.lamport {
                     *l = e;
@@ -1460,10 +1909,10 @@ impl Node {
 
     /// Forgets the awaited messages that a received receipt covers.
     fn note_receipts(&self, evs: &[(Chat, Event)]) {
-        let me = self.device_id();
+        let mine = self.mine();
         for (c, e) in evs {
             if let EventBody::Receipt { up_to, .. } = e.body
-                && e.author_device != me
+                && !mine.contains(&e.author_device)
                 && let Ok((_, seen)) = self.event(&up_to)
             {
                 let mut u = self.unacked.lock().unwrap();
@@ -1481,6 +1930,13 @@ impl Node {
             .unwrap()
             .values()
             .any(|(_, at)| at.elapsed() < FAST_FOR)
+    }
+
+    /// Our account's devices (us at least).
+    fn mine(&self) -> HashSet<[u8; 32]> {
+        let me = self.device_id();
+        let m = self.st.lock().unwrap().mine(me);
+        m.unwrap_or_else(|_| [me].into())
     }
 
     fn my_addr(&self) -> Result<SignedAddr> {
@@ -1546,7 +2002,15 @@ impl Node {
     fn peer_list(&self, st: &State, to: &[u8; 32]) -> Result<Vec<SignedAddr>> {
         let space = st.group()?;
         let mut list: Vec<SignedAddr> = vec![];
-        if st.mls.members(&space).contains(to) {
+        if st.mine(self.device_id())?.contains(to) {
+            // Our own device: everyone we know (§4.4).
+            list.extend(
+                st.store
+                    .peers()?
+                    .iter()
+                    .filter_map(|b| postcard::from_bytes(b).ok()),
+            );
+        } else if st.mls.members(&space).contains(to) {
             list.extend(
                 st.peers_of(&space)?
                     .iter()
@@ -1601,7 +2065,14 @@ impl Node {
 
     /// Puts a new envelope into the mailbox in the background; peers online get it directly anyway.
     /// `push`: the mailbox wakes the other phones of the space, only the partner's for a 1:1 chat.
+    /// For a 1:1 chat the push goes to every device of the partner. Callers holding the state
+    /// lock pass `chat: None`.
     fn post_box(&self, env: &Envelope, push: bool, chat: Chat) {
+        self.post_box_at(env, &env.space_id, push, chat)
+    }
+
+    /// `post_box` to the mailbox topic of `space` (our other devices pull our space's topic).
+    fn post_box_at(&self, env: &Envelope, space: &[u8], push: bool, chat: Chat) {
         let Some(b) = &self.mailbox else { return };
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
@@ -1609,12 +2080,20 @@ impl Node {
         let url = format!(
             "{}/box/{}/{}",
             b.url,
-            Mailbox::topic(&env.space_id),
+            Mailbox::topic(space),
             data_encoding::HEXLOWER.encode(&envelope_id(env))
         );
         let http = b.http.clone();
         let from = self.push_token.lock().unwrap().clone().unwrap_or_default();
-        let to = chat.map_or_else(String::new, |p| Mailbox::device_tag(&env.space_id, &p));
+        let to = if chat.is_some() {
+            let mine = self.mine();
+            let devs = self.st.lock().unwrap().mls.members(&env.group_id);
+            let tags = devs.iter().filter(|d| !mine.contains(*d));
+            let tags: Vec<_> = tags.map(|d| Mailbox::device_tag(space, d)).collect();
+            tags.join(",")
+        } else {
+            String::new()
+        };
         tokio::spawn(async move {
             for wait in [2, 10, 60, 0] {
                 match http
@@ -1870,16 +2349,32 @@ impl Node {
             ticket.endpoint_addr().id == from && verify_addr(&req.addr, from.as_bytes()),
             "address is not the sender's"
         );
+        let link = format!("link:{}", hex(&req.secret));
+        if self.st.lock().unwrap().store.take_meta(&link)? {
+            return self.accept_link(from, &req);
+        }
+        let sib = self.sibling_kps()?;
         let mut st = self.st.lock().unwrap();
         if st
             .store
             .take_meta(&format!("contact:{}", hex(&req.secret)))?
         {
-            // A contact link: a new pair group with just the two of us (§4.2).
+            // A contact link: a new pair group with the two of us and our other devices (§4.2);
+            // the joiner adds its own other devices.
             let mut gid = [0u8; 32];
             getrandom::fill(&mut gid)?;
             st.mls.create_group(&gid)?;
-            let (id, _commit, welcome) = st.mls.add_member(&gid, &req.key_package)?;
+            let mut kps = vec![req.key_package.clone()];
+            let ours = !sib.is_empty();
+            // The joiner gets our other devices' addresses too: they are in the group.
+            let mut peers = vec![self.my_addr()?];
+            for (d, _) in &sib {
+                let a = st.store.peer(d).ok();
+                peers.extend(a.and_then(|b| postcard::from_bytes(&b).ok()));
+            }
+            kps.extend(sib.into_iter().map(|s| s.1));
+            let (ids, _commit, welcome) = st.mls.add_members(&gid, &kps)?;
+            let id = ids[0];
             ensure!(id == *from.as_bytes(), "KeyPackage is not the sender's");
             st.add_contact(gid, id)?;
             st.save_mls()?;
@@ -1888,12 +2383,20 @@ impl Node {
             if let Some(r) = &req.addr.relay {
                 self.learn_relays(&st, std::slice::from_ref(r))?;
             }
+            if ours {
+                // Our other devices get the Welcome as an epoch-0 envelope of the group, also
+                // through our space's mailbox topic (§4.4).
+                let w = st.envelope(gid, welcome.clone(), 0)?;
+                st.store_env(&w)?;
+                self.post_box_at(&w, &st.group()?[..16], false, None);
+                // Not to the joiner: it joins from the answer, a second join would fail.
+                let to = st.peers_of(&gid)?.into_iter();
+                let to = to.filter(|p| peer_addr(p).is_some_and(|a| a.id != from));
+                self.broadcast(to.collect(), SyncMsg::Envs(vec![w]));
+            }
             self.push_registered
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            return Ok(postcard::to_allocvec(&JoinResp {
-                welcome,
-                peers: vec![self.my_addr()?],
-            })?);
+            return Ok(postcard::to_allocvec(&JoinResp { welcome, peers })?);
         }
         ensure!(st.admin()? == self.device_id(), "not the admin");
         if !st
@@ -1904,7 +2407,10 @@ impl Node {
         }
         let gid = st.group()?;
         let epoch = st.mls.epoch(&gid);
-        let (id, commit, welcome) = st.mls.add_member(&gid, &req.key_package)?;
+        let (ids, commit, welcome) = st
+            .mls
+            .add_members(&gid, std::slice::from_ref(&req.key_package))?;
+        let id = ids[0];
         ensure!(id == *from.as_bytes(), "KeyPackage is not the sender's");
         st.save_mls()?;
         let env = st.envelope(gid, commit, epoch)?;

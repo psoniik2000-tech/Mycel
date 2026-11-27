@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, Smartphone,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
 import { label, Media, MediaView } from "./media";
@@ -183,6 +183,56 @@ function Avatar(p: { id: string; onClick?: () => void; dot?: boolean }) {
 }
 
 // Name and avatar letter/color: asked on first entry, changed in Settings.
+/** Settings → Devices (§4.4): this account's devices; the first one links and unlinks the others. */
+function Devices() {
+  const [list, setList] = createSignal<{ id: string; me: boolean; root: boolean }[]>([]);
+  const [inv, setInv] = createSignal<{ link: string; svg: string }>();
+  const [err, setErr] = createSignal("");
+  const load = () => invoke<{ id: string; me: boolean; root: boolean }[]>("devices").then(setList, (e) => setErr(errText(e)));
+  load();
+  const amRoot = () => list().some((d) => d.me && d.root);
+  const link = async () => {
+    setErr("");
+    try {
+      setInv(await invoke<{ link: string; svg: string }>("device_invite"));
+    } catch (e) {
+      setErr(errText(e));
+    }
+  };
+  const unlink = async (id: string) => {
+    if (!(await ask("Отвязать устройство? Оно перестанет получать ваши чаты", { title: "Устройства", okLabel: "Отвязать", cancelLabel: "Отмена" }))) return;
+    await invoke("unlink_device", { id }).catch((e) => setErr(errText(e)));
+    load();
+  };
+  return (
+    <>
+      <h3>Устройства</h3>
+      <For each={list()}>
+        {(d) => (
+          <div class="row">
+            <span>{d.me ? "Это устройство" : `Устройство ${d.id.slice(0, 8)}`}{d.root ? " · основное" : ""}</span>
+            <Show when={amRoot() && !d.me}>
+              <button onClick={() => unlink(d.id)}><Trash2 size={16} /> Отвязать</button>
+            </Show>
+          </div>
+        )}
+      </For>
+      <Show when={amRoot()}>
+        <button onClick={link}><Link size={18} /> Привязать устройство</button>
+      </Show>
+      <Show when={inv()}>
+        <div class="card invite">
+          <div class="qr" innerHTML={inv()!.svg} />
+          <p class="muted small">На новом устройстве установите Mycel и вставьте эту ссылку вместо приглашения. Ссылка одноразовая</p>
+          <code class="path">{inv()!.link}</code>
+          <button onClick={() => navigator.clipboard.writeText(inv()!.link)}><Copy size={18} /> Копировать</button>
+        </div>
+      </Show>
+      <Show when={err()}><p class="error">{err()}</p></Show>
+    </>
+  );
+}
+
 function ProfileForm(p: { submit: string; onDone?: () => void }) {
   const me = () => people().find((m) => m.me);
   const [name, setName] = createSignal(me()?.name ?? "");
@@ -1230,6 +1280,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                     ["Голос и видео", Mic, "Микрофон, камера, громкость"],
                     ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
                     ...(android ? [] : [["Приложение", Monitor, "Автозапуск, трей"]]),
+                    ["Устройства", Smartphone, "Телефон и ПК как один аккаунт"],
                     ["Вход", LockIcon, "Пароль при запуске"],
                     ["Резервная копия", Archive, "Копия, восстановление, экспорт чата"],
                     ["Режим", Layers, simple() ? "Личные чаты" : "Пространства"],
@@ -1284,6 +1335,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                   </Match>
                   <Match when={sub() === "Вход"}>
                     <LoginSettings space={p.space} refresh={p.refresh} />
+                  </Match>
+                  <Match when={sub() === "Устройства"}>
+                    <Devices />
                   </Match>
                   <Match when={sub() === "Резервная копия"}>
                     <BackupSettings chats={rows().map((r) => r.id)} />

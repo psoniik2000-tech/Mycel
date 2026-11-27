@@ -126,6 +126,12 @@ pub enum EventBody {
         color: u8,
         key_package: Vec<u8>,
     },
+    /// Multi-device (§4.4): the account root lists its devices; a linked device names its
+    /// account (`devices` empty). A device belongs to an account only when both agree.
+    Account {
+        account: UserId,
+        devices: Vec<DeviceId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
