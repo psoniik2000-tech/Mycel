@@ -35,6 +35,9 @@ pub struct List {
     pub relays: Vec<String>,
     #[serde(default)]
     pub mailbox: Option<String>,
+    /// This PC's anchor URL: the UI restores it from here if its own copy got lost.
+    #[serde(default)]
+    pub anchor: Option<String>,
 }
 
 /// What a node keeps in its folder; `salt` goes last, so an interrupted move is redone next start.

@@ -30,6 +30,7 @@ keyring = { version = "3", features = ["windows-native", "apple-native"] }
 igd-next = { version = "0.18", features = ["aio_tokio"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tokio.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
