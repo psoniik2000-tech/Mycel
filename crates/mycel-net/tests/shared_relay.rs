@@ -10,7 +10,7 @@ async fn reach_peer_on_shared_relay() {
     cfg.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
     let relay = Server::spawn(cfg).await.unwrap();
     let url = format!("http://{}", relay.http_addr().unwrap());
-    let (a, ..) = Net::bind(SecretKey::generate(), 0, &[url.clone()], false)
+    let (a, ..) = Net::bind(SecretKey::generate(), 0, std::slice::from_ref(&url), false)
         .await
         .unwrap();
     let (b, mut inbox, ..) = Net::bind(SecretKey::generate(), 0, &[url], false)
