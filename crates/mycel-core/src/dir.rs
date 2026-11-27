@@ -231,10 +231,12 @@ impl Db {
 
 /// Username of `key` in the directory kept in `data` (main server side).
 pub(crate) fn name_in(data: &Path, key: &[u8; 32]) -> Option<String> {
-    Db::load(data.join("directory.json"))
-        .ok()?
-        .by_key
-        .remove(key)
+    // The account's key or the device that last registered the name.
+    let db = Db::load(data.join("directory.json")).ok()?;
+    db.names
+        .into_iter()
+        .find(|(_, r)| r.owner() == *key || r.key == *key)
+        .map(|(n, _)| n)
 }
 
 /// Directory service of a main server: its own iroh endpoint (stable key in `dir_key`), reached

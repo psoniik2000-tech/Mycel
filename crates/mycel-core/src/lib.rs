@@ -1631,12 +1631,13 @@ impl Node {
                     .unwrap_or_default(),
                 device: ev.author_device,
             });
+            let sticker = ev.body.sticker().is_some();
             let body = match ev.body.msg().clone() {
-                // `mentions` carries the sticker tag.
+                // A sticker keeps its tag in `mentions`; real mentions are not forwarded.
                 EventBody::Text { text, mentions, .. } => EventBody::Text {
                     text,
                     reply_to: None,
-                    mentions,
+                    mentions: if sticker { mentions } else { vec![] },
                 },
                 EventBody::Media {
                     kind,
