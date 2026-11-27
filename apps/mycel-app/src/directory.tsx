@@ -32,7 +32,7 @@ export const keepRegistered = (space: string) => {
   if (u) register(space, u).catch(() => {});
 };
 
-const nameOf = (id: string) => {
+export const usernameOf = (id: string) => {
   if (!names.has(id)) names.set(id, invoke<string | null>("dir_name_of", { server: server(), id }).catch(() => null));
   return names.get(id)!;
 };
@@ -40,7 +40,7 @@ const nameOf = (id: string) => {
 /** " · @username" of a member or contact, once known. */
 export function Username(p: { id: string; me?: boolean }) {
   const [u, setU] = createSignal<string | null>(null);
-  createEffect(() => nameOf(p.me ? "" : p.id).then(setU));
+  createEffect(() => usernameOf(p.me ? "" : p.id).then(setU));
   return <Show when={u()}> · @{u()}</Show>;
 }
 
@@ -135,7 +135,7 @@ export function UsernameSettings(p: { space: string }) {
   const [srv, setSrv] = createSignal(server());
   const [msg, setMsg] = createSignal("");
   const [busy, setBusy] = createSignal(false);
-  onMount(() => nameOf("").then((u) => u && setCur(u)));
+  onMount(() => usernameOf("").then((u) => u && setCur(u)));
   const save = async (e: Event) => {
     e.preventDefault();
     setBusy(true);

@@ -1451,15 +1451,35 @@ impl Node {
 
     /// Signs, encrypts (MLS), stores and sends a text event to every known peer.
     pub fn send_text(&self, chat: &Chat, text: &str, reply_to: Option<EventId>) -> Result<Event> {
+        self.send_mention(chat, text, reply_to, vec![])
+    }
+
+    /// `send_text` naming the members `mentions` (accounts or devices): they are notified even
+    /// with the chat muted.
+    pub fn send_mention(
+        &self,
+        chat: &Chat,
+        text: &str,
+        reply_to: Option<EventId>,
+        mentions: Vec<[u8; 32]>,
+    ) -> Result<Event> {
         self.send_msg(
             chat,
             EventBody::Text {
                 text: text.into(),
                 reply_to,
-                mentions: vec![],
+                mentions,
             },
             None,
         )
+    }
+
+    /// Someone else's message that mentions our account.
+    pub fn mentions_me(&self, ev: &Event) -> bool {
+        let me = self.account();
+        self.account_of(&ev.author_device) != me
+            && matches!(ev.body.msg(), EventBody::Text { mentions, .. }
+                if mentions.iter().any(|m| self.account_of(m) == me))
     }
 
     /// An event of any chat, with its chat.
@@ -1540,6 +1560,29 @@ impl Node {
     /// Sends copies of text or media messages as new own messages to chat `to`. Albums among them
     /// get new ids, so a copy never joins the original. Each names its original author.
     pub fn forward(&self, targets: &[EventId], to: &Chat) -> Result<()> {
+        self.copy_msgs(targets, self, to)
+    }
+
+    /// `forward` into chat `to` of another open space: media blobs are copied there first (they
+    /// must be downloaded here).
+    pub async fn forward_into(&self, targets: &[EventId], dst: &Node, to: &Chat) -> Result<()> {
+        for target in targets {
+            let ev = self.event(target)?.1;
+            let Some((_, b)) = media(&ev) else { continue };
+            ensure!(self.has_blob(b).await, "media is not downloaded yet");
+            let tmp = dst.temp()?;
+            let hash = Hash::from_bytes(b.hash);
+            self.blobs.export(hash, &tmp).finish().await?;
+            // The tag keeps it from GC.
+            dst.blobs.tags().set(hex(&b.hash), hash).await?;
+            let added = dst.blobs.add_path(&tmp).temp_tag().await;
+            let _ = std::fs::remove_file(&tmp);
+            drop(added?);
+        }
+        self.copy_msgs(targets, dst, to)
+    }
+
+    fn copy_msgs(&self, targets: &[EventId], dst: &Node, to: &Chat) -> Result<()> {
         let mut albums = HashMap::new();
         let names = self.profiles()?;
         for target in targets {
@@ -1579,7 +1622,7 @@ impl Node {
                 }
                 _ => bail!("not a message"),
             };
-            self.send_msg(to, body, Some(fwd))?;
+            dst.send_msg(to, body, Some(fwd))?;
         }
         Ok(())
     }
