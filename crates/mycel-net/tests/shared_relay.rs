@@ -34,3 +34,18 @@ async fn reach_peer_on_shared_relay() {
         .unwrap();
     assert_eq!(from, a.id());
 }
+
+/// With n0 on, a space relay (anchor) replaces the public relays as the home relay.
+#[tokio::test]
+async fn space_relay_replaces_n0() {
+    let mut cfg = ServerConfig::default();
+    cfg.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+    let relay = Server::spawn(cfg).await.unwrap();
+    let url = format!("http://{}", relay.http_addr().unwrap());
+    let (a, ..) = Net::bind(SecretKey::generate(), 0, std::slice::from_ref(&url), true)
+        .await
+        .unwrap();
+    a.online().await;
+    let home: Vec<_> = a.addr().relay_urls().map(|u| u.to_string()).collect();
+    assert_eq!(home, [format!("{url}/")]);
+}

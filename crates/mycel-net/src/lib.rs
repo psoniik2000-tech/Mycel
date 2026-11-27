@@ -98,11 +98,21 @@ impl Net {
     }
 
     /// Adds a relay to the relay map; the endpoint picks the best one as its home relay.
+    /// Once a space has its own relay (an anchor or an added server), the public n0 relays
+    /// are dropped, so every member meets there; n0 address lookup stays.
     pub async fn add_relay(&self, url: &str) -> Result<()> {
         let url: RelayUrl = url.parse()?;
         let cfg = Arc::new(RelayConfig::new(url.clone(), None));
-        self.relays.lock().unwrap().push(url.clone());
+        let ours = {
+            let mut rs = self.relays.lock().unwrap();
+            rs.push(url.clone());
+            rs.clone()
+        };
         self.ep.insert_relay(url, cfg).await;
+        let n0: Vec<RelayUrl> = RelayMode::Default.relay_map().urls();
+        for u in n0.iter().filter(|u| !ours.contains(u)) {
+            self.ep.remove_relay(u).await;
+        }
         Ok(())
     }
 
