@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
 mod spaces;
+mod update;
 mod vault;
 
 type R<T> = Result<T, String>;
@@ -2188,7 +2189,9 @@ pub fn run() {
             remove_space,
             set_remember,
             change_password,
-            autostart
+            autostart,
+            update::update_check,
+            update::update_install
         ])
         .setup(|_app| {
             #[cfg(desktop)]

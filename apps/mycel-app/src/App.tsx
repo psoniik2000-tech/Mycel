@@ -358,6 +358,7 @@ export default function App() {
     else enter(undefined, "join");
   };
   onMount(async () => {
+    checkUpdate().then(setRelease, () => {});
     await start();
     await onOpenUrl(invited);
     await invited(await getCurrent());
@@ -741,17 +742,54 @@ function MailboxSettings(p: { space: Space }) {
   );
 }
 
+// In-app update (update.rs): the newest release, when it is newer than this app.
+type Release = { version: string; url: string };
+const [release, setRelease] = createSignal<Release | null>(null);
+const [progress, setProgress] = createSignal<number | null>(null); // % while the installer downloads
+const checkUpdate = () => invoke<Release | null>("update_check");
+const installUpdate = async (r: Release) => {
+  setProgress(0);
+  const off = await listen<{ done: number; total: number }>("update-progress", (e) =>
+    setProgress(e.payload.total ? Math.round((e.payload.done * 100) / e.payload.total) : 0));
+  try {
+    await invoke("update_install", { url: r.url, version: r.version });
+  } catch (e) {
+    alert(errText(e));
+  } finally {
+    off();
+    setProgress(null);
+  }
+};
+
 function AppSettings() {
   const [on, setOn] = createSignal(false);
+  const [msg, setMsg] = createSignal("");
   invoke<boolean>("autostart", { on: null }).then(setOn, () => {});
+  const check = () => {
+    setMsg("Проверяю…");
+    checkUpdate().then((r) => {
+      setRelease(r);
+      setMsg(r ? "" : "Установлена последняя версия");
+    }, (e) => setMsg(errText(e)));
+  };
   return (
     <>
       <h3>Приложение</h3>
-      <label class="check">
-        <input type="checkbox" checked={on()} onChange={(e) => invoke<boolean>("autostart", { on: e.currentTarget.checked }).then(setOn, (err) => alert(errText(err)))} />
-        Запускать вместе с Windows
-      </label>
-      <p class="muted">Закрытие окна сворачивает Mycel в трей (значок у часов): сообщения и звонки продолжают приходить, уведомления показываются. Выйти полностью: правой кнопкой по значку → «Выйти». Когда Mycel полностью закрыт, новые сообщения придут при следующем запуске — от отправителя или от якоря.</p>
+      <Show when={!android}>
+        <label class="check">
+          <input type="checkbox" checked={on()} onChange={(e) => invoke<boolean>("autostart", { on: e.currentTarget.checked }).then(setOn, (err) => alert(errText(err)))} />
+          Запускать вместе с Windows
+        </label>
+        <p class="muted">Закрытие окна сворачивает Mycel в трей (значок у часов): сообщения и звонки продолжают приходить, уведомления показываются. Выйти полностью: правой кнопкой по значку → «Выйти». Когда Mycel полностью закрыт, новые сообщения придут при следующем запуске — от отправителя или от якоря.</p>
+      </Show>
+      <Show when={release()} fallback={<button onClick={check}>Проверить обновления</button>}>
+        {(r) => (
+          <button class="primary" disabled={progress() !== null} onClick={() => installUpdate(r())}>
+            {progress() === null ? `Обновить до ${r().version}` : `Загрузка… ${progress()}%`}
+          </button>
+        )}
+      </Show>
+      <Show when={msg()}><p class="muted">{msg()}</p></Show>
     </>
   );
 }
@@ -1338,6 +1376,17 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       </nav>
 
       <section class="panel">
+        <Show when={release()}>
+          {(r) => (
+            <div class="update-banner">
+              <span class="grow">Доступна версия {r().version}</span>
+              <button disabled={progress() !== null} onClick={() => installUpdate(r())}>
+                {progress() === null ? "Обновить" : `${progress()}%`}
+              </button>
+              <button class="icon" onClick={() => setRelease(null)} title="Позже"><X size={18} /></button>
+            </div>
+          )}
+        </Show>
         <header class="bar">
           <Show when={(tab() === "settings" && sub()) || (tab() === "chats" && arch())}>
             <button class="icon" onClick={() => history.back()} title="Назад"><ArrowLeft size={20} /></button>
@@ -1458,7 +1507,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                     ["Оформление", Palette, "Тема, обои, размер текста"],
                     ["Голос и видео", Mic, "Микрофон, камера, громкость"],
                     ["Связь", Wifi, "Серверы, почтовый ящик" + (android ? "" : ", якорь")],
-                    ...(android ? [] : [["Приложение", Monitor, "Автозапуск, трей"]]),
+                    ["Приложение", Monitor, android ? "Обновления" : "Автозапуск, трей, обновления"],
                     ["Устройства", Smartphone, "Телефон и ПК как один аккаунт"],
                     ["Вход", LockIcon, "Пароль при запуске"],
                     ["Резервная копия", Archive, "Копия, восстановление, экспорт чата"],
