@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode};
+use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, TransportAddr};
 use mycel_proto::SyncMsg;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -37,6 +37,9 @@ pub struct Net {
     /// Unix ms of the last message received from each peer.
     seen: Arc<Mutex<HashMap<EndpointId, u64>>>,
     tx: mpsc::Sender<(EndpointId, SyncMsg)>,
+    /// Our relays: every dial also tries them, so peers whose stored address names a dead relay
+    /// (n0 blocked) are still found on the relay we share.
+    relays: Arc<Mutex<Vec<RelayUrl>>>,
 }
 
 impl Net {
@@ -73,6 +76,7 @@ impl Net {
             conns: Default::default(),
             seen: Default::default(),
             tx,
+            relays: Default::default(),
         };
         let n = net.clone();
         tokio::spawn(async move {
@@ -97,8 +101,14 @@ impl Net {
     pub async fn add_relay(&self, url: &str) -> Result<()> {
         let url: RelayUrl = url.parse()?;
         let cfg = Arc::new(RelayConfig::new(url.clone(), None));
+        self.relays.lock().unwrap().push(url.clone());
         self.ep.insert_relay(url, cfg).await;
         Ok(())
+    }
+
+    fn reach(&self, to: EndpointAddr) -> EndpointAddr {
+        let rs = self.relays.lock().unwrap().clone();
+        to.with_addrs(rs.into_iter().map(TransportAddr::Relay))
     }
 
     pub fn id(&self) -> EndpointId {
@@ -130,14 +140,14 @@ impl Net {
             }
             conn.close(0u32.into(), b"stale");
         }
-        let conn = self.ep.connect(to, ALPN).await?;
+        let conn = self.ep.connect(self.reach(to), ALPN).await?;
         self.track(conn.clone());
         write(&conn, &bytes).await
     }
 
     /// One request/response on `mycel/join/1`.
     pub async fn join(&self, to: EndpointAddr, req: &[u8]) -> Result<Vec<u8>> {
-        let conn = self.ep.connect(to, JOIN_ALPN).await?;
+        let conn = self.ep.connect(self.reach(to), JOIN_ALPN).await?;
         let (mut s, mut r) = conn.open_bi().await?;
         s.write_all(req).await?;
         s.finish()?;
@@ -148,7 +158,7 @@ impl Net {
 
     /// A fresh connection on `alpn` (blobs: iroh-blobs requests run over it; calls).
     pub async fn connect(&self, to: EndpointAddr, alpn: &[u8]) -> Result<Connection> {
-        Ok(self.ep.connect(to, alpn).await?)
+        Ok(self.ep.connect(self.reach(to), alpn).await?)
     }
 
     pub async fn close(&self) {

@@ -11,3 +11,6 @@ iroh-tickets.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+iroh-relay.workspace = true
