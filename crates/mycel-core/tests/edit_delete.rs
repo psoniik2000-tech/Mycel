@@ -57,6 +57,14 @@ async fn edit_delete_pin_between_two_nodes() {
     assert!(!has(&a, m.id));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(has(&b, m.id));
+
+    // Deleting the chat erases it here only; a new message shows it again.
+    a.delete_chat(&None).unwrap();
+    assert!(a.history(&None).unwrap().is_empty());
+    assert!(has(&b, m.id));
+    let y = b.send_text(&None, "снова", None).unwrap();
+    until(|| has(&a, y.id)).await;
+    assert!(!has(&a, m.id));
     a.close().await;
     b.close().await;
 }

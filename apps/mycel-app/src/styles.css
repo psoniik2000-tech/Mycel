@@ -339,6 +339,9 @@ button.del { color: var(--danger); }
 .dialog > button.del { color: var(--danger); }
 .dialog > button:not(.primary):hover:not(:disabled) { background: var(--hover); }
 .dialog .chat-row { border-radius: 10px; }
+.profile { align-items: center; text-align: center; }
+.profile > .avatar { width: 96px; height: 96px; font-size: 32px; margin-bottom: 8px; }
+.profile > button { align-self: stretch; }
 .dialog .chat-row:hover { background: var(--hover); }
 @keyframes pop { from { opacity: 0; transform: translateY(4px); } }
 

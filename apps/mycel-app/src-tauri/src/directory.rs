@@ -87,6 +87,8 @@ async fn side_space(app: &AppHandle, st: &App, name: &str) -> R<(String, Arc<Nod
             muted: vec![],
             pinned: vec![],
             archived: vec![],
+            hidden: vec![],
+            removed: vec![],
         })
     })
     .map_err(|e| e.to_string())?;

@@ -19,6 +19,12 @@ pub struct Space {
     /// Chats moved to the archive; a new message brings one back unless it is muted.
     #[serde(default)]
     pub archived: Vec<String>,
+    /// Deleted chats: left out of the list while they have no messages.
+    #[serde(default)]
+    pub hidden: Vec<String>,
+    /// People removed from «Люди» on this device (the protocol has no kick).
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 pub const MAX_PINNED: usize = 5;
@@ -91,6 +97,8 @@ impl List {
                         muted: vec![],
                         pinned: vec![],
                         archived: vec![],
+                        hidden: vec![],
+                        removed: vec![],
                     },
                 );
                 l.last = Some("main".into());
