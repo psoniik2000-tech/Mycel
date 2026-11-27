@@ -492,22 +492,26 @@ struct Mailbox {
 /// Envelopes per mailbox page (the worker returns at most this many).
 const BOX_PAGE: usize = 200;
 
+/// HTTPS client with the bundled web roots (no system store on Android); `timeout` for the whole call.
+fn tls_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .timeout(timeout)
+        .build()?)
+}
+
 impl Mailbox {
     fn new(url: &str) -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
         Ok(Self {
-            http,
+            http: tls_client(std::time::Duration::from_secs(30))?,
             url: url.trim_end_matches('/').to_string(),
         })
     }
@@ -2561,6 +2565,40 @@ fn now_ms() -> Result<u64> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// In-app update check: the body of a GitHub API URL (GitHub wants a User-Agent).
+pub async fn https_text(url: &str) -> Result<String> {
+    let r = tls_client(std::time::Duration::from_secs(15))?
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "Mycel")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(r.text().await?)
+}
+
+/// In-app update: downloads `url` into `to`; `on_bytes(done, total)` after each chunk (`total` 0 if unknown).
+pub async fn https_download(
+    url: &str,
+    to: &Path,
+    mut on_bytes: impl FnMut(u64, u64),
+) -> Result<()> {
+    let mut r = tls_client(std::time::Duration::from_secs(900))?
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "Mycel")
+        .send()
+        .await?
+        .error_for_status()?;
+    let total = r.content_length().unwrap_or(0);
+    let mut f = std::fs::File::create(to)?;
+    let mut done = 0;
+    while let Some(c) = r.chunk().await? {
+        std::io::Write::write_all(&mut f, &c)?;
+        done += c.len() as u64;
+        on_bytes(done, total);
+    }
+    Ok(())
 }
 
 /// Settings → «Проверить»: the server answers over HTTP(S) within 5 s → its round trip in ms.

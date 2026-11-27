@@ -126,6 +126,10 @@ input, textarea {
 .nav.active svg { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 .nav .badge { position: absolute; top: 2px; right: 6px; }
 .panel { position: relative; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.update-banner { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--accent); color: var(--accent-ink); font-size: 15px; }
+.update-banner .grow { flex: 1; min-width: 0; }
+.update-banner button { padding: 4px 14px; border-radius: 14px; border: 0; background: var(--accent-ink); color: var(--accent); font-weight: 600; }
+.update-banner button.icon { padding: 2px; background: none; color: var(--accent-ink); }
 .bar input.find { padding: 8px 14px; border-radius: 20px; background: var(--hover); border-color: transparent; }
 /* New chat: round pencil bottom right, as in Telegram */
 .fab {
