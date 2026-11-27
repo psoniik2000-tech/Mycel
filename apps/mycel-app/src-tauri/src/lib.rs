@@ -335,7 +335,8 @@ async fn pull(root: &Path, id: &str, pw: &str, list: &spaces::List) -> Option<Ve
                 Some(ev) = rx.recv() => {
                     let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
                     if let Some((title, body)) = note(&node, &ev, &chat) {
-                        if spaces::List::arrived(root, id, &chat_id(&chat)) {
+                        if spaces::List::arrived(root, id, &chat_id(&chat)) && !node.mentions_me(&ev)
+                        {
                             muted = true;
                         } else {
                             notes.push([id.to_string(), chat_id(&chat), title, body]);
@@ -587,6 +588,8 @@ struct ChatRow {
     unread: usize,
     /// No notifications on this device.
     muted: bool,
+    /// An unread message mentions us.
+    mention: bool,
     /// Place among the pinned chats.
     pin: Option<usize>,
     archived: bool,
@@ -1104,8 +1107,9 @@ async fn unlock(
                 break;
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
+            // A mention notifies even in a muted chat.
             if let Some((who, text)) = note(&node, &ev, &chat)
-                && !spaces::List::arrived(&root, &space, &chat_id(&chat))
+                && (!spaces::List::arrived(&root, &space, &chat_id(&chat)) || node.mentions_me(&ev))
             {
                 notify(&app, &space, &chat_id(&chat), who, text);
             }
@@ -1465,6 +1469,10 @@ async fn chats(app: AppHandle, st: State<'_, App>) -> R<Vec<ChatRow>> {
             Ok(ChatRow {
                 // Only messages the feed shows (a call without its view is not one).
                 unread: msgs.iter().filter(|m| new.contains(&m.id)).count(),
+                mention: new
+                    .iter()
+                    .filter_map(|i| n.event(&unhex(i).ok()?).ok())
+                    .any(|(_, e)| n.mentions_me(&e)),
                 last: msgs.into_iter().last(),
                 muted: spaces.muted(space, &id),
                 pin: flags.and_then(|s| s.pinned.iter().position(|c| *c == id)),
@@ -1563,10 +1571,20 @@ async fn send(
     chat: String,
     text: String,
     reply_to: Option<String>,
+    mentions: Option<Vec<String>>,
 ) -> R<String> {
     let n = &st.node()?;
     let r = reply_to.map(|r| unhex(&r)).transpose()?;
-    let ev = n.send_text(&chat_of(n, &chat)?, &text, r).map_err(err)?;
+    // Members who left since are simply not mentioned.
+    let m = mentions.unwrap_or_default();
+    let m = m
+        .iter()
+        .filter_map(|m| chat_of(n, m).ok()?)
+        .map(|k| n.account_of(&k))
+        .collect();
+    let ev = n
+        .send_mention(&chat_of(n, &chat)?, &text, r, m)
+        .map_err(err)?;
     Ok(hex(&ev.id))
 }
 
@@ -2523,6 +2541,8 @@ pub fn run() {
             directory::dir_search,
             directory::dir_add,
             directory::dir_name_of,
+            directory::space_chats,
+            directory::forward_to_space,
             directory::create_group,
             directory::join_group,
             invite,

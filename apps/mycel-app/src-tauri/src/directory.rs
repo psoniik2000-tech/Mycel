@@ -1,6 +1,6 @@
 //! Usernames on the main server and Telegram-style groups (DESIGN.md §4.6).
 
-use super::{App, R, chat_id, chat_of, data_dir, err, spaces, vault};
+use super::{App, R, chat_id, chat_of, data_dir, err, name_of, short, spaces, unhex, vault};
 use mycel_core::{Node, Opts, dir};
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -68,21 +68,94 @@ pub async fn dir_name_of(st: State<'_, App>, server: String, id: String) -> R<Op
         .map(|r| r.username))
 }
 
+/// The open space's id and password, and its connection settings for a space opened beside it.
+fn current(st: &App) -> R<(String, String, Opts)> {
+    let o = st.0.lock().unwrap();
+    let o = o.as_ref().ok_or("locked")?;
+    let opts = Opts {
+        n0: o.n0,
+        extra_relays: o.relays.clone(),
+        mailbox: o.mailbox.clone(),
+        ..Default::default()
+    };
+    Ok((o.id.clone(), o.password.clone(), opts))
+}
+
+/// Another of our spaces, opened beside the current one for a moment (the caller closes it).
+// shortcut: with the open space's connection settings (per-space ones live in the UI), and
+// entering that space fails until it is closed again.
+async fn other_space(app: &AppHandle, st: &App, id: &str) -> R<Arc<Node>> {
+    let root = data_dir(app)?;
+    let (cur, pw, opts) = current(st)?;
+    let list = spaces::List::load(&root).map_err(|e| e.to_string())?;
+    if id == cur || list.space(id).is_none() {
+        return Err("no such space".into());
+    }
+    let pw = vault::load(&root, id).unwrap_or(pw);
+    let (n, _rx) = Node::open(&spaces::dir(&root, id), &pw, &opts)
+        .await
+        .map_err(|e| format!("Не удалось открыть группу (другой пароль?): {}", err(e)))?;
+    Ok(n)
+}
+
+/// (chat id, name) of the people in another space, for «Переслать».
+#[tauri::command]
+pub async fn space_chats(
+    app: AppHandle,
+    st: State<'_, App>,
+    space: String,
+) -> R<Vec<(String, String)>> {
+    // Read first: nothing may fail between opening the node and closing it.
+    let list = spaces::List::load(&data_dir(&app)?).map_err(|e| e.to_string())?;
+    let n = other_space(&app, &st, &space).await?;
+    let removed = list.space(&space).map_or(&[][..], |s| &s.removed);
+    let mut all = n.members();
+    all.extend(n.contacts().unwrap_or_default());
+    all.sort();
+    all.dedup();
+    // One row per account, as in «Люди».
+    all.retain(|m| n.account_of(m) == *m && *m != n.account() && !removed.contains(&short(m)));
+    let out = all.iter().map(|m| (short(m), name_of(&n, m))).collect();
+    n.close().await;
+    Ok(out)
+}
+
+/// «Переслать» into chat `to` of another space (a group, or a contact there).
+#[tauri::command]
+pub async fn forward_to_space(
+    app: AppHandle,
+    st: State<'_, App>,
+    ids: Vec<String>,
+    space: String,
+    to: String,
+) -> R<()> {
+    let cur = st.node()?;
+    let ids = ids.iter().map(|i| unhex(i)).collect::<R<Vec<_>>>()?;
+    let n = other_space(&app, &st, &space).await?;
+    let sent = async {
+        let to = chat_of(&n, &to)?;
+        if let Some(p) = to {
+            n.open_dm(p).map_err(err)?;
+        }
+        cur.forward_into(&ids, &n, &to).await.map_err(err)
+    }
+    .await;
+    // Closing at once: give the copies a moment to reach someone (the mailbox post goes on).
+    for _ in 0..30 {
+        if !n.awaiting_receipt() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    n.close().await;
+    sent
+}
+
 /// A new space beside the open one, with the same password and connection settings (and kept
 /// in the keystore if the open one is), opened in the background.
 async fn side_space(app: &AppHandle, st: &App, name: &str) -> R<(String, Arc<Node>)> {
     let root = data_dir(app)?;
-    let (cur, pw, n0, relays, mailbox) = {
-        let o = st.0.lock().unwrap();
-        let o = o.as_ref().ok_or("locked")?;
-        (
-            o.id.clone(),
-            o.password.clone(),
-            o.n0,
-            o.relays.clone(),
-            o.mailbox.clone(),
-        )
-    };
+    let (cur, pw, opts) = current(st)?;
     let id = spaces::new_id();
     spaces::List::edit(&root, |l| {
         l.spaces.push(spaces::Space {
@@ -99,12 +172,6 @@ async fn side_space(app: &AppHandle, st: &App, name: &str) -> R<(String, Arc<Nod
     if vault::load(&root, &cur).is_some() {
         vault::save(&root, &id, &pw)?;
     }
-    let opts = Opts {
-        n0,
-        extra_relays: relays,
-        mailbox,
-        ..Default::default()
-    };
     match Node::open(&spaces::dir(&root, &id), &pw, &opts).await {
         Ok((n, _rx)) => Ok((id, n)),
         Err(e) => {

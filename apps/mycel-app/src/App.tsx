@@ -24,6 +24,8 @@ import { mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./
 import { Appearance, msgSize } from "./look";
 import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameSettings, withBox, withServer } from "./directory";
 import { lastSeen, PrivacySettings } from "./privacy";
+import { mentionIds, mentionText, useMention } from "./mention";
+import { ForwardList } from "./forward";
 
 // status (own messages, §7.4): 0 ⏱ sending, 1 ✓ some member has it, 2 ✓✓ every member has it.
 type Msg = { id: string; author: string; mine: boolean; text: string; ts: number; status: number; media: Media | null; call: CallView | null;
@@ -36,7 +38,7 @@ type CallView = { id: string; video: boolean; author: string; chat: string; mine
 type CallSignal = { id: string; action: "offer" | "accept" | "reject" | "end"; video: boolean; author: string; device: string; chat: string; ts: number };
 type Active = { id: string; video: boolean; started: number; peers: string[]; chat: string };
 type Member = { id: string; me: boolean; admin: boolean; name: string | null; avatar: string; color: number | null; link: "direct" | "relay" | null; online: boolean; seen: number | null; hidden: boolean; removed: boolean };
-type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; pin: number | null; archived: boolean };
+type ChatRow = { id: string; last: Msg | null; unread: number; muted: boolean; mention: boolean; pin: number | null; archived: boolean };
 type Space = { id: string; name: string; remembered: boolean };
 type Status = { spaces: Space[]; last: string | null; current: string | null; dir: string; in_space: boolean; anchor: string | null };
 type Tab = "chats" | "calls" | "people" | "settings";
@@ -1503,6 +1505,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                         <div class="row-bottom">
                           <span class="muted ellipsis">{draft() ? <><span class="draft">Черновик:</span> {rich(draft()!)}</> : rich(preview(r))}</span>
                           <Show when={r.pin !== null}><Pin size={15} class="muted pin-mark" aria-label="Закреплён" /></Show>
+                          <Show when={r.mention}><b class="badge" title="Вас упомянули">@</b></Show>
                           <Show when={r.unread}><b class="badge" classList={{ off: r.muted }}>{r.unread}</b></Show>
                         </div>
                       </div>
@@ -1666,7 +1669,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
           <Chat chat={k.c} msgs={msgs()} members={members().length} me={members().find((m) => m.me)?.id ?? ""} admin={members().some((m) => m.me && m.admin)}
             peers={peers()} back={() => history.back()} reload={reload} inCall={!!active()} onCall={(v) => startCall(v)} callErr={callErr()}
             openChat={openChat} onJoin={acceptCall} muted={!!rows().find((r) => r.id === k.c)?.muted} onMute={toggleMute}
-            onProfile={() => setProfile(k.c)} onDelete={() => deleteChat(k.c, false)} />
+            onProfile={() => setProfile(k.c)} onMention={setProfile} onDelete={() => deleteChat(k.c, false)} />
         )}
       </Show>
       <Show when={profile()} keyed>
@@ -1907,7 +1910,7 @@ const isVideo = (path: string) => /\.(mp4|m4v|webm|mov|mkv)$/i.test(path);
 function Chat(p: {
   chat: string; msgs: Msg[]; members: number; me: string; admin: boolean; peers: number; back: () => void; reload: () => Promise<void>;
   inCall: boolean; onCall: (video: boolean) => void; callErr: string; openChat: (id: string) => void; onJoin: (c: CallView) => void;
-  muted: boolean; onMute: (on: boolean) => void; onProfile: () => void; onDelete: () => void;
+  muted: boolean; onMute: (on: boolean) => void; onProfile: () => void; onMention: (id: string) => void; onDelete: () => void;
 }) {
   const key = draftKey(p.chat);
   const [text, setText] = createSignal(getDraft(key));
@@ -2315,8 +2318,9 @@ function Chat(p: {
     setReply(undefined);
     queueMicrotask(grow);
     if (ed) return t !== ed.text && act(invoke("edit", { id: ed.id, text: t }));
+    const mentions = p.chat ? [] : mentionIds(t, people());
     queue({ text: t, reply: r ? { id: r.id, author: r.author, text: plain(r) } : null },
-      () => invoke<string>("send", { chat: p.chat, text: t, replyTo: r?.id ?? null }),
+      () => invoke<string>("send", { chat: p.chat, text: t, replyTo: r?.id ?? null, mentions }),
       // The chat may be closed by now: keep the unsent text as its draft unless a newer one exists.
       () => (getDraft(key) || setDraft(key, t), setText(t), setReply(r), queueMicrotask(grow)));
   };
@@ -2324,6 +2328,10 @@ function Chat(p: {
   createEffect(() => {
     const t = text();
     if (!editing()) setDraft(key, t);
+  });
+  const mention = useMention({
+    people: () => (p.chat ? [] : people()), text, input: () => input, avatar: (id) => <Avatar id={id} />,
+    insert: (t, caret) => (setText(t), (input.value = t), input.focus(), input.setSelectionRange(caret, caret), grow()),
   });
   const canAll = (ids: string[]) => p.admin || ids.every((id) => p.msgs.find((m) => m.id === id)?.mine);
   return (
@@ -2460,7 +2468,7 @@ function Chat(p: {
                         </Show>
                         <Show when={head().text}>
                           <span class="text" style={big() ? { "font-size": `${112 - 16 * big()}px` } : undefined}>
-                            {re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{rich(s)}</mark> : rich(s))) : rich(head().text)}
+                            {re() ? head().text.split(re()!).map((s, i) => (i % 2 ? <mark>{rich(s)}</mark> : rich(s))) : p.chat ? rich(head().text) : mentionText(head().text, people(), p.onMention)}
                           </span>
                         </Show>
                         <Show when={joinLink(head().text ?? "")}><JoinGroup text={head().text} mine={m.mine} /></Show>
@@ -2537,21 +2545,18 @@ function Chat(p: {
               <Show when={d().kind === "delete"} fallback={
                 <>
                   <h3>Переслать в чат</h3>
-                  <div class="dialog-list">
-                    <For each={["", ...people().filter((m) => !m.me).map((m) => m.id)]}>
-                      {(to) => (
-                        <button class="row chat-row" onClick={() => {
-                          const ids = d().ids;
-                          setDlg(undefined);
-                          setSel([]);
-                          act(invoke("forward", { ids, to }));
-                        }}>
-                          {to ? <Avatar id={to} /> : <div class="avatar group small-av"><Hash size={18} /></div>}
-                          <b>{to ? nameOf(to) : "Общий чат"}</b>
-                        </button>
-                      )}
-                    </For>
-                  </div>
+                  <ForwardList current={spaceId} avatar={(id) => <Avatar id={id} />}
+                    people={people().filter((m) => !m.me && !m.removed).map((m) => ({ id: m.id, name: nameOf(m.id) }))}
+                    onPick={(to, name, space) => {
+                      const ids = d().ids;
+                      setDlg(undefined);
+                      setSel([]);
+                      if (!space) return act(invoke("forward", { ids, to }));
+                      // Another space is opened for this: it takes a few seconds.
+                      setHint(`Пересылаю в «${name}»…`);
+                      act(invoke("forward_to_space", { ids, space, to }).then(() => setHint(`Переслано в «${name}»`))
+                        .finally(() => (clearTimeout(hintTimer), (hintTimer = window.setTimeout(() => setHint(""), 2000)))));
+                    }} />
                 </>
               }>
                 <h3>{d().ids.length > 1 ? `Удалить ${d().ids.length} сообщ.?` : "Удалить сообщение?"}</h3>
@@ -2640,17 +2645,21 @@ function Chat(p: {
         <textarea ref={input} rows={1} placeholder={video() ? "Сообщение · удерживайте 📹 для видеосообщения" : "Сообщение"} value={text()}
           onInput={(e) => {
             setText(e.currentTarget.value);
+            mention.track(e);
             grow();
             // The core sends at most once per 3 s.
             if (text().trim() && !editing()) invoke("typing", { chat: p.chat, voice: false }).catch(() => {});
           }}
+          onClick={mention.track} onKeyUp={mention.track}
           onKeyDown={(e) => {
+            if (mention.key(e)) return;
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
               e.preventDefault();
               send();
             }
           }} />
         </div>
+        {mention.view()}
         <Show when={emo() !== undefined}>
           <div class="overlay" onClick={() => setEmo(undefined)} />
           <div class="emoji-panel card">
