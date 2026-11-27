@@ -626,6 +626,23 @@ impl Node {
                 }
             }
         });
+        // A peer's link dropped (relay hiccup, phone switched network): dial it again and catch up
+        // in a moment instead of after the next periodic sync.
+        let (mut lost, weak) = (node.net.on_lost(), Arc::downgrade(&node));
+        tokio::spawn(async move {
+            while let Some(peer) = lost.recv().await {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let Some(n) = weak.upgrade() else { break };
+                if n.net.is_closed() {
+                    break;
+                }
+                if n.net.link(peer).0.is_none()
+                    && let Err(e) = n.sync_with(Some(peer))
+                {
+                    eprintln!("mycel: reconnect failed: {e}");
+                }
+            }
+        });
         tokio::spawn(node.clone().serve_joins(joins));
         tokio::spawn(node.clone().serve_conns(conns));
         if node.keep_blobs {
@@ -649,13 +666,19 @@ impl Node {
                 n.poll_box().await;
             }
             let mut synced = Instant::now();
+            let mut home = weak.upgrade().and_then(|n| n.relay_now());
             loop {
                 tokio::time::sleep(FAST_POLL).await;
                 let Some(n) = weak.upgrade() else { break };
                 if n.net.is_closed() {
                     break;
                 }
-                let due = synced.elapsed() >= RESYNC;
+                // Back on a relay (or another one: network switch, wake from sleep): catch up now,
+                // not on the next minute tick, so the anchor hands over what came meanwhile.
+                let now = n.relay_now();
+                let back = now.is_some() && now != home;
+                home = now;
+                let due = back || synced.elapsed() >= RESYNC;
                 if due {
                     synced = Instant::now();
                     if let Err(e) = n.sync() {
@@ -695,6 +718,11 @@ impl Node {
         r.extend(self.own_relay.clone());
         r.extend(self.extra_relays.iter().cloned());
         r
+    }
+
+    /// The home relay if it is connected right now (no waiting).
+    fn relay_now(&self) -> Option<String> {
+        self.net.relay_up().then(|| self.home_relay()).flatten()
     }
 
     /// The relay peers in other networks reach us through right now, if any.
@@ -1691,20 +1719,40 @@ impl Node {
         if self.blobs.has(hash).await? {
             return Ok(0);
         }
-        let mut peers: Vec<_> = self.st.lock().unwrap().store.peers()?;
-        peers.retain(|p| peer_addr(p).is_some_and(|a| a.id != self.net.id()));
-        // The author first, then peers we already have a link to: a cold dial to an offline
-        // member can hang until its timeout, which made media show up minutes late.
-        peers.sort_by_key(|p| {
-            peer_addr(p).map_or((true, true), |a| {
-                (*a.id.as_bytes() != author, self.net.link(a.id).0.is_none())
+        let peers: Vec<_> = self.st.lock().unwrap().store.peers()?;
+        // Dial the author, the anchors (they keep every blob) and everyone else at once and
+        // download from whoever answers first: one after another, each offline member cost a
+        // full dial timeout. Anchors and the author are dialed first.
+        let mut addrs: Vec<(bool, EndpointAddr)> = peers
+            .iter()
+            .filter_map(|p| {
+                let a = peer_addr(p)?;
+                let anchor = postcard::from_bytes::<SignedAddr>(p).is_ok_and(|s| s.relay.is_some());
+                (a.id != self.net.id()).then(|| (!(anchor || *a.id.as_bytes() == author), a))
             })
-        });
+            .collect();
+        addrs.sort_by_key(|(later, _)| *later);
+        let mut dials: n0_future::FuturesUnordered<_> = addrs
+            .into_iter()
+            .map(|(_, a)| {
+                let net = self.net.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        net.connect(a, BLOBS_ALPN),
+                    )
+                    .await
+                    .context("peer did not answer")?
+                }
+            })
+            .collect();
         let mut last = anyhow::anyhow!("no member is reachable");
-        for p in peers {
-            let Some(addr) = peer_addr(&p) else { continue };
-            match self.fetch_from(addr, hash, &mut progress).await {
-                Ok(n) => return Ok(n),
+        while let Some(conn) = dials.next().await {
+            match conn {
+                Ok(conn) => match self.fetch_from(conn, hash, &mut progress).await {
+                    Ok(n) => return Ok(n),
+                    Err(e) => last = e,
+                },
                 Err(e) => last = e,
             }
         }
@@ -1713,17 +1761,11 @@ impl Node {
 
     async fn fetch_from(
         &self,
-        addr: EndpointAddr,
+        conn: mycel_net::Connection,
         hash: Hash,
         progress: &mut impl FnMut(u64),
     ) -> Result<u64> {
         let base = self.blobs.remote().local(hash).await?.local_bytes();
-        let conn = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            self.net.connect(addr, BLOBS_ALPN),
-        )
-        .await
-        .context("peer did not answer")??;
         let mut s = self.blobs.remote().fetch(conn, hash).stream();
         while let Some(item) = s.next().await {
             match item {
@@ -2034,6 +2076,11 @@ impl Node {
 
     /// Exchanges addresses with every known peer and asks for what we miss (offering what they miss).
     fn sync(&self) -> Result<()> {
+        self.sync_with(None)
+    }
+
+    /// `sync` with one peer only (`Some`) or with all of them.
+    fn sync_with(&self, only: Option<EndpointId>) -> Result<()> {
         let st = self.st.lock().unwrap();
         if !st.in_space()? {
             return Ok(());
@@ -2043,6 +2090,9 @@ impl Node {
             let Some(id) = peer_addr(&p).map(|a| *a.id.as_bytes()) else {
                 continue;
             };
+            if only.is_some_and(|o| *o.as_bytes() != id) {
+                continue;
+            }
             let ids = envs
                 .iter()
                 .filter(|(_, g)| sees(g, &id))
@@ -2070,6 +2120,8 @@ impl Node {
 
     /// Syncs with peers and pulls the mailbox now (the app came to the foreground or got a push).
     pub async fn sync_now(&self) {
+        // After sleep or Android background the network may differ: iroh re-checks paths first.
+        self.net.network_change().await;
         let _ = self.sync();
         self.poll_box().await;
     }

@@ -2,11 +2,13 @@
 
 use anyhow::Result;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, TransportAddr};
+use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, TransportAddr, Watcher};
 use mycel_proto::SyncMsg;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 pub use iroh::endpoint::Connection;
@@ -21,7 +23,11 @@ pub const CALL_ALPN: &[u8] = b"mycel/call/1";
 // shortcut: one message per stream, capped at 16 MiB (a full-history Envs batch); chunk when histories grow.
 const MAX_MSG: usize = 16 << 20;
 /// How long a cached connection gets to acknowledge a message before it is replaced.
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// No home relay this long (our relays down: anchor PC off, server gone) → the fallback relays come back.
+const NO_RELAY_FOR: Duration = Duration::from_secs(15);
+/// While on the fallback relays, our relays are probed this often; one answering → back to them.
+const PROBE_EVERY: Duration = Duration::from_secs(30);
 
 /// Incoming sync messages with the authenticated sender.
 pub type Inbox = mpsc::Receiver<(EndpointId, SyncMsg)>;
@@ -40,6 +46,11 @@ pub struct Net {
     /// Our relays: every dial also tries them, so peers whose stored address names a dead relay
     /// (n0 blocked) are still found on the relay we share.
     relays: Arc<Mutex<Vec<RelayUrl>>>,
+    /// Relays used only while none of ours is reachable (the public n0 ones when `n0` is on).
+    fallback: Arc<Mutex<Vec<RelayUrl>>>,
+    fallback_on: Arc<AtomicBool>,
+    /// Gets the peer of every cached sync connection that closed (`on_lost`).
+    lost: Arc<Mutex<Option<mpsc::UnboundedSender<EndpointId>>>>,
 }
 
 impl Net {
@@ -77,6 +88,13 @@ impl Net {
             seen: Default::default(),
             tx,
             relays: Default::default(),
+            fallback: Arc::new(Mutex::new(if n0 {
+                RelayMode::Default.relay_map().urls()
+            } else {
+                vec![]
+            })),
+            fallback_on: Arc::new(AtomicBool::new(n0)),
+            lost: Default::default(),
         };
         let n = net.clone();
         tokio::spawn(async move {
@@ -94,7 +112,95 @@ impl Net {
         for r in relays {
             net.add_relay(r).await?;
         }
+        tokio::spawn(net.clone().watch_relays());
         Ok((net, rx, jrx, brx))
+    }
+
+    /// Without this, a space whose relays are all down (anchor PC off) leaves us on no relay at
+    /// all: brings the fallback relays back after `NO_RELAY_FOR`, drops them again once one of
+    /// ours answers.
+    async fn watch_relays(self) {
+        let mut down_since: Option<tokio::time::Instant> = None;
+        let mut probed = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if self.ep.is_closed() {
+                break;
+            }
+            let fallback = self.fallback.lock().unwrap().clone();
+            let ours = self.relays.lock().unwrap().clone();
+            if fallback.is_empty() || ours.is_empty() {
+                continue;
+            }
+            if !self.fallback_on.load(Ordering::Relaxed) {
+                if self.relay_up() {
+                    down_since = None;
+                } else if down_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= NO_RELAY_FOR
+                {
+                    eprintln!("mycel: no relay of ours is reachable, using the fallback ones");
+                    for u in fallback.iter().filter(|u| !ours.contains(u)) {
+                        let cfg = Arc::new(RelayConfig::new(u.clone(), None));
+                        self.ep.insert_relay(u.clone(), cfg).await;
+                    }
+                    self.fallback_on.store(true, Ordering::Relaxed);
+                    down_since = None;
+                    probed = tokio::time::Instant::now();
+                }
+            } else if probed.elapsed() >= PROBE_EVERY {
+                probed = tokio::time::Instant::now();
+                let mut any = false;
+                for u in &ours {
+                    any |= answers(u).await;
+                }
+                if any {
+                    eprintln!("mycel: a relay of ours is back, leaving the fallback ones");
+                    self.drop_fallback().await;
+                }
+            }
+        }
+    }
+
+    /// Removes the fallback relays (not ours) from the relay map.
+    async fn drop_fallback(&self) {
+        let ours = self.relays.lock().unwrap().clone();
+        let fallback = self.fallback.lock().unwrap().clone();
+        for u in fallback.iter().filter(|u| !ours.contains(u)) {
+            self.ep.remove_relay(u).await;
+        }
+        self.fallback_on.store(false, Ordering::Relaxed);
+    }
+
+    /// Tests: relays to fall back on instead of the n0 ones (not in the relay map until ours fail).
+    #[doc(hidden)]
+    pub fn set_fallback(&self, urls: Vec<RelayUrl>) {
+        *self.fallback.lock().unwrap() = urls;
+        self.fallback_on.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a home relay is connected right now.
+    pub fn relay_up(&self) -> bool {
+        self.ep
+            .home_relay_status()
+            .get()
+            .iter()
+            .any(|s| s.is_connected())
+    }
+
+    /// Peers whose cached sync connection closed come out of the returned receiver (replacing an
+    /// older one), so the owner can reconnect and catch up at once, not on the next periodic sync.
+    pub fn on_lost(&self) -> mpsc::UnboundedReceiver<EndpointId> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.lost.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    /// The OS network may have changed (resume from sleep, app back in the foreground):
+    /// iroh re-checks its paths and relay now.
+    pub async fn network_change(&self) {
+        self.ep.network_change().await
     }
 
     /// Adds a relay to the relay map; the endpoint picks the best one as its home relay.
@@ -103,16 +209,9 @@ impl Net {
     pub async fn add_relay(&self, url: &str) -> Result<()> {
         let url: RelayUrl = url.parse()?;
         let cfg = Arc::new(RelayConfig::new(url.clone(), None));
-        let ours = {
-            let mut rs = self.relays.lock().unwrap();
-            rs.push(url.clone());
-            rs.clone()
-        };
+        self.relays.lock().unwrap().push(url.clone());
         self.ep.insert_relay(url, cfg).await;
-        let n0: Vec<RelayUrl> = RelayMode::Default.relay_map().urls();
-        for u in n0.iter().filter(|u| !ours.contains(u)) {
-            self.ep.remove_relay(u).await;
-        }
+        self.drop_fallback().await;
         Ok(())
     }
 
@@ -206,6 +305,7 @@ impl Net {
         let peer = conn.remote_id();
         self.conns.lock().unwrap().insert(peer, conn.clone());
         let (tx, seen) = (self.tx.clone(), self.seen.clone());
+        let (conns, lost) = (self.conns.clone(), self.lost.clone());
         tokio::spawn(async move {
             while let Ok(mut rs) = conn.accept_uni().await {
                 let Ok(bytes) = rs.read_to_end(MAX_MSG).await else {
@@ -221,8 +321,32 @@ impl Net {
                     break;
                 }
             }
+            // Still the cached one (not replaced by a newer dial): the link to `peer` is gone.
+            let mut cs = conns.lock().unwrap();
+            if cs
+                .get(&peer)
+                .is_some_and(|c| c.stable_id() == conn.stable_id())
+            {
+                cs.remove(&peer);
+                if let Some(l) = &*lost.lock().unwrap() {
+                    let _ = l.send(peer);
+                }
+            }
         });
     }
+}
+
+/// The relay's host accepts a TCP connection within 3 s.
+async fn answers(url: &RelayUrl) -> bool {
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_string();
+    let dial = tokio::net::TcpStream::connect((host, port));
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), dial).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn write(conn: &Connection, bytes: &[u8]) -> Result<()> {

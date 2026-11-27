@@ -9,7 +9,7 @@ mycel-proto.workspace = true
 iroh.workspace = true
 iroh-tickets.workspace = true
 postcard.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 anyhow.workspace = true
 
 [dev-dependencies]
