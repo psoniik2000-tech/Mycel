@@ -12,6 +12,10 @@ fn dir_err(e: anyhow::Error) -> String {
         "Это имя пользователя уже занято".into()
     } else if t.contains("main server unreachable") || t.contains("not a Mycel main server") {
         format!("Сервер имён недоступен ({t})")
+    } else if t.contains(dir::DIR_DENIED) {
+        "Сервер закрытый: попросите владельца добавить вас".into()
+    } else if t.contains(dir::DIR_BUSY) {
+        "Слишком много запросов, попробуйте через минуту".into()
     } else if t.contains("no such username") {
         "Нет такого имени пользователя".into()
     } else if t.starts_with("username:") {

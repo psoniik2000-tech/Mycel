@@ -29,11 +29,14 @@ use tokio::sync::mpsc;
 pub mod backup;
 mod call;
 pub mod dir;
+#[cfg(not(target_os = "android"))]
+mod fcm;
 mod serverbox;
 pub use call::{AUDIO, Frame, LinkStats, VIDEO_DELTA, VIDEO_KEY};
 pub use mycel_crypto::safety_code;
 pub use mycel_net::RelayUrl;
 pub use mycel_proto;
+pub use serverbox::{AllowList, ROLES, allow, allowlist, backup, deny, restore};
 
 const LINK: &str = "mycel://join/";
 const CONTACT_LINK: &str = "mycel://contact/";
@@ -467,7 +470,8 @@ pub struct Node {
     box_tx: mpsc::Sender<Vec<Envelope>>,
     /// This phone's FCM token: the mailbox wakes it when something new is posted.
     push_token: Mutex<Option<String>>,
-    push_registered: std::sync::atomic::AtomicBool,
+    /// Mailboxes (urls) that have the token since it last changed.
+    push_registered: Mutex<HashSet<String>>,
     /// Per chat: (lamport, send time) of the newest own message nobody has confirmed yet.
     unacked: Mutex<HashMap<Chat, (u64, Instant)>>,
     /// Where incoming typing signals go (`typing_events`).
@@ -488,7 +492,7 @@ pub struct Typing {
 /// mailbox (a Cloudflare Worker); members pull what is new at start and every minute
 /// (every `FAST_POLL` while waiting for a receipt).
 /// It sees only ciphertext; the topic is derived from the space id, which only members know.
-// shortcut: envelopes only; media blobs still come from a member who is online.
+// Media blobs come from a member online, else from a mailbox that keeps them (a main server).
 struct Mailbox {
     http: reqwest::Client,
     url: String,
@@ -1049,8 +1053,7 @@ impl Node {
             st.store.upsert_peer(&root, ticket.as_bytes())?;
             self.add_peers(&st, &resp.peers)?;
         }
-        self.push_registered
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.push_registered.lock().unwrap().clear();
         match self.profiles()?.remove(&root) {
             Some((name, avatar, color, _)) => {
                 self.set_profile(&name, &avatar, color).map(|_| ())?
@@ -1150,8 +1153,7 @@ impl Node {
             self.post_box_at(&env, &space[..16], false, None);
             self.broadcast(peers, SyncMsg::Envs(vec![env]));
         }
-        self.push_registered
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.push_registered.lock().unwrap().clear();
         self.refresh_profile(true)?;
         self.sync()
     }
@@ -1787,8 +1789,22 @@ impl Node {
         let (s, t) = (src.to_owned(), tmp.clone());
         let key = tokio::task::spawn_blocking(move || mycel_media::encrypt(&s, &t)).await??;
         let added = self.blobs.add_path(&tmp).temp_tag().await;
+        // Mailboxes that keep blobs serve it while we are offline (§4.6).
+        let up = match std::fs::metadata(&tmp) {
+            Ok(m) if !self.mailbox.is_empty() && m.len() <= serverbox::MAX_BLOB as u64 => {
+                std::fs::read(&tmp).ok()
+            }
+            _ => None,
+        };
         let _ = std::fs::remove_file(&tmp);
         let hash = added?.hash();
+        if let Some(body) = up {
+            let path = format!("/blob/{}", hash.to_hex());
+            let h = serverbox::sign(self.net.secret_key(), "POST", &path, &body);
+            for b in &self.mailbox {
+                Self::post_bg(b, path.clone(), h.clone(), body.clone());
+            }
+        }
         self.blobs.tags().set(hex(hash.as_bytes()), hash).await?;
         meta.hash = *hash.as_bytes();
         meta.size = size;
@@ -1873,7 +1889,34 @@ impl Node {
                 Err(e) => last = e,
             }
         }
+        for b in &self.mailbox {
+            match self.fetch_box(b, hash).await {
+                Ok(n) => {
+                    progress(n);
+                    return Ok(n);
+                }
+                Err(e) => last = e,
+            }
+        }
         Err(last)
+    }
+
+    /// Downloads a blob a mailbox keeps (the author was offline); the hash checks it.
+    // shortcut: the whole blob in memory (at most MAX_BLOB), no resume; stream it if phones choke.
+    async fn fetch_box(&self, b: &Mailbox, hash: Hash) -> Result<u64> {
+        let r = self.box_get(b, &format!("/blob/{}", hash.to_hex())).await?;
+        ensure!(
+            r.content_length().unwrap_or(0) <= serverbox::MAX_BLOB as u64,
+            "blob too big"
+        );
+        let body = r.bytes().await?;
+        ensure!(Hash::new(&body) == hash, "mailbox gave a wrong blob");
+        let tmp = self.temp()?;
+        std::fs::write(&tmp, &body)?;
+        let added = self.blobs.add_path(&tmp).temp_tag().await;
+        let _ = std::fs::remove_file(&tmp);
+        ensure!(added?.hash() == hash, "mailbox gave a wrong blob");
+        Ok(body.len() as u64)
     }
 
     async fn fetch_from(
@@ -2235,8 +2278,7 @@ impl Node {
     /// Sets this phone's FCM token; it is registered with the mailbox on the next pull.
     pub fn set_push_token(&self, token: String) {
         *self.push_token.lock().unwrap() = Some(token);
-        self.push_registered
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.push_registered.lock().unwrap().clear();
     }
 
     /// Syncs with peers and pulls the mailbox now (the app came to the foreground or got a push).
@@ -2266,13 +2308,11 @@ impl Node {
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
         };
-        let url = format!(
-            "{}/box/{}/{}",
-            b.url,
+        let path = format!(
+            "/box/{}/{}",
             Mailbox::topic(space),
             data_encoding::HEXLOWER.encode(&envelope_id(env))
         );
-        let http = b.http.clone();
         let from = self.push_token.lock().unwrap().clone().unwrap_or_default();
         let to = if chat.is_some() {
             let mine = self.mine();
@@ -2283,24 +2323,45 @@ impl Node {
         } else {
             String::new()
         };
+        let mut h = vec![
+            ("x-push", if push { "1" } else { "0" }.to_string()),
+            ("x-from", from),
+            ("x-to", to),
+        ];
+        h.extend(serverbox::sign(self.net.secret_key(), "POST", &path, &body));
+        Self::post_bg(b, path, h, body);
+    }
+
+    /// POSTs to a mailbox in the background, retrying for about a minute.
+    fn post_bg(b: &Mailbox, path: String, h: Vec<(&'static str, String)>, body: Vec<u8>) {
+        let (http, url) = (b.http.clone(), format!("{}{path}", b.url));
         tokio::spawn(async move {
             for wait in [2, 10, 60, 0] {
-                match http
-                    .post(&url)
-                    .header("x-push", if push { "1" } else { "0" })
-                    .header("x-from", &from)
-                    .header("x-to", &to)
-                    .body(body.clone())
-                    .send()
-                    .await
-                    .and_then(|r| r.error_for_status())
-                {
+                let mut req = http.post(&url).body(body.clone());
+                for (k, v) in &h {
+                    req = req.header(*k, v);
+                }
+                match req.send().await.and_then(|r| r.error_for_status()) {
                     Ok(_) => break,
+                    // A mailbox without blobs (the Cloudflare worker) or a closed server: no retry.
+                    Err(e) if matches!(e.status().map(|s| s.as_u16()), Some(403 | 404 | 413)) => {
+                        eprintln!("mycel: mailbox post refused: {e}");
+                        break;
+                    }
                     Err(e) if wait == 0 => eprintln!("mycel: mailbox post failed: {e}"),
                     Err(_) => tokio::time::sleep(std::time::Duration::from_secs(wait)).await,
                 }
             }
         });
+    }
+
+    /// A signed GET to a mailbox (`path` with its query).
+    async fn box_get(&self, b: &Mailbox, path: &str) -> Result<reqwest::Response> {
+        let mut req = b.http.get(format!("{}{path}", b.url));
+        for (k, v) in serverbox::sign(self.net.secret_key(), "GET", path, &[]) {
+            req = req.header(k, v);
+        }
+        Ok(req.send().await?.error_for_status()?)
     }
 
     /// Pulls the envelopes posted to the mailbox since the last pull into the inbox loop.
@@ -2346,21 +2407,20 @@ impl Node {
         };
         let token = self.push_token.lock().unwrap().clone();
         if let Some(t) = token
-            && !self
-                .push_registered
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self.push_registered.lock().unwrap().contains(&b.url)
         {
             for (space, _) in &topics {
-                b.http
-                    .post(format!("{}/push/{}", b.url, Mailbox::topic(space)))
-                    .header("x-device", Mailbox::device_tag(space, &self.device_id()))
-                    .body(t.clone())
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                let path = format!("/push/{}", Mailbox::topic(space));
+                let mut req = b
+                    .http
+                    .post(format!("{}{path}", b.url))
+                    .header("x-device", Mailbox::device_tag(space, &self.device_id()));
+                for (k, v) in serverbox::sign(self.net.secret_key(), "POST", &path, t.as_bytes()) {
+                    req = req.header(k, v);
+                }
+                req.body(t.clone()).send().await?.error_for_status()?;
             }
-            self.push_registered
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.push_registered.lock().unwrap().insert(b.url.clone());
         }
         for (space, key) in topics {
             let topic = Mailbox::topic(&space);
@@ -2373,13 +2433,9 @@ impl Node {
                 .and_then(|v| v.try_into().ok())
                 .map_or(0, u64::from_le_bytes);
             loop {
-                let url = format!("{}/box/{topic}?after={seq}", b.url);
-                let text = b
-                    .http
-                    .get(url)
-                    .send()
+                let text = self
+                    .box_get(b, &format!("/box/{topic}?after={seq}"))
                     .await?
-                    .error_for_status()?
                     .text()
                     .await?;
                 // One envelope per line: "<seq> <base64 postcard>".
@@ -2607,8 +2663,7 @@ impl Node {
                 let to = to.filter(|p| peer_addr(p).is_some_and(|a| a.id != from));
                 self.broadcast(to.collect(), SyncMsg::Envs(vec![w]));
             }
-            self.push_registered
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.push_registered.lock().unwrap().clear();
             return Ok(postcard::to_allocvec(&JoinResp { welcome, peers })?);
         }
         ensure!(st.admin()? == self.device_id(), "not the admin");
@@ -2879,7 +2934,8 @@ pub async fn spawn_relay(url: &str) -> Result<RelayServer> {
 
 /// An anchor that is also a main server (§4.6): the relay, the username directory (`dir_key`,
 /// `directory.json` in `data`; the relay port answers its id at [`dir::ID_PATH`]) and a mailbox
-/// (the `mailbox/worker.js` API on the relay port, envelopes in `data/box`).
+/// (the `mailbox/worker.js` API on the relay port, envelopes in `data/box`, blobs in
+/// `data/blob`, pushes with `data/fcm.json`, only for `data/allow.json` if it lists anyone).
 #[cfg(not(target_os = "android"))]
 pub async fn spawn_anchor(url: &str, data: &Path) -> Result<RelayServer> {
     let id = Arc::new(std::sync::OnceLock::new());
@@ -2958,14 +3014,14 @@ async fn relay_with(
         loop {
             tokio::select! {
                 Some(_) = conns.join_next() => {}
-                r = listener.accept() => if let Ok((s, _)) = r {
+                r = listener.accept() => if let Ok((s, addr)) = r {
                     let svc = svc.clone();
                     match &boxes {
                         None => {
                             conns.spawn(svc.handle_connection(s, None, std::time::Duration::from_secs(30)));
                         }
                         Some(b) => {
-                            conns.spawn(serve_with_box(s, svc, b.clone()));
+                            conns.spawn(serve_with_box(s, addr.ip(), svc, b.clone()));
                         }
                     }
                 }
@@ -2984,10 +3040,12 @@ async fn relay_with(
 #[cfg(not(target_os = "android"))]
 async fn serve_with_box(
     s: tokio::net::TcpStream,
+    ip: std::net::IpAddr,
     svc: iroh_relay::server::RelayService,
     b: Arc<serverbox::ServerBox>,
 ) {
     let service = BoxSvc {
+        ip,
         relay: iroh_relay::server::http_server::RelayServiceWithNotify::new(
             svc,
             Arc::new(tokio::sync::Notify::new()),
@@ -3006,6 +3064,7 @@ async fn serve_with_box(
 struct BoxSvc {
     relay: iroh_relay::server::http_server::RelayServiceWithNotify,
     b: Arc<serverbox::ServerBox>,
+    ip: std::net::IpAddr,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -3019,7 +3078,7 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for BoxSvc {
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let s = self.clone();
         Box::pin(async move {
-            match serverbox::serve(&s.b, req).await {
+            match serverbox::serve(s.b.clone(), s.ip, req).await {
                 Ok(resp) => Ok(resp),
                 Err(req) => s.relay.call(req).await,
             }

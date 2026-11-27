@@ -8,9 +8,15 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] [--keep-days N]
-                    <http://PUBLIC-IP:PORT | init | id | members | chat | invite | join <link> | serve <relay-url>>
-  http://PUBLIC-IP:PORT: the main server only (no password, no space): relay, username directory
-        and mailbox for offline users, data in DIR (default mycel-data)
+                    <http://PUBLIC-IP:PORT | init | id | members | chat | invite | join <link> | serve <relay-url>
+                     | allow <key|@name> [dir] [box] [files] | deny <key|@name> | allowlist
+                     | backup <file> | restore <file>>
+  http://PUBLIC-IP:PORT: the main server only (no password, no space): relay, username directory,
+        mailbox and media for offline users, phone pushes with DIR/fcm.json (Firebase service
+        account), data in DIR (default mycel-data)
+  allow/deny/allowlist: a closed main server: once DIR/allow.json lists anyone, only they may register
+        a username (dir), use the mailbox (box) and keep media (files); no roles = all three
+  backup/restore: the directory, its key and the allowlist in one file (restore with the server stopped)
   init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat
   serve http://PUBLIC-IP:PORT: run 24/7 as an anchor: an iroh-relay on PORT (TCP) for the members,
         store-and-forward for offline members, events kept --keep-days (default 30),
@@ -35,6 +41,41 @@ async fn main() -> Result<()> {
     }
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
 
+    // Main server administration: files in DIR, applied at once (no restart).
+    match rest[..] {
+        ["allow", who, ref roles @ ..] => {
+            let roles: Vec<String> = roles.iter().map(|r| r.to_string()).collect();
+            println!("allowed {}", mycel_core::allow(&dir, who, &roles)?);
+            return Ok(());
+        }
+        ["deny", who] => {
+            let had = mycel_core::deny(&dir, who)?;
+            println!("{}", if had { "removed" } else { "was not listed" });
+            return Ok(());
+        }
+        ["allowlist"] => {
+            let l = mycel_core::allowlist(&dir)?;
+            if l.is_empty() {
+                println!("empty: the server is open to everyone");
+            }
+            for (who, roles) in l {
+                println!("{who} {}", roles.join(" "));
+            }
+            return Ok(());
+        }
+        ["backup", file] => {
+            let n = mycel_core::backup(&dir, file.as_ref())?;
+            println!("{n} files saved to {file}");
+            return Ok(());
+        }
+        ["restore", file] => {
+            let n = mycel_core::restore(&dir, file.as_ref())?;
+            println!("{n} files restored into {}", dir.display());
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Main server (§4.6): not a member of any space, so no password and no node.
     if let [url] = rest[..]
         && url.starts_with("http")
@@ -43,8 +84,17 @@ async fn main() -> Result<()> {
         let id = s.dir_id().context("directory did not start")?;
         println!(
             "main server up: {url}#{id}
-data in {}; Ctrl+C to stop",
-            dir.display()
+data in {}; pushes {}; allowlist: {}; Ctrl+C to stop",
+            dir.display(),
+            if dir.join("fcm.json").exists() {
+                "on"
+            } else {
+                "off (no fcm.json)"
+            },
+            match mycel_core::allowlist(&dir)?.len() {
+                0 => "empty, open to everyone".to_string(),
+                n => format!("{n} entries"),
+            }
         );
         tokio::signal::ctrl_c().await?;
         return Ok(());

@@ -1,7 +1,8 @@
 //! Username directory on a main server (DESIGN.md §4.6): @username → a signed public contact link.
 //! The server only maps names to links; chats stay end-to-end encrypted and P2P.
 
-use crate::{CONTACT_LINK, Mailbox, Node};
+use crate::serverbox::{Access, Rate};
+use crate::{CONTACT_LINK, Mailbox, Node, hex};
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
 use mycel_crypto::{SecretKey, sign_bytes, verify_bytes};
@@ -190,6 +191,14 @@ impl Db {
     }
 }
 
+/// Username of `key` in the directory kept in `data` (main server side).
+pub(crate) fn name_in(data: &Path, key: &[u8; 32]) -> Option<String> {
+    Db::load(data.join("directory.json"))
+        .ok()?
+        .by_key
+        .remove(key)
+}
+
 /// Directory service of a main server: its own iroh endpoint (stable key in `dir_key`), reached
 /// through the server's relay; records in `directory.json`. Stops when dropped.
 pub struct DirServer {
@@ -228,10 +237,11 @@ impl DirServer {
         let local = format!("http://127.0.0.1:{port}");
         let db = Arc::new(Mutex::new(Db::load(data.join("directory.json"))?));
         let (net, _, _, mut conns) = Net::bind(key, 0, &[local], false).await?;
+        let guard = Arc::new((Access::new(data), Rate::default()));
         let task = tokio::spawn(async move {
             while let Some(conn) = conns.recv().await {
                 if conn.alpn() == DIR_ALPN {
-                    tokio::spawn(serve(conn, db.clone()));
+                    tokio::spawn(serve(conn, db.clone(), guard.clone()));
                 }
             }
         });
@@ -243,10 +253,27 @@ impl DirServer {
     }
 }
 
-async fn serve(conn: Connection, db: Arc<Mutex<Db>>) -> Result<()> {
+/// Error text when the allowlist (`allow.json`) does not let a key register.
+pub const DIR_DENIED: &str = "not allowed on this server";
+/// Error text of a rate limit.
+pub const DIR_BUSY: &str = "too many requests, try later";
+
+async fn serve(conn: Connection, db: Arc<Mutex<Db>>, guard: Arc<(Access, Rate)>) -> Result<()> {
     let (mut s, mut r) = conn.accept_bi().await?;
     let req = r.read_to_end(64 << 10).await?;
+    let (access, rate) = &*guard;
+    // Endpoint ids are free to make: the global cap keeps a flood from one host in check too.
+    let who = conn.remote_id();
     let resp = match postcard::from_bytes::<DirReq>(&req) {
+        _ if !rate.hit(&format!("dir {who}"), 120) || !rate.hit("dir *", 3000) => {
+            DirResp::Err(DIR_BUSY.into())
+        }
+        Ok(DirReq::Register(r)) if !rate.hit(&format!("reg {}", hex(&r.key)), 10) => {
+            DirResp::Err(DIR_BUSY.into())
+        }
+        Ok(DirReq::Register(r)) if !access.allows(Some(&r.key), Some(&r.username), "dir") => {
+            DirResp::Err(DIR_DENIED.into())
+        }
         Ok(req) => db.lock().unwrap().handle(req),
         Err(e) => DirResp::Err(e.to_string()),
     };

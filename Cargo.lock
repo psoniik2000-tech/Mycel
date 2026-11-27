@@ -4355,6 +4355,7 @@ dependencies = [
  "n0-future",
  "postcard",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
