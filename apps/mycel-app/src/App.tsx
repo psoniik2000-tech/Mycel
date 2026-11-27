@@ -23,7 +23,7 @@ import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { groupTitle, mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
-import { DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameBanner, UsernameSettings, withBox, withServer } from "./directory";
+import { Accounts, DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameBanner, UsernameSettings, withBox, withServer } from "./directory";
 import { lastSeen, PrivacySettings } from "./privacy";
 import { mentionIds, mentionText, useMention } from "./mention";
 import { ForwardList } from "./forward";
@@ -239,12 +239,12 @@ function Devices() {
         )}
       </For>
       <Show when={amRoot()}>
-        <button onClick={link}><Link size={18} /> Привязать устройство</button>
+        <button onClick={link}><Plus size={18} /> Добавить устройство</button>
       </Show>
       <Show when={inv()}>
         <div class="card invite">
           <div class="qr" innerHTML={inv()!.svg} />
-          <p class="muted small">На новом устройстве установите Mycel и вставьте эту ссылку вместо приглашения. Ссылка одноразовая</p>
+          <p class="muted small">На новом устройстве установите Mycel, нажмите «Войти по QR или ссылке» и отсканируйте этот QR или вставьте ссылку. Ссылка одноразовая</p>
           <code class="path">{inv()!.link}</code>
           <button onClick={() => navigator.clipboard.writeText(inv()!.link)}><Copy size={18} /> Копировать</button>
         </div>
@@ -404,7 +404,8 @@ export default function App() {
           </Match>
           <Match when={stage() === "main" && s().spaces.find((x) => x.id === s().current)}>
             {(sp) => /* Another space is another node: Main starts over (chats, messages, listeners). */ <Show when={sp().id} keyed>{(_) => <Main dir={s().dir} theme={theme()} setTheme={setTheme} space={sp()} onLeave={leave} refresh={refresh}
-              onEnter={async (id) => { const sp = (await refresh()).spaces.find((x) => x.id === id); if (sp) enter(sp); }} />}</Show>}
+              onEnter={async (id) => { const sp = (await refresh()).spaces.find((x) => x.id === id); if (sp) enter(sp); }}
+              onAdd={async () => { await invoke("close_space"); setPeople([]); await refresh(); enter(); }} />}</Show>}
           </Match>
         </Switch>
       )}
@@ -1104,7 +1105,7 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
   return (
     <Show when={p.how || other()} fallback={
       <div class="center">
-        <QuickStart space={spaceId} color={Math.floor(Math.random() * PALETTE.length)} onDone={p.onDone} onOther={() => setOther(true)} />
+        <QuickStart space={spaceId} color={Math.floor(Math.random() * PALETTE.length)} onDone={p.onDone} onOther={() => setOther(true)} scan={android ? scanQr : undefined} />
       </div>
     }>
     <div class="center">
@@ -1151,7 +1152,7 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
   );
 }
 
-function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void; onEnter: (id: string) => void }) {
+function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void; onEnter: (id: string) => void; onAdd: () => void }) {
   const [del, setDel] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>("chats");
   const [chatOpen, setChatOpen] = createSignal(false);
@@ -1607,6 +1608,9 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
                     <div class="muted small">Имя и аватар<Username id="" me /></div>
                   </div>
                 </button>
+                <Show when={simple()}>
+                  <Accounts current={p.space.id} personal={SIMPLE_NAME} myName={members().find((m) => m.me)?.name} onEnter={enterSpace} onAdd={() => afterCall(p.onAdd)} />
+                </Show>
                 <div class="list">
                   <For each={[
                     ["Оформление", Palette, "Тема, обои, размер текста"],
