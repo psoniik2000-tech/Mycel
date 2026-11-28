@@ -1149,15 +1149,13 @@ async fn unlock(
     });
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            // Another space was opened since: its own loop reports, this one only its call.
+            // Another space was opened since: its own loop reports; this one (in a call) only
+            // notifies and passes on its call's signals.
             let st = app.state::<App>();
             let is = |n: R<Arc<Node>>| n.is_ok_and(|n| Arc::ptr_eq(&n, &node));
             let current = is(st.node());
             if !current && !is(st.call_node()) {
                 break;
-            }
-            if !current && !matches!(ev.body, EventBody::Call { .. }) {
-                continue;
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
             // A mention notifies even in a muted chat.
@@ -1165,6 +1163,11 @@ async fn unlock(
                 && (!spaces::List::arrived(&root, &space, &chat_id(&chat)) || node.mentions_me(&ev))
             {
                 notify(&app, &space, &chat_id(&chat), who, text);
+            }
+            if !current
+                && !matches!(&ev.body, EventBody::Call { call_id, .. } if node.call_id() == Some(*call_id))
+            {
+                continue;
             }
             if let EventBody::Call { call_id, action } = &ev.body {
                 let (action, video) = match action {

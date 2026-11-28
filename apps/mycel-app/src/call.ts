@@ -373,9 +373,11 @@ export class CallMedia {
 
   /** Every 2 s: link stats per participant, then bitrate adaptation by the worst loss. */
   private async poll() {
-    const links = await invoke<{ id: string; rtt: number; loss: number; relay: boolean }[]>("call_stats").catch(() => []);
-    if (this.stopped) return;
+    const links = await invoke<{ id: string; rtt: number; loss: number; relay: boolean }[]>("call_stats").catch(() => undefined);
+    if (this.stopped || !links) return;
     let loss = 0;
+    // A connection gone (someone from outside the call's chat leaves without a signal we see): drop the tile.
+    for (const id of [...this.rx.keys()]) if (!links.some((l) => l.id === id)) this.drop(id);
     for (const l of links) {
       const p = this.peer(l.id); // a silent participant still gets a tile
       p.setNet({ rtt: l.rtt, loss: l.loss, relay: l.relay, kbps: Math.round((p.rxBytes * 8) / 2000) });

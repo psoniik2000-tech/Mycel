@@ -190,7 +190,13 @@ function Voice(p: { src: string; wave: number[]; ms: number; ready: boolean; bus
       <audio ref={audio} src={p.src} preload="auto"
         onPlay={() => { audio.playbackRate = rate(); setPlaying(true); }}
         onPause={() => setPlaying(false)}
-        onEnded={() => { setPlaying(false); setPos(0); }}
+        onEnded={() => {
+          setPlaying(false);
+          setPos(0);
+          // As in Telegram: the next voice message in the chat plays on.
+          const all = [...document.querySelectorAll<HTMLAudioElement>(".voice audio")];
+          all[all.indexOf(audio) + 1]?.play().catch(() => {});
+        }}
         onDurationChange={() => isFinite(audio.duration) && setDur(audio.duration * 1000)}
         onTimeUpdate={() => !audio.paused && setPos(audio.currentTime * 1000)} />
     </div>

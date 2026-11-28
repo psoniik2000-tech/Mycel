@@ -1357,7 +1357,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     const a = active();
     if (c.action === "end") ended.add(c.id + c.author);
     // A stale ring (its End got lost) must not block a new call.
-    if (c.action === "offer" && !ended.has(c.id + c.author) && Date.now() - c.ts < 60_000 && !(incoming() && Date.now() - incoming()!.ts < 60_000)) setIncoming(c);
+    if (c.action === "offer" && a?.id !== c.id && !ended.has(c.id + c.author) && Date.now() - c.ts < 60_000 && !(incoming() && Date.now() - incoming()!.ts < 60_000)) setIncoming(c);
     if ((c.action === "end" || c.action === "reject") && incoming()?.id === c.id && incoming()!.author === c.author) setIncoming(undefined);
     if (a?.id === c.id) {
       if (c.action === "accept") setActive({ ...a, started: a.started || Date.now(), peers: [...new Set([...a.peers, c.author])] });
@@ -1365,14 +1365,20 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
         const peers = a.peers.filter((p) => p !== c.author);
         setActive({ ...a, peers });
         media?.drop(c.device);
-        // Everyone left (or the only other person declined): hang up.
-        if ((a.started && !peers.length) || (c.action === "reject" && (a.chat || members().length <= 2))) endCall();
+        // Everyone left (or the only other person declined): hang up. Someone invited from another
+        // chat sends no signal here, only media: their tile keeps the call (see the effect below).
+        if ((a.started && !peers.length && !tiles().some((t) => t.id !== c.device)) || (c.action === "reject" && (a.chat || members().length <= 2))) endCall();
       }
     }
     if (c.chat === chat()) reload();
     else loadChats();
     loadCalls();
   };
+  // The last tile gone (people outside this chat leave without a signal here) and nobody left: hang up.
+  createEffect(() => {
+    const a = active();
+    if (a?.started && !a.peers.length && !tiles().length) endCall();
+  });
   const pollPeers = () => invoke<number>("peers").then(setPeers);
   onMount(async () => {
     loadMembers();

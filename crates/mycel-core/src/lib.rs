@@ -480,8 +480,8 @@ pub struct Node {
     push_registered: Mutex<HashSet<String>>,
     /// Per chat: (lamport, send time) of the newest own message nobody has confirmed yet.
     unacked: Mutex<HashMap<Chat, (u64, Instant)>>,
-    /// Own messages a mailbox accepted: ✓ even while the partner's phone is off.
-    // shortcut: in memory; after a restart such a message shows ⏱ again until a receipt.
+    /// Own messages a mailbox accepted: ✓ even while the partner's phone is off. Moved to the
+    /// store (`stored:<id>`) by `statuses`, so a restart does not bring ⏱ back.
     stored: Arc<Stored>,
     /// Where incoming typing signals go (`typing_events`).
     typing_tx: Mutex<Option<mpsc::Sender<Typing>>>,
@@ -1763,7 +1763,7 @@ impl Node {
                 let has = |s: Option<u64>| s.is_some_and(|l| l >= e.lamport);
                 let s = if has(read) {
                     2
-                } else if has(delivered) || self.stored.0.lock().unwrap().contains(&e.id) {
+                } else if has(delivered) || self.was_stored(&e.id) {
                     1
                 } else {
                     0
@@ -1771,6 +1771,17 @@ impl Node {
                 (e.id, s)
             })
             .collect())
+    }
+
+    /// A mailbox accepted our event: just now (memory, persisted here) or before a restart (store).
+    fn was_stored(&self, id: &[u8; 32]) -> bool {
+        let key = format!("stored:{}", hex(id));
+        let st = self.st.lock().unwrap();
+        if self.stored.0.lock().unwrap().remove(id) {
+            let _ = st.store.set_meta(&key, &[1]);
+            return true;
+        }
+        st.store.meta(&key).ok().flatten().is_some()
     }
 
     /// Others' messages and calls in the chat newer than my latest Read receipt.

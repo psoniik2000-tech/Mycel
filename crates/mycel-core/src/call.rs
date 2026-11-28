@@ -62,22 +62,22 @@ impl Node {
 
     /// Invites the members of `chat` (a 1:1 chat or another group) to the call we are in.
     pub fn call_invite(&self, chat: &Chat) -> Result<Event> {
-        let (id, secret, video, peers) = {
+        let (id, secret, video, conns) = {
             let g = self.call.lock().unwrap();
             let c = g.as_ref().context("not in a call")?;
-            (
-                c.id,
-                c.secret,
-                c.video,
-                c.conns.keys().copied().collect::<Vec<_>>(),
-            )
+            let conns: Vec<_> = c.conns.keys().map(|p| *p.as_bytes()).collect();
+            (c.id, c.secret, c.video, conns)
         };
+        // Connected ones and those who joined but are still being dialled.
+        let mut all = conns;
+        for p in self.call_members(id)? {
+            if !all.contains(&p) && p != self.device_id() {
+                all.push(p);
+            }
+        }
         let peers = {
             let st = self.st.lock().unwrap();
-            peers
-                .iter()
-                .filter_map(|p| st.store.peer(p.as_bytes()).ok())
-                .collect()
+            all.iter().filter_map(|p| st.store.peer(p).ok()).collect()
         };
         let action = CallAction::Invite {
             video,
@@ -200,6 +200,24 @@ impl Node {
             .collect())
     }
 
+    /// Sends a fresh Invite to every chat we invited into call `id`.
+    fn reinvite(&self, id: [u8; 16]) -> Result<()> {
+        let me = self.device_id();
+        let mut chats = vec![];
+        for (chat, e) in self.all_events()? {
+            if e.author_device == me
+                && matches!(e.body, EventBody::Call { call_id, action: CallAction::Invite { .. } } if call_id == id)
+                && !chats.contains(&chat)
+            {
+                chats.push(chat);
+            }
+        }
+        for chat in chats {
+            self.call_invite(&chat)?;
+        }
+        Ok(())
+    }
+
     /// Reacts to a peer's Call event: dial a newcomer (if we are the smaller id), drop a leaver.
     pub(crate) fn on_call_event(self: &Arc<Self>, ev: &Event) {
         let EventBody::Call { call_id, action } = &ev.body else {
@@ -214,10 +232,28 @@ impl Node {
             return;
         };
         match action {
-            CallAction::Accept if self.device_id() < ev.author_device => {
-                if !c.conns.contains_key(&peer) {
-                    drop(g);
+            CallAction::Accept => {
+                let dial = self.device_id() < ev.author_device && !c.conns.contains_key(&peer);
+                drop(g);
+                if dial {
                     self.dial(call_id, ev.author_device, None);
+                }
+                // Those we invited do not see this Accept: tell them who is in now.
+                if let Err(e) = self.reinvite(call_id) {
+                    eprintln!("mycel: re-invite failed: {e}");
+                }
+            }
+            // A fresh list from the inviter: dial whoever joined since (they do not know us).
+            CallAction::Invite { peers, .. } => {
+                let me = self.device_id();
+                let new: Vec<_> = peers
+                    .iter()
+                    .filter_map(|a| crate::peer_addr(a))
+                    .filter(|a| *a.id.as_bytes() != me && !c.conns.contains_key(&a.id))
+                    .collect();
+                drop(g);
+                for a in new {
+                    self.dial(call_id, *a.id.as_bytes(), Some(a));
                 }
             }
             CallAction::End | CallAction::Reject => {
