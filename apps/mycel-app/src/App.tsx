@@ -8,7 +8,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import {
   ArrowLeft, Bell, BellOff, EllipsisVertical, Camera, Check, CheckCheck, ChevronDown, ChevronUp, CircleCheck, Clock, Contact, Copy, Forward, Hash, Link, Lock as LockIcon, LogOut, MessageCircle, Mic, MicOff, Paperclip, Pencil, Phone, PhoneMissed, PhoneOff, Pin, PinOff, Plus, Reply, Search, Send,
-  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer, SwitchCamera,
+  Settings, ShieldAlert, Smile, ShieldCheck, Trash2, UserMinus, UserPlus, ScreenShare, ScreenShareOff, Users, Video, VideoOff, X, ChevronRight, Database, Layers, Monitor, Palette, Wifi, Archive, ArchiveRestore, Smartphone, Timer, SwitchCamera,
   EyeOff,
 } from "lucide-solid";
 import logo from "../app-icon.svg";
@@ -2194,6 +2194,16 @@ function Chat(p: {
         sendFiles(e.payload.paths);
       } else setDrag(e.payload.type !== "leave");
     });
+    // Ctrl+V of a screenshot or copied files: the same as attaching them.
+    const paste = async (e: ClipboardEvent) => {
+      const files = [...(e.clipboardData?.files ?? [])];
+      if (!files.length) return;
+      e.preventDefault();
+      const paths = await Promise.all(files.map(async (f) =>
+        invoke<string>("stash", new Uint8Array(await f.arrayBuffer()), { headers: { name: encodeURIComponent(f.name || "image.png") } })));
+      sendFiles(paths);
+    };
+    document.addEventListener("paste", paste);
     const esc = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || view()) return; // the viewer closes itself
       if (toSend().length) return setToSend([]);
@@ -2206,6 +2216,7 @@ function Chat(p: {
     addEventListener("keydown", esc);
     onCleanup(() => {
       un();
+      document.removeEventListener("paste", paste);
       removeEventListener("keydown", esc);
     });
   });
@@ -2251,8 +2262,8 @@ function Chat(p: {
       if (!send) vib(50); // a deliberate cancel ticks; a too-short press is dropped
       return r.cancel();
     }
-    vib(30);
     const blob = await r.stop();
+    vib(30); // after the mic closes: Android mutes haptics while audio is being recorded
     const kind = video() ? "videonote" : "voice";
     const wave = kind === "voice" ? await waveform(blob) : [];
     const body = new Uint8Array(await blob.arrayBuffer());
@@ -2273,13 +2284,13 @@ function Chat(p: {
     clearTimeout(holdTimer);
     holdTimer = window.setTimeout(async () => {
       holdTimer = 0;
+      vib(30); // before the mic opens: Android mutes haptics while audio is being recorded
       try {
         const r = await record(video());
         if (!holding || id !== holdId) return r.cancel();
         setRec(r);
         setElapsed(0);
         red = false;
-        vib(30);
         if (video()) preview.srcObject = r.stream;
         meter(r.stream);
         tick = window.setInterval(() => {
@@ -2815,6 +2826,30 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
   const [gear, setGear] = createSignal(false);
   const [camErr, setCamErr] = createSignal(p.media.camErr);
   const [front, setFront] = createSignal(true);
+  const [screen, setScreen] = createSignal(p.media.screen);
+  const [adding, setAdding] = createSignal(false);
+  const [invited, setInvited] = createSignal<string[]>([]);
+  const [addErr, setAddErr] = createSignal("");
+  p.media.onScreenEnd = () => setScreen(false);
+  const toggleScreen = async () => {
+    setCamErr("");
+    try {
+      await p.media.setScreen(!screen());
+      setScreen(!screen());
+    } catch (e) {
+      // Closing the picker is not an error.
+      if ((e as Error)?.name !== "NotAllowedError") setCamErr(`Демонстрация экрана: ${e}`);
+    }
+  };
+  const invite = async (id: string) => {
+    setAddErr("");
+    try {
+      await invoke("call_invite", { chat: id });
+      setInvited([...invited(), id]);
+    } catch (e) {
+      setAddErr(String(e));
+    }
+  };
   const t = setInterval(() => setNow(Date.now()), 250);
   onCleanup(() => clearInterval(t));
   // Ringback until someone answers.
@@ -2865,7 +2900,7 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
           <div class="tile"><span class="muted">{p.a.started ? "Соединяемся…" : "Ждём ответа"}</span></div>
         </Show>
       </div>
-      <Show when={cam()}>
+      <Show when={cam() || screen()}>
         <video class="self" classList={{ back: !front() }} autoplay muted playsinline ref={(v) => (v.srcObject = p.media.local)} />
       </Show>
       <Show when={camErr()}><p class="error call-err">{camErr()}</p></Show>
@@ -2875,11 +2910,35 @@ function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () =
         <button class="round" classList={{ off: !cam() }} onClick={toggleCam}
           title={cam() ? "Выключить камеру" : "Включить камеру"}>{cam() ? <Video size={24} /> : <VideoOff size={24} />}</button>
         <Show when={android && cam()}><button class="round" onClick={flip} title="Сменить камеру"><SwitchCamera size={24} /></button></Show>
+        <Show when={!android}>
+          <button class="round" classList={{ off: screen() }} onClick={toggleScreen}
+            title={screen() ? "Остановить демонстрацию" : "Демонстрация экрана или окна"}>{screen() ? <ScreenShareOff size={24} /> : <ScreenShare size={24} />}</button>
+        </Show>
+        <button class="round" onClick={() => (setAddErr(""), setAdding(true))} title="Добавить в звонок"><UserPlus size={24} /></button>
         <button class="round" classList={{ off: gear() }} onClick={() => setGear(!gear())} title="Голос и видео"><Settings size={24} /></button>
         <button class="round hang" onClick={p.onEnd} title="Завершить"><PhoneOff size={24} /></button>
       </div>
       <Show when={gear()}>
         <div class="call-settings scroll pad"><VoiceSettings /></div>
+      </Show>
+      <Show when={adding()}>
+        <div class="modal" onClick={() => setAdding(false)}>
+          <div class="card dialog" onClick={(e) => e.stopPropagation()}>
+            <h3>Добавить в звонок</h3>
+            <div class="dialog-list">
+              <For each={people().filter((m) => !m.me && !m.removed)} fallback={<p class="muted">Некого добавить</p>}>
+                {(m) => (
+                  <button class="row chat-row" disabled={invited().includes(m.id)} onClick={() => invite(m.id)}>
+                    <Avatar id={m.id} /><b class="ellipsis">{nameOf(m.id)}</b>
+                    <Show when={invited().includes(m.id)}><span class="muted">Звоним…</span></Show>
+                  </button>
+                )}
+              </For>
+            </div>
+            <Show when={addErr()}><p class="error">{addErr()}</p></Show>
+            <button onClick={() => setAdding(false)}>Готово</button>
+          </div>
+        </div>
       </Show>
     </div>
     </Show>

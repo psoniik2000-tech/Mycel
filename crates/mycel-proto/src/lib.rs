@@ -270,12 +270,21 @@ pub enum ReceiptKind {
     Read,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallAction {
-    Offer { video: bool },
+    Offer {
+        video: bool,
+    },
     Accept,
     Reject,
     End,
+    /// An invite to a running call, sent in the invitee's own chat with the inviter: the call's
+    /// secret (frame keys) and the addresses of the participants already in it.
+    Invite {
+        video: bool,
+        secret: [u8; 32],
+        peers: Vec<Vec<u8>>,
+    },
 }
 
 #[cfg(test)]

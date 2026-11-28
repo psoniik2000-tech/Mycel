@@ -206,7 +206,7 @@ fn note(n: &Node, ev: &Event, chat: &Chat) -> Option<(String, String)> {
     let mut who = name_of(n, &ev.author_device);
     let text = match ev.body.msg() {
         EventBody::Call {
-            action: CallAction::Offer { .. },
+            action: CallAction::Offer { .. } | CallAction::Invite { .. },
             ..
         } => return Some((who, "Входящий звонок".into())),
         EventBody::Text { text, .. } if ev.body.sticker().is_some() => format!("{text} Стикер"),
@@ -669,7 +669,7 @@ fn name_of(n: &Node, dev: &[u8; 32]) -> String {
 fn msg(n: &Node, ev: &Event, cx: &Ctx) -> Option<Msg> {
     if let EventBody::Call {
         call_id,
-        action: CallAction::Offer { .. },
+        action: CallAction::Offer { .. } | CallAction::Invite { .. },
     } = &ev.body
     {
         let c = cx.calls.get(&hex(call_id))?.clone();
@@ -812,14 +812,17 @@ fn calls(n: &Node, hist: &[Event], chat: &str) -> HashMap<String, CallView> {
         };
         let id = hex(call_id);
         let devs = inside.entry(id.clone()).or_default();
-        if matches!(action, CallAction::Offer { .. } | CallAction::Accept) {
+        if matches!(
+            action,
+            CallAction::Offer { .. } | CallAction::Accept | CallAction::Invite { .. }
+        ) {
             devs.insert(e.author_device);
         } else {
             devs.remove(&e.author_device);
         }
         let active = !devs.is_empty();
         match action {
-            CallAction::Offer { video } => {
+            CallAction::Offer { video } | CallAction::Invite { video, .. } => {
                 out.insert(
                     id.clone(),
                     CallView {
@@ -1165,7 +1168,9 @@ async fn unlock(
             }
             if let EventBody::Call { call_id, action } = &ev.body {
                 let (action, video) = match action {
-                    CallAction::Offer { video } => ("offer", *video),
+                    CallAction::Offer { video } | CallAction::Invite { video, .. } => {
+                        ("offer", *video)
+                    }
                     CallAction::Accept => ("accept", false),
                     CallAction::Reject => ("reject", false),
                     CallAction::End => ("end", false),
@@ -2060,6 +2065,13 @@ async fn call_accept(st: State<'_, App>, id: String) -> R<Vec<String>> {
     Ok(others.filter(|m| *m != me).map(|m| short(&m)).collect())
 }
 
+/// Invites the members of `chat` to the call we are in (people outside the call's chat too).
+#[tauri::command]
+async fn call_invite(st: State<'_, App>, chat: String) -> R<()> {
+    let n = &st.call_node()?;
+    n.call_invite(&chat_of(n, &chat)?).map(|_| ()).map_err(err)
+}
+
 #[tauri::command]
 async fn call_reject(st: State<'_, App>, id: String) -> R<()> {
     st.node()?
@@ -2644,6 +2656,7 @@ pub fn run() {
             call_start,
             call_accept,
             call_reject,
+            call_invite,
             call_end,
             call_send,
             call_listen,

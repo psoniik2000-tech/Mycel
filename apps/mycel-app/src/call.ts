@@ -120,6 +120,8 @@ export class CallMedia {
   local = new MediaStream();
   mic = true;
   cam = false;
+  screen = false; // the video track is a screen or window instead of the camera
+  onScreenEnd?: () => void; // sharing stopped from the system's own control
   facing: "user" | "environment" = "user";
   camErr = ""; // why the camera asked for at start did not turn on
   private ctx = new AudioContext({ sampleRate: 48000 });
@@ -213,6 +215,7 @@ export class CallMedia {
 
   /** Camera on/off; the camera is opened on first use (an audio call can turn it on). */
   async setCam(on: boolean) {
+    if (this.screen) return void (this.cam = on); // applied when the sharing stops
     let t = this.local.getVideoTracks()[0];
     if (on && !t) {
       // A chosen device wins; otherwise the front / back camera (phones).
@@ -225,6 +228,27 @@ export class CallMedia {
     this.cam = on;
     if (t) t.enabled = on;
     this.forceKey = on;
+  }
+
+  /** Screen sharing: the system picker chooses a screen or a window; it replaces the camera track. */
+  async setScreen(on: boolean) {
+    let t: MediaStreamTrack | undefined;
+    if (on) {
+      const s = await navigator.mediaDevices.getDisplayMedia({ video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 15 } }, audio: false });
+      t = s.getVideoTracks()[0];
+      t.onended = () => {
+        if (this.screen && this.local.getVideoTracks()[0] === t) this.setScreen(false).then(() => this.onScreenEnd?.());
+      };
+    }
+    const old = this.local.getVideoTracks()[0];
+    old?.stop(); // ends its pumpVideo loop
+    if (old) this.local.removeTrack(old);
+    this.screen = on;
+    if (t) {
+      this.local.addTrack(t);
+      this.bitrate = Math.max(this.bitrate, 1_000_000); // text needs more than a face
+      this.pumpVideo(t);
+    } else if (this.cam) await this.setCam(true).catch(() => (this.cam = false));
   }
 
   /** Front ⇄ back camera: the old track is stopped (its pump ends) and the other one opened. */
@@ -338,7 +362,7 @@ export class CallMedia {
       if (!enc || enc.state === "closed" || this.vcfg?.width !== f.displayWidth || this.vcfg?.height !== f.displayHeight || (soft && this.vcfg.hardwareAcceleration !== "prefer-software"))
         open(f.displayWidth, f.displayHeight);
       // Busy encoder (slow PC): skip a frame rather than build up delay.
-      if (this.cam && enc!.state === "configured" && enc!.encodeQueueSize < 2) {
+      if ((this.cam || this.screen) && enc!.state === "configured" && enc!.encodeQueueSize < 2) {
         enc!.encode(f, { keyFrame: this.forceKey || n++ % KEY_EVERY === 0 });
         this.forceKey = false;
       }
@@ -364,7 +388,8 @@ export class CallMedia {
     if (Math.abs(k - this.kbps) >= 2) this.setKbps(Math.round(k));
     // Video.
     if (!this.venc || !this.vcfg || this.venc.state !== "configured") return;
-    const b = loss > 0.05 ? Math.max(150_000, this.bitrate * 0.7) : loss < 0.01 ? Math.min(1_200_000, this.bitrate * 1.1) : this.bitrate;
+    const max = this.screen ? 2_000_000 : 1_200_000;
+    const b = loss > 0.05 ? Math.max(150_000, this.bitrate * 0.7) : loss < 0.01 ? Math.min(max, this.bitrate * 1.1) : this.bitrate;
     if (Math.abs(b - this.bitrate) < 20_000) return;
     this.bitrate = Math.round(b);
     this.venc.configure((this.vcfg = { ...this.vcfg, bitrate: this.bitrate }));

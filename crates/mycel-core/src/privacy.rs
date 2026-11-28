@@ -295,8 +295,8 @@ impl Node {
     pub(crate) fn screen_call(&self, ev: &Event) -> bool {
         let EventBody::Call {
             call_id,
-            action: CallAction::Offer { .. },
-        } = ev.body
+            action: CallAction::Offer { .. } | CallAction::Invite { .. },
+        } = &ev.body
         else {
             return false;
         };
@@ -311,7 +311,7 @@ impl Node {
         if ok.unwrap_or(false) {
             return false;
         }
-        if let Err(e) = self.call_reject(call_id) {
+        if let Err(e) = self.call_reject(*call_id) {
             eprintln!("mycel: call reject failed: {e}");
         }
         true

@@ -135,3 +135,72 @@ async fn five_calls_in_a_row_both_ways() {
         while fb.try_recv().is_ok() {}
     }
 }
+
+/// A call in A↔B's private chat; A invites C through A↔C's chat (C is not in the call's chat):
+/// C rings, accepts, and media flows between C and B, who share no chat with the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_into_running_call() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = vec![];
+    for (i, d) in dirs.iter().enumerate() {
+        nodes.push(
+            Node::open(d.path(), &format!("p{i}"), &Opts::default())
+                .await
+                .unwrap(),
+        );
+    }
+    let mut it = nodes.into_iter();
+    let ((a, _ra), (b, mut rx_b), (c, mut rx_c)) =
+        (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+    let (a, b, c) = (&a, &b, &c);
+    a.create_space().unwrap();
+    b.join(&a.invite().await.unwrap()).await.unwrap();
+    c.join(&a.invite().await.unwrap()).await.unwrap();
+    for _ in 0..150 {
+        if [a, b, c].iter().all(|n| n.members().len() == 3) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for n in [a, b, c] {
+        n.set_profile("x", "", 1).unwrap();
+    }
+    // Key packages (with the profiles) arrive after the join.
+    for p in [b.device_id(), c.device_id()] {
+        let mut r = a.open_dm(p);
+        for _ in 0..150 {
+            if r.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            r = a.open_dm(p);
+        }
+        r.unwrap();
+    }
+    let (fb, fc) = (&mut b.call_frames(), &mut c.call_frames());
+    let (id, _) = a.call_offer(&Some(b.device_id()), false).unwrap();
+    assert_eq!(recv_call(&mut rx_b).await.0, id);
+    b.call_accept(id).unwrap();
+    exchange(a, fb, AUDIO, b"a").await;
+
+    a.call_invite(&Some(c.device_id())).unwrap();
+    let (got, action) = recv_call(&mut rx_c).await;
+    assert_eq!(got, id);
+    assert!(matches!(action, CallAction::Invite { .. }));
+    c.call_accept(id).unwrap();
+
+    let f = loop {
+        let f = exchange(b, fc, AUDIO, b"from-b").await;
+        if f.from == b.device_id() {
+            break f;
+        }
+    };
+    assert_eq!(f.data, b"from-b");
+    let f = loop {
+        let f = exchange(c, fb, AUDIO, b"from-c").await;
+        if f.from == c.device_id() {
+            break f;
+        }
+    };
+    assert_eq!(f.data, b"from-c");
+}

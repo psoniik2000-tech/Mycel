@@ -1,6 +1,7 @@
 package org.mycel.app
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -16,12 +17,10 @@ object Haptics {
     } else {
       context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
     }
-    when {
-      // The device's own tuned "click": many phones drop a 20-50 ms one-shot as too short to feel.
-      Build.VERSION.SDK_INT >= 29 ->
-        v.vibrate(VibrationEffect.createPredefined(if (ms >= 50) VibrationEffect.EFFECT_HEAVY_CLICK else VibrationEffect.EFFECT_CLICK))
-      Build.VERSION.SDK_INT >= 26 -> v.vibrate(VibrationEffect.createOneShot(maxOf(ms, 40), 255))
-      else -> v.vibrate(maxOf(ms, 40))
-    }
+    // Alarm usage: touch-class haptics are dropped by the "touch feedback" setting and by many
+    // vendor ROMs; one firm one-shot, long enough to feel on any motor.
+    val alarm = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build()
+    if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createOneShot(maxOf(ms, 50), 255), alarm)
+    else v.vibrate(maxOf(ms, 50), alarm)
   }
 }

@@ -2154,7 +2154,8 @@ impl Node {
             || matches!(
                 body,
                 EventBody::Call {
-                    action: mycel_proto::CallAction::Offer { .. },
+                    action: mycel_proto::CallAction::Offer { .. }
+                        | mycel_proto::CallAction::Invite { .. },
                     ..
                 }
             );
@@ -2947,7 +2948,8 @@ fn is_incoming(b: &EventBody) -> bool {
         || matches!(
             b,
             EventBody::Call {
-                action: mycel_proto::CallAction::Offer { .. },
+                action: mycel_proto::CallAction::Offer { .. }
+                    | mycel_proto::CallAction::Invite { .. },
                 ..
             }
         )
