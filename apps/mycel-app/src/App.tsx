@@ -1737,7 +1737,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       </Show>
       {/* After the call screen: a new call rings on top of an active one. */}
       <Show when={incoming()}>
-        <Incoming c={incoming()!} onAccept={acceptCall} onReject={rejectCall} />
+        <Incoming c={incoming()!} onAccept={() => acceptCall()} onReject={rejectCall} />
       </Show>
     </div>
   );
