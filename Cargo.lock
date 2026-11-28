@@ -4300,6 +4300,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "mycel-core",
+ "serde_json",
  "tokio",
 ]
 

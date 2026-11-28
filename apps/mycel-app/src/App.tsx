@@ -1388,6 +1388,7 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     const unStatus = await listen<[string, number][]>("status", (e) => {
       const st = new Map(e.payload);
       setMsgs((all) => all.map((m) => (st.has(m.id) && st.get(m.id) !== m.status ? { ...m, status: st.get(m.id)! } : m)));
+      loadChats(); // the row's tick
     });
     await reload();
     const onVis = () => {
@@ -2546,7 +2547,7 @@ function Chat(p: {
                           <Show when={m.mine}>
                             <Switch>
                               <Match when={status() === 0}><span title="Отправляется"><Clock size={14} /></span></Match>
-                              <Match when={status() === 1}><span title="Доставлено"><Check size={14} /></span></Match>
+                              <Match when={status() === 1}><span title="Отправлено"><Check size={14} /></span></Match>
                               <Match when={status() === 2}><span title="Прочитано"><CheckCheck size={14} /></span></Match>
                             </Switch>
                           </Show>

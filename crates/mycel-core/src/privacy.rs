@@ -272,10 +272,15 @@ impl Node {
                 hidden: false,
             };
         }
+        // "Online" is repeated every sync; an old one is from an app killed while on screen, and a
+        // phone woken by a push would flash it until its fresh report arrives.
+        let fresh = now_ms()
+            .unwrap_or(0)
+            .saturating_sub(2 * crate::RESYNC.as_millis() as u64);
         Presence {
-            online: reports
-                .iter()
-                .any(|(d, r)| r.online && r.at.is_some() && self.link(d).0.is_some()),
+            online: reports.iter().any(|(d, r)| {
+                r.online && r.at.is_some() && r.got >= fresh && self.link(d).0.is_some()
+            }),
             seen: reports.iter().filter_map(|(_, r)| r.at).max(),
             hidden: false,
         }

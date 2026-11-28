@@ -479,6 +479,9 @@ pub struct Node {
     push_registered: Mutex<HashSet<String>>,
     /// Per chat: (lamport, send time) of the newest own message nobody has confirmed yet.
     unacked: Mutex<HashMap<Chat, (u64, Instant)>>,
+    /// Own messages a mailbox accepted: ✓ even while the partner's phone is off.
+    // shortcut: in memory; after a restart such a message shows ⏱ again until a receipt.
+    stored: Arc<Stored>,
     /// Where incoming typing signals go (`typing_events`).
     typing_tx: Mutex<Option<mpsc::Sender<Typing>>>,
     /// Per chat: when we last sent a typing signal and whether it was voice.
@@ -486,6 +489,10 @@ pub struct Node {
     /// The app is on screen (`set_active`).
     active: std::sync::atomic::AtomicBool,
 }
+
+/// Own messages a mailbox accepted, and the chat of the latest one (`stored_events`).
+#[derive(Default)]
+struct Stored(Mutex<HashSet<[u8; 32]>>, tokio::sync::watch::Sender<Chat>);
 
 /// A member is typing (or recording a voice message, `voice`) in a chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,6 +616,7 @@ impl Node {
             push_token: Mutex::new(None),
             push_registered: Default::default(),
             unacked: Default::default(),
+            stored: Default::default(),
             typing_tx: Default::default(),
             typing_sent: Default::default(),
             active: Default::default(),
@@ -1754,7 +1762,7 @@ impl Node {
                 let has = |s: Option<u64>| s.is_some_and(|l| l >= e.lamport);
                 let s = if has(read) {
                     2
-                } else if has(delivered) {
+                } else if has(delivered) || self.stored.0.lock().unwrap().contains(&e.id) {
                     1
                 } else {
                     0
@@ -1887,7 +1895,7 @@ impl Node {
             let path = format!("/blob/{}", hash.to_hex());
             let h = serverbox::sign(self.net.secret_key(), "POST", &path, &body);
             for b in &self.mailbox {
-                Self::post_bg(b, path.clone(), h.clone(), body.clone());
+                Self::post_bg(b, path.clone(), h.clone(), body.clone(), None);
             }
         }
         self.blobs.tags().set(hex(hash.as_bytes()), hash).await?;
@@ -2180,7 +2188,7 @@ impl Node {
                 .unwrap()
                 .insert(*chat, (ev.lamport, Instant::now()));
         }
-        self.post_box(&env, push, *chat);
+        self.post_box_ev(&env, push, *chat, Some(ev.id));
         self.broadcast(peers, SyncMsg::Envs(vec![env]));
         Ok(ev)
     }
@@ -2386,17 +2394,32 @@ impl Node {
     /// For a 1:1 chat the push goes to every device of the partner. Callers holding the state
     /// lock pass `chat: None`.
     fn post_box(&self, env: &Envelope, push: bool, chat: Chat) {
-        self.post_box_at(env, &env.space_id, push, chat)
+        self.post_box_ev(env, push, chat, None)
+    }
+
+    /// `post_box`; a mailbox that takes it marks event `ev` stored (✓).
+    fn post_box_ev(&self, env: &Envelope, push: bool, chat: Chat, ev: Option<[u8; 32]>) {
+        for b in &self.mailbox {
+            self.post_box_to(b, env, &env.space_id, push, chat, ev);
+        }
     }
 
     /// `post_box` to the mailbox topic of `space` (our other devices pull our space's topic).
     fn post_box_at(&self, env: &Envelope, space: &[u8], push: bool, chat: Chat) {
         for b in &self.mailbox {
-            self.post_box_to(b, env, space, push, chat);
+            self.post_box_to(b, env, space, push, chat, None);
         }
     }
 
-    fn post_box_to(&self, b: &Mailbox, env: &Envelope, space: &[u8], push: bool, chat: Chat) {
+    fn post_box_to(
+        &self,
+        b: &Mailbox,
+        env: &Envelope,
+        space: &[u8],
+        push: bool,
+        chat: Chat,
+        ev: Option<[u8; 32]>,
+    ) {
         let Ok(body) = postcard::to_allocvec(env) else {
             return;
         };
@@ -2421,11 +2444,18 @@ impl Node {
             ("x-to", to),
         ];
         h.extend(serverbox::sign(self.net.secret_key(), "POST", &path, &body));
-        Self::post_bg(b, path, h, body);
+        let done = ev.map(|e| (self.stored.clone(), e, chat));
+        Self::post_bg(b, path, h, body, done);
     }
 
     /// POSTs to a mailbox in the background, retrying for about a minute.
-    fn post_bg(b: &Mailbox, path: String, h: Vec<(&'static str, String)>, body: Vec<u8>) {
+    fn post_bg(
+        b: &Mailbox,
+        path: String,
+        h: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+        done: Option<(Arc<Stored>, [u8; 32], Chat)>,
+    ) {
         let (http, url) = (b.http.clone(), format!("{}{path}", b.url));
         tokio::spawn(async move {
             for wait in [2, 10, 60, 0] {
@@ -2434,7 +2464,13 @@ impl Node {
                     req = req.header(*k, v);
                 }
                 match req.send().await.and_then(|r| r.error_for_status()) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        if let Some((s, id, chat)) = done {
+                            s.0.lock().unwrap().insert(id);
+                            s.1.send_replace(chat);
+                        }
+                        break;
+                    }
                     // A mailbox without blobs (the Cloudflare worker) or a closed server: no retry.
                     Err(e) if matches!(e.status().map(|s| s.as_u16()), Some(403 | 404 | 413)) => {
                         eprintln!("mycel: mailbox post refused: {e}");
@@ -2591,6 +2627,11 @@ impl Node {
     }
 
     /// Incoming typing signals go to the returned receiver (replacing an older one).
+    /// Changes with the chat of each own message a mailbox accepts (its tick moves to ✓).
+    pub fn stored_events(&self) -> tokio::sync::watch::Receiver<Chat> {
+        self.stored.1.subscribe()
+    }
+
     pub fn typing_events(&self) -> mpsc::Receiver<Typing> {
         let (tx, rx) = mpsc::channel(64);
         *self.typing_tx.lock().unwrap() = Some(tx);

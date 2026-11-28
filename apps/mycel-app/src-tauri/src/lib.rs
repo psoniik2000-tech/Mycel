@@ -1087,6 +1087,13 @@ async fn unlock(
         relays,
         mailbox,
     });
+    let (mut stored, app2, node2) = (node.stored_events(), app.clone(), node.clone());
+    tauri::async_runtime::spawn(async move {
+        while stored.changed().await.is_ok() {
+            let chat = *stored.borrow_and_update();
+            let _ = app2.emit("status", statuses(&node2, &chat));
+        }
+    });
     let (mut typing, app2, node2) = (node.typing_events(), app.clone(), node.clone());
     tauri::async_runtime::spawn(async move {
         while let Some(t) = typing.recv().await {

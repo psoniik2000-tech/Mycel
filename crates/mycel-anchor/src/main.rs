@@ -7,13 +7,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] [--keep-days N]
+mod panel;
+mod update;
+
+const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] [--keep-days N] [--panel PORT] [--no-update]
                     <http://PUBLIC-IP:PORT | init | id | members | chat | invite | join <link> | serve <relay-url>
                      | allow <key|@name> [dir] [box] [files] | deny <key|@name> | allowlist
                      | backup <file> | restore <file>>
   http://PUBLIC-IP:PORT: the main server only (no password, no space): relay, username directory,
         mailbox and media for offline users, phone pushes with DIR/fcm.json (Firebase service
-        account), data in DIR (default mycel-data)
+        account), data in DIR (default mycel-data); a control panel on http://127.0.0.1:3341
+        (--panel PORT, 0 = off); updates itself from the GitHub releases (--no-update: never)
   allow/deny/allowlist: a closed main server: once DIR/allow.json lists anyone, only they may register
         a username (dir), use the mailbox (box) and keep media (files); no roles = all three
   backup/restore: the directory, its key and the allowlist in one file (restore with the server stopped)
@@ -28,6 +32,7 @@ async fn main() -> Result<()> {
     let mut dir = PathBuf::from("mycel-data");
     let mut opts = Opts::default();
     let mut keep_days = 30u64;
+    let (mut panel_port, mut auto_update) = (3341u16, true);
     let mut rest = vec![];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -36,6 +41,8 @@ async fn main() -> Result<()> {
             "--port" => opts.port = args.next().unwrap_or_default().parse()?,
             "--n0-relay" => opts.n0 = true,
             "--keep-days" => keep_days = args.next().unwrap_or_default().parse()?,
+            "--panel" => panel_port = args.next().unwrap_or_default().parse()?,
+            "--no-update" => auto_update = false,
             _ => rest.push(a),
         }
     }
@@ -80,6 +87,10 @@ async fn main() -> Result<()> {
     if let [url] = rest[..]
         && url.starts_with("http")
     {
+        // Started by an update: the old process is still letting go of the port.
+        if std::env::var_os("MYCEL_RESTARTED").is_some() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
         let s = mycel_core::spawn_anchor(url, &dir).await?;
         let id = s.dir_id().context("directory did not start")?;
         println!(
@@ -96,6 +107,23 @@ data in {}; pushes {}; allowlist: {}; Ctrl+C to stop",
                 n => format!("{n} entries"),
             }
         );
+        println!("version {}", update::VERSION);
+        if panel_port != 0 {
+            let p = panel::Panel {
+                dir: dir.clone(),
+                url: url.to_string(),
+                id: id.to_string(),
+                started: std::time::Instant::now(),
+            };
+            tokio::spawn(async move {
+                if let Err(e) = panel::run(p, panel_port).await {
+                    eprintln!("control panel failed: {e:#}");
+                }
+            });
+        }
+        if auto_update {
+            tokio::spawn(update::auto());
+        }
         tokio::signal::ctrl_c().await?;
         return Ok(());
     }
