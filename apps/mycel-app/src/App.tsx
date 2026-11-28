@@ -97,6 +97,12 @@ const anchor = (space?: string | null) => (simple() ? null : ls("anchor", space)
     keys.forEach((k) => localStorage.removeItem(k));
     localStorage.setItem("anchor_auto", "0");
   } else if (!mode() && keys.length) setMode("spaces");
+  // 0.2.3: the main server is its own program on port 3340 now; an anchor kept from back then took
+  // that port before it (and every time it restarts). Off once more; Settings → Связь turns it on.
+  if (!localStorage.getItem("anchor_off_023")) {
+    keys.forEach((k) => localStorage.removeItem(k));
+    localStorage.setItem("anchor_off_023", "1");
+  }
 }
 // Backup public relays (n0's test servers): used besides the main n0 ones; editable in Settings → Связь.
 const DEFAULT_RELAYS = ["https://euc1-1.staging-relay.n0.iroh.link", "https://use1-1.staging-relay.n0.iroh.link"];

@@ -100,7 +100,7 @@ async fn api(p: &Panel, method: &str, path: &str, body: &str) -> Result<(&'stati
             let names = std::fs::read_to_string(p.dir.join("directory.json"))
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v["names"].as_object().map(|m| m.len()))
+                .and_then(|v| v.as_object().map(|m| m.len()))
                 .unwrap_or(0);
             let allow: Vec<_> = mycel_core::allowlist(&p.dir)?
                 .into_iter()
