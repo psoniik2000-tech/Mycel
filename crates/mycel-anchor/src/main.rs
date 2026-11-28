@@ -18,6 +18,8 @@ const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] 
         mailbox and media for offline users, phone pushes with DIR/fcm.json (Firebase service
         account), data in DIR (default mycel-data); a control panel on http://127.0.0.1:3341
         (--panel PORT, 0 = off); updates itself from the GitHub releases (--no-update: never)
+  no arguments (a double click): the main server with the address in DIR/server.txt (asked on the
+        first start), data beside the exe, the panel opens in the browser
   allow/deny/allowlist: a closed main server: once DIR/allow.json lists anyone, only they may register
         a username (dir), use the mailbox (box) and keep media (files); no roles = all three
   cluster: other main servers that serve as one with this one (each must list the others): they copy
@@ -29,8 +31,76 @@ const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] 
         and the username directory (mycel/dir/1, data in DIR)
   --n0-relay: also use the public n0 relays (off by default)";
 
+/// Started by a double click: no arguments. An error stays on screen until Enter.
 #[tokio::main]
 async fn main() -> Result<()> {
+    let clicked = std::env::args().len() == 1;
+    let r = run(clicked).await;
+    if clicked && let Err(e) = &r {
+        eprintln!(
+            "
+Ошибка: {e:#}
+Нажмите Enter, чтобы закрыть."
+        );
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    r
+}
+
+/// Double click: the address saved in DIR/server.txt, asked once on the first start.
+fn saved_url(dir: &std::path::Path) -> Result<String> {
+    let f = dir.join("server.txt");
+    if let Ok(u) = std::fs::read_to_string(&f)
+        && !u.trim().is_empty()
+    {
+        return Ok(u.trim().to_string());
+    }
+    println!("Первый запуск главного сервера Mycel.");
+    println!("Введите внешний IP этого ПК (или адрес с портом, например 5.130.50.199:3340):");
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    let s = s.trim().trim_end_matches('/');
+    anyhow::ensure!(!s.is_empty(), "адрес не введён");
+    let s = if s.starts_with("http") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    };
+    // No port after the host: the default one.
+    let url = if s
+        .rsplit_once(':')
+        .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
+    {
+        s
+    } else {
+        format!("{s}:3340")
+    };
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&f, &url)?;
+    println!(
+        "Сохранено в {} — в следующий раз сервер запустится сразу.
+",
+        f.display()
+    );
+    Ok(url)
+}
+
+/// The control panel in the default browser.
+fn open_browser(url: &str) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(not(windows))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    let _ = r;
+}
+
+async fn run(clicked: bool) -> Result<()> {
+    // Data beside the exe, wherever the click (or autostart) started it.
+    if clicked && let Some(d) = std::env::current_exe()?.parent() {
+        std::env::set_current_dir(d)?;
+    }
     let mut dir = PathBuf::from("mycel-data");
     let mut opts = Opts::default();
     let mut keep_days = 30u64;
@@ -47,6 +117,9 @@ async fn main() -> Result<()> {
             "--no-update" => auto_update = false,
             _ => rest.push(a),
         }
+    }
+    if clicked {
+        rest.push(saved_url(&dir)?);
     }
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
 
@@ -147,6 +220,10 @@ data in {}; pushes {}; allowlist: {}; Ctrl+C to stop",
         }
         if auto_update {
             tokio::spawn(update::auto());
+        }
+        // Not again after an update restart.
+        if clicked && panel_port != 0 && std::env::var_os("MYCEL_RESTARTED").is_none() {
+            open_browser(&format!("http://127.0.0.1:{panel_port}"));
         }
         tokio::signal::ctrl_c().await?;
         return Ok(());
