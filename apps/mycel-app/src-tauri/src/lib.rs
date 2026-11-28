@@ -18,9 +18,10 @@ mod vault;
 
 type R<T> = Result<T, String>;
 
-/// The open space: one node at a time, swapped without restarting the app.
+/// The open space: one node at a time, swapped without restarting the app. The second slot keeps
+/// the space left during a call open in the background until that call ends.
 #[derive(Default)]
-struct App(Mutex<Option<Open>>);
+struct App(Mutex<Option<Open>>, Mutex<Option<Open>>);
 
 struct Open {
     node: Arc<Node>,
@@ -152,10 +153,34 @@ impl App {
         self.0.lock().unwrap().as_ref().is_some_and(|o| o.id == id)
     }
 
-    /// Ends the call and closes the open node, if any.
+    /// Closes the open node, if any; one in a call moves to the background slot instead.
     async fn close(&self) {
-        let open = self.0.lock().unwrap().take();
-        if let Some(o) = open {
+        let Some(o) = self.0.lock().unwrap().take() else {
+            return;
+        };
+        let o = match o.node.call_id() {
+            Some(_) => match self.1.lock().unwrap().replace(o) {
+                Some(old) => old,
+                None => return,
+            },
+            None => o,
+        };
+        let _ = o.node.call_end();
+        o.node.close().await;
+    }
+
+    /// The node holding the call: the background one, else the open one.
+    fn call_node(&self) -> R<Arc<Node>> {
+        match self.1.lock().unwrap().as_ref() {
+            Some(o) => Ok(o.node.clone()),
+            None => self.node(),
+        }
+    }
+
+    /// Ends the background call and closes its node.
+    async fn end_bg(&self) {
+        let bg = self.1.lock().unwrap().take();
+        if let Some(o) = bg {
             let _ = o.node.call_end();
             o.node.close().await;
         }
@@ -1024,6 +1049,17 @@ async fn unlock(
     (list.n0, list.relays, list.mailbox) = (n0, relays.clone(), mailbox.clone());
     list.save(&root).map_err(|e| e.to_string())?;
     st.close().await;
+    // Back to the space whose call runs in the background: its node is still open.
+    let bg = st.1.lock().unwrap().take_if(|o| o.id == id);
+    if let Some(o) = bg {
+        if o.anchor == anchor && o.n0 == n0 && o.relays == relays && o.mailbox == mailbox {
+            let admin = o.node.admin().is_ok();
+            *st.0.lock().unwrap() = Some(o);
+            return Ok(admin);
+        }
+        let _ = o.node.call_end();
+        o.node.close().await;
+    }
     #[cfg(not(target_os = "android"))]
     match &anchor {
         Some(u) => {
@@ -1110,10 +1146,15 @@ async fn unlock(
     });
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            // Another space was opened since: its own loop reports.
-            let current = app.state::<App>().node();
-            if !current.is_ok_and(|n| Arc::ptr_eq(&n, &node)) {
+            // Another space was opened since: its own loop reports, this one only its call.
+            let st = app.state::<App>();
+            let is = |n: R<Arc<Node>>| n.is_ok_and(|n| Arc::ptr_eq(&n, &node));
+            let current = is(st.node());
+            if !current && !is(st.call_node()) {
                 break;
+            }
+            if !current && !matches!(ev.body, EventBody::Call { .. }) {
+                continue;
             }
             let chat = node.event(&ev.id).map(|e| e.0).unwrap_or(None);
             // A mention notifies even in a muted chat.
@@ -1997,6 +2038,7 @@ async fn calls_list(st: State<'_, App>) -> R<Vec<CallView>> {
 /// 📞/📹: sends an Offer to a chat (space chat: group call; 1:1 chat: just that member); returns the call id.
 #[tauri::command]
 async fn call_start(st: State<'_, App>, chat: String, video: bool) -> R<String> {
+    st.end_bg().await;
     let n = &st.node()?;
     Ok(hex(&n
         .call_offer(&chat_of(n, &chat)?, video)
@@ -2010,6 +2052,7 @@ async fn call_accept(st: State<'_, App>, id: String) -> R<Vec<String>> {
     let n = &st.node()?;
     let id = call_id(&id)?;
     // Answering while still in another call: leave that one.
+    st.end_bg().await;
     n.call_end().map_err(err)?;
     n.call_accept(id).map_err(err)?;
     let me = n.device_id();
@@ -2034,6 +2077,10 @@ async fn typing(st: State<'_, App>, chat: String, voice: bool) -> R<()> {
 
 #[tauri::command]
 async fn call_end(st: State<'_, App>) -> R<()> {
+    if st.1.lock().unwrap().is_some() {
+        st.end_bg().await;
+        return Ok(());
+    }
     st.node()?.call_end().map(|_| ()).map_err(err)
 }
 
@@ -2046,13 +2093,13 @@ async fn call_send(st: State<'_, App>, request: tauri::ipc::Request<'_>) -> R<()
         .get("kind")
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .ok_or("no kind")?;
-    st.node()?.call_send(kind, data).map_err(err)
+    st.call_node()?.call_send(kind, data).map_err(err)
 }
 
 /// Incoming frames go to `ch` as raw bytes: kind (1), sender short id (4), seq (8, BE), data.
 #[tauri::command]
 async fn call_listen(st: State<'_, App>, ch: Channel<InvokeResponseBody>) -> R<()> {
-    let mut rx = st.node()?.call_frames();
+    let mut rx = st.call_node()?.call_frames();
     tauri::async_runtime::spawn(async move {
         while let Some(f) = rx.recv().await {
             let mut b = vec![f.kind];
@@ -2079,7 +2126,7 @@ struct Link {
 #[tauri::command]
 async fn call_stats(st: State<'_, App>) -> R<Vec<Link>> {
     Ok(st
-        .node()?
+        .call_node()?
         .call_stats()
         .into_iter()
         .map(|l| Link {
@@ -2147,6 +2194,9 @@ async fn remove_space(app: AppHandle, st: State<'_, App>, id: String) -> R<()> {
     let root = data_dir(&app)?;
     if st.is_open(&id) {
         st.close().await;
+    }
+    if st.1.lock().unwrap().as_ref().is_some_and(|o| o.id == id) {
+        st.end_bg().await;
     }
     let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
     list.spaces.retain(|s| s.id != id);

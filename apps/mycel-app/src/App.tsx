@@ -1158,6 +1158,10 @@ function Onboard(p: { how?: How; setHow: (h: How) => void; link: string; setLink
   );
 }
 
+const [active, setActive] = createSignal<Active>();
+const [tiles, setTiles] = createSignal<Peer[]>([]);
+let media: CallMedia | undefined;
+
 function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; space: Space; onLeave: () => void; refresh: () => void; onEnter: (id: string) => void; onAdd: () => void }) {
   const [del, setDel] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>("chats");
@@ -1284,12 +1288,10 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     setChatOpen(true);
   };
 
-  // Calls (§9): `incoming` rings full screen; `active` is the call screen (started = 0 while ringing out).
+  // Calls (§9): `incoming` rings full screen; `active` (module level: a call outlives a space
+  // switch, its node stays open in the background) is the call screen (started = 0 while ringing out).
   const [incoming, setIncoming] = createSignal<CallSignal>();
-  const [active, setActive] = createSignal<Active>();
   const [callErr, setCallErr] = createSignal("");
-  let media: CallMedia | undefined;
-  const [tiles, setTiles] = createSignal<Peer[]>([]);
   const endCall = async () => {
     media?.stop();
     media = undefined;
@@ -1298,14 +1300,8 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     await invoke("call_end").catch(() => {});
     reload();
   };
-  // Another space closes this one's node, and the call with it: ask, then hang up while it can still be told.
-  const afterCall = async (go: () => void) => {
-    if (active()) {
-      if (!(await ask("Звонок завершится. Продолжить?", { title: "Звонок", okLabel: "Завершить звонок", cancelLabel: "Отмена" }))) return;
-      await endCall();
-    }
-    go();
-  };
+  // The call goes on in another space: the app keeps this space's node open until it ends.
+  const afterCall = (go: () => void) => go();
   const enterSpace = (id: string) => afterCall(() => {
     const r = rows().find((x) => !x.id);
     if (r?.last) lastMsg.set(p.space.id, { text: preview(r), ts: r.last.ts });
@@ -1423,7 +1419,6 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
       unCall();
       unTyping();
       unStatus();
-      media && endCall();
       wideQuery.removeEventListener("change", onWide);
       removeEventListener("focus", onFocus);
       removeEventListener("blur", onBlur);
@@ -2815,7 +2810,7 @@ function CallTop(p: { onMini: () => void; label: string }) {
 function CallScreen(p: { a: Active; tiles: Peer[]; media: CallMedia; onEnd: () => void }) {
   const [mini, setMini] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
-  const [mic, setMic] = createSignal(true);
+  const [mic, setMic] = createSignal(p.media.mic);
   const [cam, setCam] = createSignal(p.media.cam);
   const [gear, setGear] = createSignal(false);
   const [camErr, setCamErr] = createSignal(p.media.camErr);
