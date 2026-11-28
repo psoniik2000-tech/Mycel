@@ -50,6 +50,15 @@
     </div>
   </section>
   <section>
+    <h2>Кластер</h2>
+    <p class="muted">Другие главные серверы, которые работают вместе с этим: копируют друг у друга имена, а приложения пользуются всеми — если один выключен, работают остальные. Добавьте ссылку того сервера здесь, а ссылку этого — в его панели.</p>
+    <table id="cluster"></table>
+    <div class="row" style="margin-top:10px">
+      <input id="peer" placeholder="http://адрес:порт#id" size="40">
+      <button id="addPeer">Добавить</button>
+    </div>
+  </section>
+  <section>
     <h2>Резервная копия</h2>
     <p class="muted">Каталог имён, его ключ и список доступа одним файлом. Восстановление: <code>mycel-server restore файл</code> при остановленном сервере.</p>
     <button id="backup">Скачать</button>
@@ -72,6 +81,7 @@ async function load() {
   const rows = [["Версия", s.version], ["Адрес", s.url], ["Ссылка сервера", s.url + "#" + s.id], ["Работает", up(s.uptime)],
     ["Push-уведомления", s.push ? "включены" : "выключены (нет fcm.json)"], ["Имён в каталоге", s.names], ["Данные", gb(s.bytes) + " — " + s.dir]];
   $("status").replaceChildren(...rows.flatMap(([k, v]) => { const a = document.createElement("span"), b = document.createElement("span"); a.textContent = k; b.innerHTML = ""; const c = document.createElement("code"); c.textContent = v; b.append(c); return [a, b]; }));
+  showCluster(s.cluster);
   $("openNote").textContent = s.allow.length ? "Сервер закрыт: пользоваться могут только эти аккаунты." : "Список пуст — сервер открыт для всех. Добавьте кого-нибудь, чтобы закрыть.";
   $("allow").replaceChildren(...s.allow.map((e) => {
     const tr = document.createElement("tr"), a = document.createElement("td"), b = document.createElement("td"), c = document.createElement("td");
@@ -82,6 +92,22 @@ async function load() {
     c.append(x); tr.append(a, b, c); return tr;
   }));
 }
+function showCluster(list) {
+  $("cluster").replaceChildren(...list.map((link) => {
+    const tr = document.createElement("tr"), a = document.createElement("td"), c = document.createElement("td");
+    a.innerHTML = "<code></code>"; a.firstChild.textContent = link;
+    const x = document.createElement("button"); x.className = "ghost"; x.textContent = "Убрать";
+    x.onclick = async () => { await call("POST", "/api/cluster-remove", link); load(); };
+    c.append(x); tr.append(a, c); return tr;
+  }));
+  if (!list.length) { const tr = document.createElement("tr"), td = document.createElement("td"); td.className = "muted"; td.textContent = "Пока один сервер"; tr.append(td); $("cluster").append(tr); }
+}
+$("addPeer").onclick = async () => {
+  const v = $("peer").value.trim();
+  if (!v) return;
+  try { await call("POST", "/api/cluster-add", v); $("peer").value = ""; say("Добавлен. Не забудьте добавить этот сервер в панели того."); load(); }
+  catch (e) { say(e.message); }
+};
 async function checkUpdate() {
   try {
     const v = await (await call("GET", "/api/update")).json();

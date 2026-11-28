@@ -2558,6 +2558,7 @@ pub fn run() {
             create_space,
             join,
             directory::dir_register,
+            directory::dir_cluster,
             directory::dir_search,
             directory::dir_add,
             directory::dir_name_of,

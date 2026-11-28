@@ -43,6 +43,8 @@ pub(crate) struct ServerBox {
     rate: Rate,
     #[cfg(not(target_os = "android"))]
     fcm: Option<crate::fcm::Fcm>,
+    /// This server's `url#id`, once the directory runs (`/cluster`).
+    pub(crate) me: std::sync::OnceLock<String>,
 }
 
 struct Inner {
@@ -298,6 +300,7 @@ impl ServerBox {
             rate: Rate::default(),
             #[cfg(not(target_os = "android"))]
             fcm: crate::fcm::Fcm::load(&data.join("fcm.json"))?,
+            me: Default::default(),
         };
         b.prune(crate::now_ms()?)?;
         Ok(b)
@@ -508,6 +511,19 @@ pub(crate) async fn serve(
     // (kind, requests per minute per IP and per key, role).
     let (kind, max, role) = match (&m, &parts[..]) {
         (&Method::GET, ["", ""]) => return Ok(text(200, "Mycel mailbox works (main server)")),
+        (&Method::GET, ["", "cluster"]) => {
+            return Ok(text(200, &crate::cluster::members(&b.data, b.me.get())));
+        }
+        // The whole directory, unlisted names too: only for the cluster's servers.
+        (&Method::GET, ["", "dir", "all"]) => {
+            return Ok(match signer(req.headers(), "GET", &pq, &[]) {
+                Ok(Some(k)) if crate::cluster::peer_ids(&b.data).contains(&k) => {
+                    let f = std::fs::read(b.data.join("directory.json"));
+                    reply(200, f.unwrap_or_else(|_| b"{}".to_vec()).into())
+                }
+                _ => text(403, "not a server of this cluster"),
+            });
+        }
         (&Method::POST, ["", "push", _]) => ("push", 20, "box"),
         (&Method::GET, ["", "box", _]) | (&Method::POST, ["", "box", _, _]) => ("box", 600, "box"),
         (&Method::GET | &Method::POST, ["", "blob", _]) => ("blob", 120, "files"),

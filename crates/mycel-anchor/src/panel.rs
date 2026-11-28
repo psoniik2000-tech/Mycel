@@ -116,6 +116,7 @@ async fn api(p: &Panel, method: &str, path: &str, body: &str) -> Result<(&'stati
                 "bytes": size(&p.dir),
                 "dir": p.dir.display().to_string(),
                 "allow": allow,
+                "cluster": mycel_core::cluster::peers(&p.dir),
             }))
         }
         ("POST", "/api/allow") => {
@@ -124,6 +125,12 @@ async fn api(p: &Panel, method: &str, path: &str, body: &str) -> Result<(&'stati
             let roles: Vec<String> = w.map(str::to_string).collect();
             json(serde_json::json!(mycel_core::allow(&p.dir, who, &roles)?))
         }
+        ("POST", "/api/cluster-add") => json(serde_json::json!(mycel_core::cluster::add_peer(
+            &p.dir, body
+        )?)),
+        ("POST", "/api/cluster-remove") => json(serde_json::json!(
+            mycel_core::cluster::remove_peer(&p.dir, body)?
+        )),
         ("POST", "/api/deny") => json(serde_json::json!(mycel_core::deny(&p.dir, body)?)),
         ("GET", "/api/backup") => {
             let f = std::env::temp_dir().join(format!("mycel-backup-{}.bin", std::process::id()));

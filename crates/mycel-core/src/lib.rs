@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 pub mod backup;
 mod call;
+pub mod cluster;
 pub mod dir;
 #[cfg(not(target_os = "android"))]
 mod fcm;
@@ -3081,9 +3082,11 @@ pub async fn spawn_relay(url: &str) -> Result<RelayServer> {
 pub async fn spawn_anchor(url: &str, data: &Path) -> Result<RelayServer> {
     let id = Arc::new(std::sync::OnceLock::new());
     let boxes = Arc::new(serverbox::ServerBox::open(data)?);
-    let mut relay = relay_with(url, Some(id.clone()), Some(boxes)).await?;
+    let mut relay = relay_with(url, Some(id.clone()), Some(boxes.clone())).await?;
     let d = dir::DirServer::spawn(data, url).await?;
     let _ = id.set(d.id().to_string());
+    let u: RelayUrl = url.parse()?;
+    let _ = boxes.me.set(dir::pinned(&u, &d.id()));
     relay.dir = Some(d);
     Ok(relay)
 }

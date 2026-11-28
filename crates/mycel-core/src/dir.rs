@@ -244,11 +244,14 @@ pub(crate) fn name_in(data: &Path, key: &[u8; 32]) -> Option<String> {
 pub struct DirServer {
     net: Net,
     task: tokio::task::JoinHandle<()>,
+    /// Copies the cluster peers' records (`cluster.rs`).
+    sync: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for DirServer {
     fn drop(&mut self) {
         self.task.abort();
+        self.sync.abort();
         // A restarted server binds the same key: the old endpoint must leave the relay.
         let net = self.net.clone();
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -276,7 +279,8 @@ impl DirServer {
             .context("relay url without port")?;
         let local = format!("http://127.0.0.1:{port}");
         let db = Arc::new(Mutex::new(Db::load(data.join("directory.json"))?));
-        let (net, _, _, mut conns) = Net::bind(key, 0, &[local], false).await?;
+        let (net, _, _, mut conns) = Net::bind(key.clone(), 0, &[local], false).await?;
+        let sync = tokio::spawn(sync_peers(data.to_path_buf(), key, db.clone()));
         let guard = Arc::new((Access::new(data), Rate::default()));
         let task = tokio::spawn(async move {
             while let Some(conn) = conns.recv().await {
@@ -285,12 +289,42 @@ impl DirServer {
                 }
             }
         });
-        Ok(Self { net, task })
+        Ok(Self { net, task, sync })
     }
 
     pub fn id(&self) -> EndpointId {
         self.net.id()
     }
+}
+
+/// Every [`crate::cluster::SYNC`]: each peer's records that are new here (the same rules as a
+/// registration: the owner's signature, first come first served, newer wins).
+// shortcut: a name taken on two servers between syncs stays split (each keeps its first owner).
+async fn sync_peers(data: PathBuf, key: SecretKey, db: Arc<Mutex<Db>>) {
+    loop {
+        tokio::time::sleep(crate::cluster::SYNC).await;
+        for p in crate::cluster::peers(&data) {
+            if let Err(e) = sync_one(&p, &key, &db).await {
+                eprintln!("mycel: cluster sync with {p} failed: {e:#}");
+            }
+        }
+    }
+}
+
+async fn sync_one(peer: &str, key: &SecretKey, db: &Mutex<Db>) -> Result<()> {
+    let (url, _) = crate::cluster::parse(peer)?;
+    let b = Mailbox::new(&url)?;
+    let mut req = b.http.get(format!("{url}/dir/all"));
+    for (k, v) in crate::serverbox::sign(key, "GET", "/dir/all", &[]) {
+        req = req.header(k, v);
+    }
+    let body = req.send().await?.error_for_status()?.bytes().await?;
+    let names: BTreeMap<String, DirRecord> = serde_json::from_slice(&body)?;
+    let mut db = db.lock().unwrap();
+    for r in names.into_values() {
+        let _ = db.register(r); // taken, stale or already here
+    }
+    Ok(())
 }
 
 /// Error text when the allowlist (`allow.json`) does not let a key register.
@@ -358,7 +392,19 @@ pub fn pinned(url: &RelayUrl, id: &EndpointId) -> String {
 }
 
 impl Node {
+    /// `server`: one or more main servers (a cluster, by spaces); the first that answers serves.
     async fn dir_call(&self, server: &str, req: &DirReq) -> Result<(String, DirResp)> {
+        let mut last = anyhow::anyhow!("no main server set");
+        for s in server.split_whitespace() {
+            match self.dir_call_one(s, req).await {
+                Err(e) if e.to_string().contains("unreachable") => last = e,
+                r => return r,
+            }
+        }
+        Err(last)
+    }
+
+    async fn dir_call_one(&self, server: &str, req: &DirReq) -> Result<(String, DirResp)> {
         let (url, id) = resolve(server).await?;
         let addr = EndpointAddr::new(id).with_relay_url(url.clone());
         let call = async {

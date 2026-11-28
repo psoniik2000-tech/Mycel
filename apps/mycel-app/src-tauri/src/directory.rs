@@ -34,6 +34,12 @@ pub async fn dir_register(st: State<'_, App>, server: String, username: String) 
         .map_err(dir_err)
 }
 
+/// All servers of the main server's cluster (`url#id`), the setting itself if none answers.
+#[tauri::command]
+pub async fn dir_cluster(server: String) -> Vec<String> {
+    mycel_core::cluster::members_of(&server).await
+}
+
 #[tauri::command]
 pub async fn dir_search(
     st: State<'_, App>,

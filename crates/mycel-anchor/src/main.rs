@@ -13,13 +13,15 @@ mod update;
 const USAGE: &str = "usage: mycel-anchor [--dir DIR] [--port PORT] [--n0-relay] [--keep-days N] [--panel PORT] [--no-update]
                     <http://PUBLIC-IP:PORT | init | id | members | chat | invite | join <link> | serve <relay-url>
                      | allow <key|@name> [dir] [box] [files] | deny <key|@name> | allowlist
-                     | backup <file> | restore <file>>
+                     | backup <file> | restore <file> | cluster [add <url#id> | remove <url>]>
   http://PUBLIC-IP:PORT: the main server only (no password, no space): relay, username directory,
         mailbox and media for offline users, phone pushes with DIR/fcm.json (Firebase service
         account), data in DIR (default mycel-data); a control panel on http://127.0.0.1:3341
         (--panel PORT, 0 = off); updates itself from the GitHub releases (--no-update: never)
   allow/deny/allowlist: a closed main server: once DIR/allow.json lists anyone, only they may register
         a username (dir), use the mailbox (box) and keep media (files); no roles = all three
+  cluster: other main servers that serve as one with this one (each must list the others): they copy
+        each other's usernames, and apps use them all, so the service lives on while one is off
   backup/restore: the directory, its key and the allowlist in one file (restore with the server stopped)
   init: create a space (you are its admin); invite: print a one-time link, then chat; join: enter a space, then chat
   serve http://PUBLIC-IP:PORT: run 24/7 as an anchor: an iroh-relay on PORT (TCP) for the members,
@@ -68,6 +70,28 @@ async fn main() -> Result<()> {
             for (who, roles) in l {
                 println!("{who} {}", roles.join(" "));
             }
+            return Ok(());
+        }
+        ["cluster"] => {
+            let l = mycel_core::cluster::peers(&dir);
+            if l.is_empty() {
+                println!(
+                    "no other servers: add one with `cluster add <url#id>` (it prints at start)"
+                );
+            }
+            for p in l {
+                println!("{p}");
+            }
+            return Ok(());
+        }
+        ["cluster", "add", link] => {
+            println!("added {}", mycel_core::cluster::add_peer(&dir, link)?);
+            println!("now add this server on that one too");
+            return Ok(());
+        }
+        ["cluster", "remove", url] => {
+            let had = mycel_core::cluster::remove_peer(&dir, url)?;
+            println!("{}", if had { "removed" } else { "was not listed" });
             return Ok(());
         }
         ["backup", file] => {

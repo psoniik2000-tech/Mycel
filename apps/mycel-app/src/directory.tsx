@@ -5,14 +5,23 @@ import { AtSign, Camera, Check, CircleUser, Hash, LogIn, MessageCircle, Plus, Qr
 import { rich } from "./rich";
 import { groupTitle } from "./simple";
 
-/** The main server: an anchor that also keeps the username directory. `url#id` once pinned. */
+/** The main server: an anchor that also keeps the username directory. `url#id` once pinned;
+ *  a cluster is several, by spaces (the first that answers serves). */
 export const DEFAULT_SERVER = "http://5.130.50.199:3340";
 export const server = () => localStorage.getItem("server") || DEFAULT_SERVER;
-const serverUrl = () => server().split("#")[0];
-/** The main server's relay is used in every space too. */
-export const withServer = (relays: string[]) => (relays.includes(serverUrl()) ? relays : [...relays, serverUrl()]);
-/** ...and keeps envelopes for everyone offline, besides the user's mailbox (which wakes phones). */
-export const withBox = (mailbox: string | null) => [...new Set([mailbox, serverUrl()].filter((m): m is string => !!m))].join(" ");
+const urlOf = (s: string) => s.split("#")[0];
+const serverUrls = () => server().split(/\s+/).filter(Boolean).map(urlOf);
+/** The main servers' relays are used in every space too. */
+export const withServer = (relays: string[]) => [...new Set([...relays, ...serverUrls()])];
+/** ...and keep envelopes for everyone offline, besides the user's mailbox (which wakes phones). */
+export const withBox = (mailbox: string | null) => [...new Set([mailbox, ...serverUrls()].filter((m): m is string => !!m))].join(" ");
+/** Adds the other servers of the cluster to the setting (used from the next start). */
+const learnCluster = async () => {
+  const cur = server().split(/\s+/).filter(Boolean);
+  const have = new Set(cur.map(urlOf));
+  const add = (await invoke<string[]>("dir_cluster", { server: server() })).filter((m) => !have.has(urlOf(m)));
+  if (add.length) localStorage.setItem("server", [...cur, ...add].join(" "));
+};
 const errText = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e));
 const norm = (u: string) => u.trim().replace(/^@/, "").toLowerCase();
 export const validUsername = (u: string) => /^[a-z0-9_]{5,32}$/.test(norm(u));
@@ -23,7 +32,10 @@ const names = new Map<string, Promise<string | null>>();
 /** Registers (or renames to) `username`; the server's answer pins its id on first use. */
 export async function register(space: string, username: string) {
   const pinned = await invoke<string>("dir_register", { server: server(), username: norm(username) });
-  if (!server().includes("#") && pinned.startsWith(serverUrl() + "#")) localStorage.setItem("server", pinned);
+  // Pin the id of the server that answered.
+  const all = server().split(/\s+/).filter(Boolean);
+  const next = all.map((s) => (s === urlOf(pinned) ? pinned : s)).join(" ");
+  if (next !== all.join(" ")) localStorage.setItem("server", next);
   localStorage.setItem(userKey(space), norm(username));
   names.set("", Promise.resolve(norm(username)));
 }
@@ -34,7 +46,10 @@ export const refreshRegistration = async (space: string) => {
   if (u) await register(space, u);
 };
 /** At every start, quietly: addresses change. */
-export const keepRegistered = (space: string) => void refreshRegistration(space).catch(() => {});
+export const keepRegistered = (space: string) => {
+  void refreshRegistration(space).catch(() => {});
+  void learnCluster().catch(() => {});
+};
 
 export const usernameOf = (id: string) => {
   if (!names.has(id)) names.set(id, invoke<string | null>("dir_name_of", { server: server(), id }).catch(() => null));
