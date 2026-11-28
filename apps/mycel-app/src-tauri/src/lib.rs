@@ -2369,6 +2369,9 @@ async fn backup(
             None => without.push(s.name),
         }
     }
+    if with.is_empty() {
+        return Err("Откройте аккаунт или пространство перед созданием копии".into());
+    }
     let out = out_path(to, &format!("mycel-{}.mycelbak", spaces::new_id()));
     let o = out.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2427,53 +2430,67 @@ async fn restore_backup(app: AppHandle, path: String, password: String, phrase: 
     let made = Arc::new(Mutex::new(Vec::<String>::new()));
     let m = made.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
-        mycel_core::backup::restore(Path::new(&path), &pw, &pw, |name| {
-            let mut list = spaces::List::load(&r)?;
+        let names = mycel_core::backup::restore(Path::new(&path), &pw, &pw, |name| {
             let id = spaces::new_id();
-            list.spaces.push(spaces::Space {
-                id: id.clone(),
-                name: name.into(),
-                muted: vec![],
-                pinned: vec![],
-                archived: vec![],
-                hidden: vec![],
-                removed: vec![],
-            });
-            if m.lock().unwrap().is_empty() {
-                list.last = Some(id.clone());
-            }
             // Listed before the folder exists, so List::load never takes it for an orphan.
-            list.save(&r)?;
+            spaces::List::edit(&r, |list| {
+                list.spaces.push(spaces::Space {
+                    id: id.clone(),
+                    name: name.into(),
+                    muted: vec![],
+                    pinned: vec![],
+                    archived: vec![],
+                    hidden: vec![],
+                    removed: vec![],
+                });
+            })?;
             m.lock().unwrap().push(id.clone());
             Ok(spaces::dir(&r, &id))
-        })
+        })?;
+        anyhow::ensure!(!names.is_empty(), "В копии нет пространств");
+        anyhow::Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+    .and_then(|r| {
+        r.map_err(|e| {
+            if e.to_string() == mycel_core::backup::BAD_PASSWORD {
+                if phrase {
+                    "Эта фраза не открывает копию. Проверьте порядок слов и способ шифрования файла"
+                        .into()
+                } else {
+                    "Неверный пароль или файл повреждён".into()
+                }
+            } else {
+                err(e)
+            }
+        })
+    });
     let made = made.lock().unwrap().clone();
-    if let Err(e) = res {
-        let mut list = spaces::List::load(&root).map_err(|e| e.to_string())?;
-        list.spaces.retain(|s| !made.contains(&s.id));
-        if list.last.as_ref().is_some_and(|l| made.contains(l)) {
-            list.last = None;
-        }
-        list.save(&root).map_err(|e| e.to_string())?;
+    let res = res.and_then(|()| {
         for id in &made {
+            vault::save(&root, id, &password)?;
+        }
+        if phrase && vault::load(&root, PHRASE).is_none() {
+            vault::save(&root, PHRASE, &password)?;
+        }
+        spaces::List::edit(&root, |list| list.last = made.first().cloned())
+            .map_err(|e| e.to_string())
+    });
+    if res.is_err() && !made.is_empty() {
+        spaces::List::edit(&root, |list| {
+            list.spaces.retain(|s| !made.contains(&s.id));
+            if list.last.as_ref().is_some_and(|l| made.contains(l)) {
+                list.last = None;
+            }
+        })
+        .map_err(|e| e.to_string())?;
+        for id in &made {
+            vault::forget(&root, id);
             let _ = std::fs::remove_dir_all(spaces::dir(&root, id));
         }
-        return Err(if e.to_string() == mycel_core::backup::BAD_PASSWORD {
-            "Неверный пароль или файл повреждён".into()
-        } else {
-            err(e)
-        });
     }
-    for id in &made {
-        vault::save(&root, id, &password)?;
-    }
-    if phrase {
-        vault::save(&root, PHRASE, &password)?;
-    }
-    Ok(())
+    res
 }
 
 fn esc(s: &str) -> String {

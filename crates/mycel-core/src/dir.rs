@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
 use mycel_crypto::{SecretKey, sign_bytes, verify_bytes};
 use mycel_net::{Connection, DIR_ALPN, EndpointAddr, EndpointId, EndpointTicket, Net, RelayUrl};
+use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -522,11 +523,31 @@ impl Node {
 
     /// Finds `name` and adds it as a contact unless we already chat; returns the chat partner.
     pub async fn dir_add(&self, server: &str, name: &str) -> Result<[u8; 32]> {
-        let rec = self
+        let mut rec = self
             .dir_lookup(server, name)
             .await?
             .context("no such username")?;
         rec.check()?;
+        // A mirror can still point to an older device between directory syncs.
+        let mut lookups: n0_future::FuturesUnordered<_> = server
+            .split_whitespace()
+            .skip(1)
+            .map(|s| self.dir_lookup(s, name))
+            .collect();
+        // A slow mirror must not delay a dial using a record we already have.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(result) = lookups.next().await {
+                if let Ok(Some(newer)) = result
+                    && newer.username == rec.username
+                    && newer.owner() == rec.owner()
+                    && newer.ts > rec.ts
+                    && newer.check().is_ok()
+                {
+                    rec = newer;
+                }
+            }
+        })
+        .await;
         let (peer, owner) = (self.account_of(&rec.key), rec.owner());
         ensure!(
             peer != self.account() && owner != self.account() && rec.key != self.device_id(),
@@ -534,11 +555,14 @@ impl Node {
         );
         let known = {
             let st = self.st.lock().unwrap();
-            st.gid(&Some(peer)).is_ok() || st.gid(&Some(owner)).is_ok()
+            [owner, peer]
+                .into_iter()
+                .find(|p| st.gid(&Some(*p)).is_ok())
         };
-        if !known {
-            self.join(&rec.link).await?;
+        if let Some(partner) = known {
+            return Ok(partner);
         }
+        self.join(&rec.link).await?;
         Ok(self.account_of(&rec.key))
     }
 }

@@ -18,6 +18,10 @@ fn dir_err(e: anyhow::Error) -> String {
         "Слишком много запросов, попробуйте через минуту".into()
     } else if t.contains("no such username") {
         "Нет такого имени пользователя".into()
+    } else if t.starts_with(mycel_core::JOIN_UNREACHABLE) {
+        "Не удалось связаться с устройством пользователя. Попросите его открыть Mycel и повторите попытку".into()
+    } else if t.starts_with(mycel_core::JOIN_USED) {
+        "Контактная ссылка устарела. Попросите пользователя заново открыть Mycel и повторите попытку".into()
     } else if t.starts_with("username:") {
         "Имя пользователя: 5–32 знака, латиница, цифры и _".into()
     } else {

@@ -72,7 +72,25 @@ async fn linked_device_shares_the_username() {
     until("root", || texts(a, &kb) == ["привет"]).await;
     until("linked", || texts(a2, &kb) == ["привет"]).await;
 
-    a.dir_register(url, "anna_1").await.unwrap();
+    // The first server still points to A2, which went offline. A mirror has a newer
+    // registration for the same account pointing to the reachable root.
+    a2.close().await;
+    let mirror_url = "http://127.0.0.1:34883";
+    let mirror_data = tempfile::tempdir().unwrap();
+    let _mirror = mycel_core::spawn_anchor(mirror_url, mirror_data.path())
+        .await
+        .unwrap();
+    a.dir_register(mirror_url, "anna_1").await.unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let (c, _rx) = Node::open(fresh.path(), "pc", &opts).await.unwrap();
+    c.create_space().unwrap();
+    assert_eq!(
+        c.dir_add(&format!("{url} {mirror_url}"), "anna_1")
+            .await
+            .unwrap(),
+        a.device_id()
+    );
+    c.close().await;
     for n in &nodes {
         n.close().await;
     }

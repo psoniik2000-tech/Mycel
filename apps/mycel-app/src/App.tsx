@@ -23,7 +23,7 @@ import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { groupTitle, mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
 import { Appearance, msgSize } from "./look";
-import { Accounts, DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, SpaceRows, Username, UsernameBanner, UsernameSettings, withBox, withServer } from "./directory";
+import { Accounts, DirSearch, JoinGroup, joinLink, keepRegistered, NewGroup, QuickStart, refreshRegistration, SpaceRows, Username, UsernameBanner, UsernameSettings, withBox, withServer } from "./directory";
 import { lastSeen, PrivacySettings } from "./privacy";
 import { mentionIds, mentionText, useMention } from "./mention";
 import { ForwardList } from "./forward";
@@ -945,8 +945,8 @@ function BackupSettings(p: { chats: string[] }) {
           <button type="button" onClick={() => setRestoring(true)}>Восстановить из копии</button>
         </div>
       </form>
-      <h3>Фраза восстановления</h3>
-      <p class="muted">24 слова вместо пароля копии: файл копии и эти слова восстанавливают историю на новом устройстве.</p>
+      <h3>Фраза для резервной копии</h3>
+      <p class="muted">24 слова открывают файл, созданный с этой фразой. Для входа в прежний аккаунт используйте QR или ссылку с устройства, где уже выполнен вход.</p>
       <div class="actions">
         <button onClick={newPhrase}>{hasPhrase() ? "Создать новую фразу" : "Создать фразу восстановления"}</button>
       </div>
@@ -999,18 +999,36 @@ function Restore(p: { onClose: () => void }) {
     else w[i] = v.toLowerCase().trim();
     setWords(w);
   };
-  // Red only once no word starts so; the button waits for every word to be in the list.
+  // The list gives hints; Rust validates the words and checksum.
   const bad = (w: string) => !!w && list().size > 0 && ![...list()].some((x) => x.startsWith(w));
-  const phraseOk = () => words().every((w) => list().has(w));
+  const phraseFilled = () => words().every(Boolean);
   // Android pickers give content:// URIs: the file is read here and stashed (as for attachments).
   let picker!: HTMLInputElement;
   const pick = async () => {
-    if (!android) return setPath(((await open({ filters: [{ name: "Mycel", extensions: ["mycelbak"] }] })) as string | null) ?? "");
-    picker.click();
+    setErr("");
+    try {
+      if (android) picker.click();
+      else {
+        const file = await open({ filters: [{ name: "Mycel", extensions: ["mycelbak"] }] });
+        if (typeof file === "string") setPath(file);
+      }
+    } catch (e) {
+      setErr(errText(e));
+    }
   };
   const stash = async () => {
     const f = picker.files?.[0];
-    if (f) setPath(await invoke<string>("stash", new Uint8Array(await f.arrayBuffer()), { headers: { name: encodeURIComponent(f.name) } }));
+    if (!f) return;
+    setPath("");
+    setBusy(true);
+    try {
+      setPath(await invoke<string>("stash", new Uint8Array(await f.arrayBuffer()), { headers: { name: encodeURIComponent(f.name) } }));
+    } catch (e) {
+      setErr(`Не удалось прочитать файл: ${errText(e)}`);
+    } finally {
+      picker.value = "";
+      setBusy(false);
+    }
   };
   const run = async (e: Event) => {
     e.preventDefault();
@@ -1028,9 +1046,9 @@ function Restore(p: { onClose: () => void }) {
   return (
     <div class="modal" onClick={(e) => e.target === e.currentTarget && p.onClose()}>
       <form class="card dialog" onSubmit={run}>
-        <h3>Восстановить из копии</h3>
+        <h3>Восстановить переписку из копии</h3>
         <input ref={picker} type="file" hidden onChange={stash} />
-        <button type="button" onClick={pick}>{path() ? baseName(path()) : "Выбрать файл .mycelbak"}</button>
+        <button type="button" disabled={busy()} onClick={pick}>{path() ? baseName(path()) : "Выбрать файл .mycelbak"}</button>
         <label class="check">
           <input type="checkbox" checked={byPhrase()} onChange={(e) => usePhrase(e.currentTarget.checked)} />
           По фразе из 24 слов
@@ -1044,15 +1062,22 @@ function Restore(p: { onClose: () => void }) {
               {(w, i) => (
                 <input list="bip39" autocapitalize="off" autocomplete="off" spellcheck={false} placeholder={`${i + 1}`} value={w()}
                   style={{ "min-width": 0, "border-color": bad(w()) ? "var(--danger)" : undefined }}
+                  onPaste={(e) => {
+                    const value = e.clipboardData?.getData("text").trim();
+                    if (value && /\s/.test(value)) {
+                      e.preventDefault();
+                      setWord(i, value);
+                    }
+                  }}
                   onInput={(e) => setWord(i, e.currentTarget.value)} />
               )}
             </Index>
           </div>
         </Show>
-        <p class="muted small">{simple() ? "Чаты" : "Пространства"} из копии добавятся на это устройство, их пароль — пароль копии. Затем войдите в них заново по приглашению: история уже будет на месте.</p>
+        <p class="muted small">Выберите пароль или 24 слова, которыми зашифровали файл. Для входа в прежний аккаунт нужна ссылка или QR с устройства, где уже выполнен вход.</p>
         <Show when={err()}><p class="error">{err()}</p></Show>
         <div class="actions">
-          <button class="primary" disabled={busy() || !path() || (byPhrase() ? !phraseOk() : !pw())}>{busy() ? "Восстанавливаем…" : "Восстановить"}</button>
+          <button class="primary" disabled={busy() || !path() || (byPhrase() ? !phraseFilled() : !pw())}>{busy() ? "Подождите…" : "Восстановить"}</button>
           <button type="button" onClick={p.onClose}>Отмена</button>
         </div>
       </form>
@@ -1401,7 +1426,12 @@ function Main(p: { dir: string; theme: string; setTheme: (t: string) => void; sp
     await reload();
     const onVis = () => {
       invoke("set_visible", { v: !document.hidden });
-      if (!document.hidden) invoke("sync_now").catch(() => {});
+      if (!document.hidden) {
+        const id = p.space.id;
+        invoke("sync_now").then(() => {
+          if (!document.hidden && spaceId === id) return refreshRegistration(id);
+        }).catch(() => {});
+      }
     };
     document.addEventListener("visibilitychange", onVis);
     // Android back closes the chat: opening it pushes a history entry.
