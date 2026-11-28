@@ -2025,6 +2025,65 @@ fn vibrate(ms: u32) {
     let _ = ms;
 }
 
+/// Voice note by the system recorder (Voice.kt), Android only: starts at once; returns the mime type.
+#[tauri::command]
+fn voice_start() -> R<String> {
+    #[cfg(target_os = "android")]
+    return vault::with_class("org.mycel.app.Voice", |env, class, ctx| {
+        use jni::objects::{JString, JValue};
+        let s: JString = env
+            .call_static_method(
+                class,
+                "start",
+                "(Landroid/content/Context;)Ljava/lang/String;",
+                &[JValue::Object(ctx)],
+            )?
+            .l()?
+            .into();
+        Ok(env.get_string(&s)?.into())
+    });
+    #[cfg(not(target_os = "android"))]
+    Err("android only".into())
+}
+
+/// Stops the voice note: its bytes (`keep`), or nothing (cancelled / too short).
+#[tauri::command]
+fn voice_stop(keep: bool) -> R<tauri::ipc::Response> {
+    #[cfg(target_os = "android")]
+    let path: String = vault::with_class("org.mycel.app.Voice", |env, class, _| {
+        use jni::objects::JString;
+        let s: JString = env
+            .call_static_method(class, "stop", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        Ok(env.get_string(&s)?.into())
+    })?;
+    #[cfg(not(target_os = "android"))]
+    let path = String::new();
+    if path.is_empty() {
+        return Ok(tauri::ipc::Response::new(Vec::<u8>::new()));
+    }
+    let data = if keep {
+        std::fs::read(&path).map_err(|e| e.to_string())?
+    } else {
+        vec![]
+    };
+    let _ = std::fs::remove_file(&path);
+    Ok(tauri::ipc::Response::new(data))
+}
+
+/// Peak level of the voice note since the last call, 0..32767.
+#[tauri::command]
+fn voice_level() -> i32 {
+    #[cfg(target_os = "android")]
+    return vault::with_class("org.mycel.app.Voice", |env, class, _| {
+        env.call_static_method(class, "level", "()I", &[])?.i()
+    })
+    .unwrap_or(0);
+    #[cfg(not(target_os = "android"))]
+    0
+}
+
 /// Calls tab: newest first.
 #[tauri::command]
 async fn calls_list(st: State<'_, App>) -> R<Vec<CallView>> {
@@ -2657,6 +2716,9 @@ pub fn run() {
             call_accept,
             call_reject,
             call_invite,
+            voice_start,
+            voice_stop,
+            voice_level,
             call_end,
             call_send,
             call_listen,

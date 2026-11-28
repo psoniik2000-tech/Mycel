@@ -18,7 +18,7 @@ import { Shot, useBack, Viewer } from "./viewer";
 import { EMOJI, emojiOnly, recentEmoji, useEmoji } from "./emoji";
 import { Emoji, rich } from "./rich";
 import { Picker, Sticker } from "./stickers";
-import { openStream, record, Recording, waveform } from "./capture";
+import { record, recordNative, Recording, waveform } from "./capture";
 import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { groupTitle, mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
@@ -2224,24 +2224,35 @@ function Chat(p: {
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
   // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
   let holdTimer = 0, holdId = 0, hintTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, red = false, raf = 0, halo!: HTMLElement;
-  let opening: Promise<MediaStream> | undefined; // the mic being opened by the current press
+  let starting: Promise<Recording> | undefined; // the recording started by the current press
   let ctx: AudioContext | undefined;
   // Telegram-like haptics: short ticks on start, entering the cancel zone, lock, send and cancel; never on every move.
   const vib = (ms: number) => android && void invoke("vibrate", { ms }).catch(() => {});
   // The halo behind the mic scales 1.0–1.25 with the microphone's loudness (smoothed).
-  const meter = (stream: MediaStream) => {
+  const meter = (r: Recording) => {
+    let lvl = 0;
+    const show = (v: number) => {
+      lvl += (v - lvl) * 0.25;
+      if (halo) halo.style.transform = `scale(${1 + 0.25 * lvl})`;
+    };
+    if (r.level) {
+      const poll = async () => {
+        show(await r.level!());
+        if (rec() === r) raf = requestAnimationFrame(() => void poll());
+      };
+      return void poll();
+    }
+    const stream = r.stream!;
     ctx = new AudioContext();
     const an = ctx.createAnalyser();
     an.fftSize = 512;
     ctx.createMediaStreamSource(stream).connect(an);
     const buf = new Uint8Array(an.fftSize);
-    let lvl = 0;
     const frame = () => {
       an.getByteTimeDomainData(buf);
       let sum = 0;
       for (const v of buf) sum += (v - 128) ** 2;
-      lvl += (Math.min(1, Math.sqrt(sum / buf.length) / 128 * 4) - lvl) * 0.25;
-      if (halo) halo.style.transform = `scale(${1 + 0.25 * lvl})`;
+      show(Math.min(1, Math.sqrt(sum / buf.length) / 128 * 4));
       raf = requestAnimationFrame(frame);
     };
     frame();
@@ -2249,9 +2260,9 @@ function Chat(p: {
   const stopRec = async (send: boolean) => {
     const r = rec();
     holding = false; // a release after the recording ended by itself does nothing
-    // Released before recording began: close the mic opened at the press.
-    if (holdTimer) opening?.then((s) => s.getTracks().forEach((t) => t.stop()), () => {});
-    opening = undefined;
+    // Released before the recording was shown (a tap): drop the one started at the press.
+    if (holdTimer) starting?.then((r) => r.cancel(), () => {});
+    starting = undefined;
     clearTimeout(holdTimer);
     clearInterval(tick);
     cancelAnimationFrame(raf);
@@ -2286,20 +2297,22 @@ function Chat(p: {
     setHint("");
     const id = ++holdId; // the mic may still be opening for an earlier press
     clearTimeout(holdTimer);
-    // The mic opens at the press, during the hold delay: recording starts with the tick, not a second later.
-    const mine = (opening = openStream(video()));
+    // Recording starts at the press, during the hold delay; on Android a voice note goes through the
+    // system recorder (WebView capture takes up to a second to open the mic).
+    const v = video();
+    const mine = (starting = android && !v ? recordNative().catch(() => record(false)) : record(v));
     mine.catch(() => {});
     holdTimer = window.setTimeout(async () => {
       holdTimer = 0;
       try {
-        const r = await record(video(), mine);
+        const r = await mine;
         if (!holding || id !== holdId) return r.cancel();
         vib(30); // the moment recording starts
         setRec(r);
         setElapsed(0);
         red = false;
-        if (video()) preview.srcObject = r.stream;
-        meter(r.stream);
+        if (video()) preview.srcObject = r.stream ?? null;
+        meter(r);
         tick = window.setInterval(() => {
           setElapsed(Date.now() - r.started);
           if (!video()) invoke("typing", { chat: p.chat, voice: true }).catch(() => {});

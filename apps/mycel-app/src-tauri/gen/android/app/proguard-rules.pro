@@ -26,6 +26,7 @@
 -keep class org.mycel.app.Vault { *; }
 -keep class org.mycel.app.Save { *; }
 -keep class org.mycel.app.Haptics { *; }
+-keep class org.mycel.app.Voice { *; }
 # Push.show is called from Rust over JNI by name (lib.rs notify); R8 renamed it and the call failed silently.
 -keep class org.mycel.app.Push { *; }
 # Update.install is called from Rust over JNI by name (update.rs).

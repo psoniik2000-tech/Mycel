@@ -1,4 +1,5 @@
 // Mic/camera capture in the WebView (MediaRecorder → Opus/WebM). Calls (phase 6) reuse `openStream`.
+import { invoke } from "@tauri-apps/api/core";
 
 export const VOICE = { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } };
 export const CIRCLE = { ...VOICE, video: { width: 480, height: 480, aspectRatio: 1, facingMode: "user" } };
@@ -7,7 +8,20 @@ export function openStream(video: boolean): Promise<MediaStream> {
   return navigator.mediaDevices.getUserMedia(video ? CIRCLE : VOICE);
 }
 
-export type Recording = { stream: MediaStream; mime: string; started: number; stop: () => Promise<Blob>; cancel: () => void };
+// `stream`: WebView capture (its level comes from it); `level`: the system recorder's peak, 0..1.
+export type Recording = { stream?: MediaStream; level?: () => Promise<number>; mime: string; started: number; stop: () => Promise<Blob>; cancel: () => void };
+
+/** Android voice note by the system recorder (Rust `voice_*`, Voice.kt): starts in ~0.1 s, WebView capture takes up to 1 s. */
+export async function recordNative(): Promise<Recording> {
+  const mime = await invoke<string>("voice_start");
+  return {
+    mime,
+    started: Date.now(),
+    level: () => invoke<number>("voice_level").then((v) => Math.min(1, Math.sqrt(v / 32767) * 1.5)),
+    stop: async () => new Blob([await invoke<ArrayBuffer>("voice_stop", { keep: true })], { type: mime }),
+    cancel: () => void invoke("voice_stop", { keep: false }).catch(() => {}),
+  };
+}
 
 /** Starts recording: voice ~24 kbit/s mono Opus, or a 480×480 video note; `opening`: a stream already being opened. */
 export async function record(video: boolean, opening = openStream(video)): Promise<Recording> {
