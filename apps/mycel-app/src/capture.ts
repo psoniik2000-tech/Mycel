@@ -9,9 +9,9 @@ export function openStream(video: boolean): Promise<MediaStream> {
 
 export type Recording = { stream: MediaStream; mime: string; started: number; stop: () => Promise<Blob>; cancel: () => void };
 
-/** Starts recording: voice ~24 kbit/s mono Opus, or a 480×480 video note. */
-export async function record(video: boolean): Promise<Recording> {
-  const stream = await openStream(video);
+/** Starts recording: voice ~24 kbit/s mono Opus, or a 480×480 video note; `opening`: a stream already being opened. */
+export async function record(video: boolean, opening = openStream(video)): Promise<Recording> {
+  const stream = await opening;
   const mime = video ? "video/webm;codecs=vp8,opus" : "audio/webm;codecs=opus";
   const rec = new MediaRecorder(stream, {
     mimeType: mime,

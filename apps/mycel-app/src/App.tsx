@@ -18,7 +18,7 @@ import { Shot, useBack, Viewer } from "./viewer";
 import { EMOJI, emojiOnly, recentEmoji, useEmoji } from "./emoji";
 import { Emoji, rich } from "./rich";
 import { Picker, Sticker } from "./stickers";
-import { record, Recording, waveform } from "./capture";
+import { openStream, record, Recording, waveform } from "./capture";
 import { CallMedia, camError, Peer, ring } from "./call";
 import { Signal, VoiceSettings } from "./voice";
 import { groupTitle, mode, ModeChoice, ModeSettings, setMode, simple, SIMPLE_NAME } from "./simple";
@@ -2224,6 +2224,7 @@ function Chat(p: {
   // 🎤/📹: a tap switches the mode, holding records; release sends, slide sideways (or Esc) cancels.
   // Hold: slide left past 120px cancels; slide up past 80px locks (release does nothing then; the big button sends).
   let holdTimer = 0, holdId = 0, hintTimer = 0, tick = 0, startX = 0, startY = 0, holding = false, red = false, raf = 0, halo!: HTMLElement;
+  let opening: Promise<MediaStream> | undefined; // the mic being opened by the current press
   let ctx: AudioContext | undefined;
   // Telegram-like haptics: short ticks on start, entering the cancel zone, lock, send and cancel; never on every move.
   const vib = (ms: number) => android && void invoke("vibrate", { ms }).catch(() => {});
@@ -2248,6 +2249,9 @@ function Chat(p: {
   const stopRec = async (send: boolean) => {
     const r = rec();
     holding = false; // a release after the recording ended by itself does nothing
+    // Released before recording began: close the mic opened at the press.
+    if (holdTimer) opening?.then((s) => s.getTracks().forEach((t) => t.stop()), () => {});
+    opening = undefined;
     clearTimeout(holdTimer);
     clearInterval(tick);
     cancelAnimationFrame(raf);
@@ -2282,12 +2286,15 @@ function Chat(p: {
     setHint("");
     const id = ++holdId; // the mic may still be opening for an earlier press
     clearTimeout(holdTimer);
+    // The mic opens at the press, during the hold delay: recording starts with the tick, not a second later.
+    const mine = (opening = openStream(video()));
+    mine.catch(() => {});
     holdTimer = window.setTimeout(async () => {
       holdTimer = 0;
-      vib(30); // before the mic opens: Android mutes haptics while audio is being recorded
       try {
-        const r = await record(video());
+        const r = await record(video(), mine);
         if (!holding || id !== holdId) return r.cancel();
+        vib(30); // the moment recording starts
         setRec(r);
         setElapsed(0);
         red = false;
